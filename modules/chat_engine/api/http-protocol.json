@@ -805,41 +805,6 @@
             "$ref": "#/components/responses/InternalServerError"
           }
         }
-      },
-      "delete": {
-        "summary": "Delete message",
-        "description": "Permanently delete a message and cascade delete all associated reactions. Requires message ownership.",
-        "operationId": "deleteMessage",
-        "tags": ["Message Operations"],
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/MessageId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Message deleted successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MessageDeleteResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "500": {
-            "$ref": "#/components/responses/InternalServerError"
-          }
-        }
       }
     },
     "/messages/{id}/reaction": {
@@ -931,6 +896,46 @@
           }
         }
       }
+    },
+    "/sessions/{id}/messages/{message_id}": {
+      "delete": {
+        "summary": "Delete message",
+        "description": "Permanently delete a message and cascade delete all associated reactions. Validates session ownership via JWT identity before deletion.",
+        "operationId": "deleteMessage",
+        "tags": ["Message Operations"],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionId"
+          },
+          {
+            "$ref": "#/components/parameters/MessageItemId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Message deleted successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageDeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -952,6 +957,14 @@
       },
       "MessageId": {
         "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "../schemas/common/GtsMessageId.json"
+        }
+      },
+      "MessageItemId": {
+        "name": "message_id",
         "in": "path",
         "required": true,
         "schema": {
