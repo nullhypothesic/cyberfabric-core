@@ -61,7 +61,9 @@ ALWAYS open `docs/modkit_unified_system/04_rest_operation_builder.md` WHEN addin
 
 ALWAYS open `docs/modkit_unified_system/05_errors_rfc9457.md` WHEN implementing error handling, creating DomainError, mapping errors to Problem (RFC-9457), defining SDK errors, or adding From impls for error conversion
 
-ALWAYS open `docs/modkit_unified_system/06_authn_authz_secure_orm.md` WHEN adding SeaORM entities, implementing repositories, using SecureConn, creating database migrations, implementing AuthN/AuthZ, using PolicyEnforcer PEP pattern, or working with AccessScope from PDP constraints
+ALWAYS open `docs/modkit_unified_system/06_authn_authz_secure_orm.md` WHEN adding SeaORM entities, using SecureConn, implementing AuthN/AuthZ, using PolicyEnforcer PEP pattern, or working with AccessScope from PDP constraints
+
+ALWAYS open `docs/modkit_unified_system/11_database_patterns.md` WHEN implementing repositories, creating database migrations, using DBRunner/SecureTx, or implementing transaction patterns
 
 ALWAYS open `docs/modkit_unified_system/07_odata_pagination_select_filter.md` WHEN adding OData filtering, pagination, $select, $orderby, implementing ODataFilterable derive, creating FieldToColumn/ODataFieldMapping, or using cursor-based pagination
 

@@ -26,7 +26,8 @@ Read the minimum set of docs needed for the task. Start with the routing table b
 | Wire ClientHub, inter-module clients, plugins | `docs/modkit_unified_system/03_clienthub_and_plugins.md` |
 | Add REST endpoints, OperationBuilder, SSE, auth | `docs/modkit_unified_system/04_rest_operation_builder.md` |
 | Implement errors, RFC-9457 Problem, From impls | `docs/modkit_unified_system/05_errors_rfc9457.md` |
-| Add DB entities, SecureORM, AuthZ PEP, migrations | `docs/modkit_unified_system/06_authn_authz_secure_orm.md` |
+| Add DB entities, SecureORM, AuthZ PEP | `docs/modkit_unified_system/06_authn_authz_secure_orm.md` |
+| Add repositories, migrations, transactions | `docs/modkit_unified_system/11_database_patterns.md` |
 | Add OData filtering, pagination, $select, $orderby | `docs/modkit_unified_system/07_odata_pagination_select_filter.md` |
 | Configure lifecycle, background tasks, cancellation | `docs/modkit_unified_system/08_lifecycle_stateful_tasks.md` |
 | Create out-of-process module, gRPC, OoP SDK | `docs/modkit_unified_system/09_oop_grpc_sdk_pattern.md` |
@@ -51,7 +52,7 @@ Use the answers to determine which docs to load next.
 1. Read `docs/modkit_unified_system/02_module_layout_and_sdk_pattern.md`
 2. Read `docs/modkit_unified_system/10_checklists_and_templates.md` — use the "Adding a New Module" checklist
 3. If capabilities include `rest` — also read `docs/modkit_unified_system/04_rest_operation_builder.md`
-4. If capabilities include `db` — also read `docs/modkit_unified_system/06_authn_authz_secure_orm.md`
+4. If capabilities include `db` — also read `docs/modkit_unified_system/06_authn_authz_secure_orm.md` and `docs/modkit_unified_system/11_database_patterns.md`
 5. Study corresponding files in `examples/modkit/users-info/` for the layers being created
 
 Present to the user:
