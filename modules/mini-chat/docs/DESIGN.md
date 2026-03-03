@@ -50,7 +50,7 @@ Long conversations are managed via thread summaries - a Level 1 compression stra
 | `cpt-cf-mini-chat-nfr-cost-control` | Predictable and bounded LLM costs | mini-chat module (domain service + quota_service) | Credit-based rate limits per tier across multiple periods (daily, monthly) tracked in real-time; credits are computed from provider-reported tokens using model credit multipliers; premium models have stricter limits, standard-tier models have separate, higher limits; two-tier downgrade cascade (premium → standard); file search and web search call limits; token budget per request | Usage metrics dashboard; budget alert tests |
 | `cpt-cf-mini-chat-nfr-streaming-latency` | Low time-to-first-token for chat responses | mini-chat module (domain service), OAGW | Direct SSE relay without buffering; cancellation propagation on disconnect | TTFT benchmarks under load; **Disconnect test**: open SSE -> receive 1-2 tokens -> disconnect -> assert provider request closed within 200 ms and active-generation counter decrements; **TTFT delta test**: measure `t_first_token_ui - t_first_byte_from_provider` -> assert platform overhead < 50 ms p99 |
 | `cpt-cf-mini-chat-nfr-data-retention` | Deleted chats purged from provider; temporary chat cleanup (P2) | mini-chat module (domain + infra layers) | Scheduled cleanup job; cascade delete to provider files and chat vector stores (OpenAI Files API / Azure OpenAI Files API) | Retention policy compliance tests |
-| `cpt-cf-mini-chat-nfr-observability-supportability` | Operational visibility for on-call, SRE, and cost governance | mini-chat module (domain service + quota_service) | `mini_chat_*` Prometheus metrics on all critical paths; stable `request_id` tracing per turn; structured audit events; turn state API (`GET /turns/{request_id}`) | Metric series presence tests; request_id propagation tests; alert rule validation |
+| `cpt-cf-mini-chat-nfr-observability-supportability` | Operational visibility for on-call, SRE, and cost governance | mini-chat module (domain service + quota_service) | `mini_chat_*` Prometheus metrics on all critical paths; stable `request_id` tracing per turn; structured audit events; turn state API (`GET /v1/chats/{chat_id}/turns/{request_id}`) | Metric series presence tests; request_id propagation tests; alert rule validation |
 | `cpt-cf-mini-chat-nfr-rag-scalability` | Bounded RAG costs and stable retrieval quality | mini-chat module (domain service + infra/storage) | Per-chat document count, file size, and chunk limits; configurable retrieval-k and max retrieved tokens per turn; per-chat dedicated vector stores | Per-chat limit enforcement tests; retrieval latency p95 benchmarks; `mini_chat_retrieval_latency_ms` within threshold |
 
 #### Key Decisions (ADRs)
@@ -249,7 +249,7 @@ Once a chat is created with a model (user-selected or resolved via the `is_defau
 The **effective_model** is the model actually used for a specific turn. Invariants:
 
 - `selected_model` never changes during chat lifetime.
-- `effective_model` may differ from `selected_model` due to automatic downgrade (quota exhaustion) or kill switches (`disable_premium_tier`, `force_standard_tier`).
+- `effective_model` may differ from `selected_model` due to automatic downgrade (quota exhaustion), kill switches (`disable_premium_tier`, `force_standard_tier`), or per-model catalog disablement (`global_enabled=false` on the specific model).
 - `effective_model` MUST be recorded in:
   - `messages.model` column (per assistant message)
   - SSE `event: done` payload (`effective_model` and `usage.model` fields)
@@ -383,6 +383,8 @@ Reserve is an internal accounting concept (it may be implemented as held/pending
 
 All period boundaries use UTC. Per-tenant timezone configuration (`quota_timezone`) is deferred to P2+. Additional periods (4-hourly rolling windows, weekly) are deferred to P2+.
 
+**Quota period boundary invariant (normative)**: All settlement operations (reserve release and commit) MUST target the same `(period_type, period_start)` bucket rows as the original reserve. The `period_start` values are computed at preflight time and MUST NOT be recomputed at settlement time using the current clock. Implementations MUST persist the preflight `period_start` values alongside the reserve (e.g., in the `chat_turns` row or in context passed to the settlement path) and use those persisted values for all subsequent settlement operations. This ensures that in-flight reserves straddling period boundaries (e.g., a turn started at 23:59:59 UTC and completed at 00:00:01 UTC) are settled against the correct day-1 bucket rows rather than incorrectly targeting day-2 — which would cause `reserved_credits_micro` in day-1 to remain permanently inflated while day-2 is double-reserved.
+
 #### Quota Warning Thresholds (P2+)
 
 Quota warning thresholds (`warning_threshold_pct`, `quota_warnings` array in the SSE `done` event) are deferred to P2+. P1 does not emit quota warning notifications in the SSE stream.
@@ -403,13 +405,104 @@ System tasks (thread summary update, document summary generation) MUST be isolat
 
 **Implementation guard**: any code path that produces an outbox usage event for a user turn MUST require an existing `chat_turns` row and its CAS finalization winner token (`rows_affected = 1` from the `WHERE state = 'running'` guard, section 5.7). System tasks MUST have a separate code path that does not pass through this guard. A system task that attempts to use the user-turn finalization path MUST be rejected by the CAS precondition (no matching `chat_turns` row with `state = 'running'`).
 
+#### System Task Attribution Rules (Normative)
+
+**Scope:** Background/system tasks (thread summary update, document summary generation) that invoke LLM providers but do not participate in user-initiated turn lifecycle.
+
+**Identity fields for system tasks:**
+
+1. **`requester_type`**: Always `"system"` (vs `"user"` for normal turns)
+
+2. **`tenant_id`**:
+   - MUST be the UUID of the chat's owning tenant (from `chats.tenant_id`)
+   - NEVER null (system tasks are always scoped to a tenant)
+   - Rationale: Tenant is the billing entity; system work is attributed to the tenant that owns the resource
+
+3. **`user_id`** / `requester_user_id`:
+   - MUST be null for system tasks
+   - Rationale: No specific user requested the work; attributing to an arbitrary user would skew per-user quotas
+
+4. **`chat_id`**:
+   - Present when the system task operates on a specific chat (e.g., thread summary update)
+   - May be null for tenant-wide system operations (P2+)
+
+5. **`request_id`**:
+   - MUST be a server-generated UUID v4 (unique per system task invocation)
+   - NOT derived from any user request_id
+   - Rationale: System tasks are idempotent on their own identity, not correlated with user turns
+
+6. **Outbox `dedupe_key` format for system tasks:**
+
+   Since system tasks do NOT create `chat_turns` rows, the dedupe_key format is:
+
+   ```
+   "{tenant_id}/{system_task_type}/{system_request_id}"
+   ```
+
+   Where:
+   - `tenant_id` — normalized to 32-char hex (same as user turns)
+   - `system_task_type` — enum string identifying the task type:
+     - `"thread_summary_update"`
+     - `"doc_summary_generation"`
+     - (P2+: additional system task types)
+   - `system_request_id` — server-generated UUID v4 for this system task invocation, normalized to 32-char hex
+
+   **Example:**
+   ```
+   f47ac10b58cc4372a5670e02b2c3d479/thread_summary_update/c3d4e5f67890abcdef1234567890abc
+   ```
+
+   **Idempotency:** If a system task is retried (e.g., after failure), it MUST use the same `system_request_id` to prevent duplicate outbox events.
+
+**Quota enforcement:**
+
+- System tasks MUST NOT debit `quota_usage` rows keyed by `(tenant_id, user_id)`
+- System tasks MAY debit a tenant-level operational quota bucket (implementation-defined, P2+)
+- P1: System tasks do not participate in per-user quota enforcement but DO emit usage events for tenant billing
+
+**Outbox payload schema for system tasks:**
+
+```json
+{
+  "namespace": "mini-chat",
+  "topic": "usage_snapshot",
+  "tenant_id": "<tenant_uuid>",
+  "dedupe_key": "{tenant_id}/{system_task_type}/{system_request_id}",
+  "payload": {
+    "tenant_id": "<tenant_uuid>",
+    "user_id": null,
+    "requester_type": "system",
+    "system_task_type": "thread_summary_update",
+    "chat_id": "<chat_uuid>",
+    "request_id": "<system_request_uuid>",
+    "usage": { "input_tokens": 5000, "output_tokens": 200 },
+    "actual_credits_micro": 125000,
+    "effective_model": "claude-opus-4",
+    "outcome": "completed",
+    "settlement_method": "actual"
+  }
+}
+```
+
+**Database schema:**
+
+System tasks do NOT create:
+- `chat_turns` rows (they are not execution turns)
+- `messages` rows (unless the summary is persisted separately, P2+)
+
+System tasks DO create:
+- `modkit_outbox_events` rows (for billing attribution)
+- Metrics/audit events (for observability)
+
+**Implementation guard:** Any code that assumes all LLM invocations have a corresponding `chat_turns` row is incorrect and will fail for system tasks.
+
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-component-authz-integration`
 
 - **authz_resolver (PDP)** — Platform AuthZ Resolver module. The mini-chat domain service calls it (via PolicyEnforcer) before every data-access operation to obtain authorization decisions and SQL-compilable constraints. See section 3.8.
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-component-orphan-watchdog`
 
-- **orphan_watchdog** — P1 mandatory. Periodic background job that detects and cleans up turns abandoned by crashed pods. Transitions orphaned `running` turns to `failed` after a configurable timeout (default: 5 min), commits bounded quota debit, and emits a `modkit_outbox_events` row. MUST be leader-elected or sharded to avoid duplicate transitions. See section "Turn Lifecycle, Crash Recovery and Orphan Handling" for full specification.
+- **orphan_watchdog** — P1 mandatory. Periodic background job that detects and cleans up turns abandoned by crashed pods. Transitions orphaned `running` turns to `failed` after a configurable timeout (default: 5 min), commits bounded quota debit, and emits a `modkit_outbox_events` row. MUST use leader election to ensure exactly one active watchdog instance per environment. See section "Turn Lifecycle, Crash Recovery and Orphan Handling" for full specification.
 
 ### 3.3 API Contracts
 
@@ -549,9 +642,49 @@ Request body:
 ```json
 {
   "content": "string",
-  "request_id": "uuid (client-generated, optional)",
+  "request_id": "uuid (optional — client MAY provide for idempotency; server generates UUID v4 if omitted)",
   "attachment_ids": ["uuid (optional)"],
   "web_search": { "enabled": false }
+}
+```
+
+**`request_id` semantics (normative):**
+
+1. **In client requests (POST /v1/chats/{id}/messages:stream):**
+   - Optional field
+   - If provided: MUST be a valid UUID v4; used for idempotency (replay detection)
+   - If omitted: Server generates UUID v4 and uses it as the turn correlation key
+   - Idempotency guarantee: duplicate requests with the same `(chat_id, request_id)` in COMPLETED state trigger SSE replay (side-effect-free, no quota reserve, no billing)
+
+2. **In API responses (Message objects):**
+   - Always present and non-null
+   - Within a normal user-initiated turn: user message and assistant message share the same `request_id`
+   - System/background messages (e.g., doc_summary generation): carry an independently server-generated UUID v4 (no user turn correlation)
+
+3. **In database schema (internal only):**
+   - `messages.request_id` column is NULLABLE in the database schema
+   - Nullability exists for internal flexibility (e.g., legacy data migration, system messages not yet assigned a correlation key)
+   - **API Contract Invariant:** All messages exposed through public APIs MUST have a non-null `request_id`
+   - Any message with `request_id IS NULL` in the database MUST be filtered out or backfilled before API serialization
+
+**Implementation guard:**
+```rust
+impl MessageEntity {
+    pub fn to_api_message(&self) -> Result<ApiMessage, InternalError> {
+        let request_id = self.request_id
+            .ok_or_else(|| InternalError::NullRequestId {
+                message_id: self.id,
+                context: "API serialization requires non-null request_id",
+            })?;
+
+        Ok(ApiMessage {
+            id: self.id,
+            request_id,  // guaranteed non-null here
+            role: self.role,
+            content: self.content,
+            // ... other fields
+        })
+    }
 }
 ```
 
@@ -632,6 +765,32 @@ Turn Status is authoritative for lifecycle state resolution after disconnect. `e
 - API `done` corresponds to internal `chat_turns.state = completed` and terminal `event: done`
 - API `error` corresponds to internal `chat_turns.state = failed` and terminal `event: error`
 - API `cancelled` corresponds to internal `chat_turns.state = cancelled` and indicates cancellation was processed; the UI should treat it as terminal and allow resend with a new `request_id`
+
+**CRITICAL: `error` state semantics for UX and support analytics (P1 normative)**
+
+The Turn Status API `state: "error"` maps to internal `chat_turns.state = 'failed'`, but this does NOT always mean "provider failed". The `error_code` field disambiguates the failure cause:
+
+- `error_code: "provider_error"` → LLM provider returned a terminal error (billing outcome: FAILED)
+- `error_code: "provider_timeout"` → LLM provider request timed out (billing outcome: FAILED)
+- `error_code: "orphan_timeout"` → Turn stuck in `running` state beyond watchdog timeout; **stream ended without provider terminal event** (billing outcome: **ABORTED**, not FAILED)
+- `error_code: "context_length_exceeded"` → Context budget exceeded during preflight (billing outcome: FAILED, pre-provider)
+
+**Support and analytics guidance:**
+- **Do NOT assume `state: "error"` means "provider failure"**. Check `error_code`.
+- `orphan_timeout` indicates a **system timeout** (pod crash, network partition, orphan watchdog cleanup), not a provider-side error. The billing outcome for orphan timeout is `ABORTED` (estimated settlement), not `FAILED` (actual or released).
+- For UX error messages: `orphan_timeout` should display "Request timed out. Please try again." NOT "Provider error."
+- For operational dashboards: `orphan_timeout` metrics should be tracked separately from `provider_error` to distinguish infrastructure issues from LLM provider issues.
+
+**Similarly, `state: "cancelled"` can map to billing outcome ABORTED:**
+- Client disconnect → internal `cancelled` → billing outcome `ABORTED` (estimated settlement)
+
+**IMPORTANT: Overshoot tolerance violations do NOT change turn state to error:**
+- When actual usage exceeds overshoot tolerance (`quota_overshoot_exceeded` condition), the turn remains in `state: "done"` (internal `chat_turns.state = completed`)
+- Billing is capped at reserved credits, but the completed response is delivered to the user
+- The "completed remains completed" rule (see Reserve Overshoot Reconciliation Rule, section 5.8.1) is absolute: a COMPLETED turn MUST remain COMPLETED regardless of overshoot magnitude
+- This is logged via the `mini_chat_quota_overshoot_exceeded_total` metric for operator investigation, but does NOT result in `state: "error"` or any error_code visible to the client
+
+The Turn Status API deliberately hides billing outcomes to keep the client contract simple. Billing settlement details (outcome, settlement method, charged credits) are internal to the system and NOT exposed via this endpoint.
 
 UI guidance: if the SSE stream disconnects before a terminal event, the UI SHOULD show a user-visible banner: "Message delivery uncertain due to connection loss. You can resend." Resend MUST use a new `request_id`.
 
@@ -727,7 +886,7 @@ Finalizes the stream. Provides usage and model selection metadata.
 | `selected_model` | string | Model chosen at chat creation (`chats.model`). Always present. Equals `effective_model` when no downgrade occurred. |
 | `quota_decision` | `"allow"` \| `"downgrade"` (required) | Always present. `"allow"` when the turn used the selected model without override; `"downgrade"` when a quota-driven downgrade occurred. |
 | `downgrade_from` | string (optional) | Always equals `selected_model` when present — the model from which the quota-driven downgrade occurred. Present only when `quota_decision="downgrade"`. |
-| `downgrade_reason` | string (optional) | Why downgrade occurred: `"premium_quota_exhausted"` or `"kill_switch"`. Present only when `quota_decision="downgrade"`. |
+| `downgrade_reason` | string (optional) | Why downgrade occurred. Present only when `quota_decision="downgrade"`. Values: `"premium_quota_exhausted"` (user's premium quota exhausted — quota-driven downgrade); `"force_standard_tier"` (operator kill switch: premium tier forcibly disabled for this tenant via `force_standard_tier=true`); `"disable_premium_tier"` (operator kill switch: premium tier globally disabled via `disable_premium_tier=true`); `"model_disabled"` (operator kill switch: the selected model's `global_enabled=false`). |
 | `quota_warnings` | array of objects (optional) | Deferred to P2+. Not emitted in P1. |
 
 ##### `event: error`
@@ -747,7 +906,23 @@ data: {"code": "quota_exceeded", "message": "Daily limit reached", "quota_scope"
 
 ##### `event: ping`
 
-Keepalive to prevent idle-timeout disconnects by proxies and browsers (especially when the model is "thinking" before producing tokens). Sent every 15-30 seconds during generation. Clients MUST ignore `ping` events.
+Keepalive to prevent idle-timeout disconnects by proxies and browsers (especially when the model is "thinking" before producing tokens). Clients MUST ignore `ping` events.
+
+**P1 Emission Rule (normative)**:
+
+The server MUST emit `event: ping` with the following cadence:
+
+- **During active streaming** (when `delta` or `tool` events are being produced): ping is OPTIONAL (not required when content is actively flowing).
+- **During idle periods** (no content events for N seconds): the server MUST emit a `ping` event every 15 seconds (±2 seconds jitter allowed for load balancing).
+- **After terminal event**: NO `ping` events are permitted after the terminal `done` or `error` event. The server MUST close the connection immediately after the terminal event (section "SSE stream close rules").
+
+**Configuration (P1)**:
+
+- `sse_ping_interval_seconds`: configurable via MiniChat ConfigMap. Default: `15` seconds.
+- Valid range: `5` (aggressive keepalive for strict proxies) to `60` (relaxed for stable networks). Values outside this range MUST be rejected at startup.
+- Jitter: up to ±2 seconds jitter MAY be applied to ping intervals to avoid thundering herd effects across concurrent streams.
+
+**Rationale**: A 15-second interval is aggressive enough to keep most HTTP/2 proxies and browsers from timing out idle streams (typical proxy idle timeouts: 30-60 seconds), while not overwhelming the network with unnecessary keepalive traffic.
 
 ```
 event: ping
@@ -838,6 +1013,11 @@ For streaming endpoints, failures before any streaming begins MUST be returned a
 | `model_not_found` | 404 | Model does not exist in the catalog or is not visible to the user (globally disabled or user-disabled). Used by `GET /v1/models/{model_id}`. |
 | `provider_error` | 502 | LLM provider returned an error |
 | `provider_timeout` | 504 | LLM provider request timed out |
+| `web_search_calls_exceeded` | — (SSE only) | Per-message web search tool call limit exceeded mid-turn. Emitted as terminal `event: error` payload only; no HTTP error status is used because the stream is already open. The turn is finalized as `failed` with `settlement_method="actual"\|"estimated"`. |
+| `invalid_turn_state` | 400 | Retry, edit, or delete attempted on a turn that is not in a terminal state (turn is `running`). Always pre-stream JSON. |
+| `not_latest_turn` | 409 | Retry, edit, or delete targeted a turn that is not the most recent non-deleted turn for the chat. Always pre-stream JSON. |
+| `message_not_found` | 404 | Target message does not exist or is not accessible. Used by reaction endpoints. Always pre-stream JSON. |
+| `invalid_reaction_target` | 400 | Reaction attempted on a message type that does not support reactions (e.g., system messages). Always pre-stream JSON. |
 
 **Quota error disambiguation invariant**: token quota exhaustion, upload quota exhaustion, and web search quota exhaustion MUST be distinguishable to clients via the stable, machine-readable `quota_scope` field on every `quota_exceeded` error response. Clients MUST NOT parse the `message` string to determine quota scope. The `quota_scope` field is REQUIRED when `code` is `quota_exceeded` and MUST be one of: `"tokens"` (token-based rate limit exhaustion), `"uploads"` (per-user daily upload limit exhaustion), or `"web_search"` (per-user daily web search call limit exhaustion).
 
@@ -1148,7 +1328,7 @@ sequenceDiagram
   - **Resize policy**: fit inside configured `thumbnail_width` x `thumbnail_height` (deployment config), preserve aspect ratio, no cropping. Default target: 128x128 pixels.
   - **Output format**: `image/webp` (fixed).
   - **Size bound**: the decoded thumbnail (raw binary bytes) MUST NOT exceed `thumbnail_max_bytes` (default: 131072 bytes / 128 KiB). The enforced limit is on decoded bytes, not the base64 string size. If the produced thumbnail exceeds this limit, the server reduces quality or skips thumbnail generation (attachment still transitions to `ready` with `img_thumbnail = null`).
-  - **Security safeguard — max pixels**: before decoding, the server MUST check the image header dimensions. If `width * height` exceeds `thumbnail_max_pixels` (default: 100,000,000), thumbnail generation is skipped to prevent pixel-bomb memory exhaustion. The attachment may still become `ready` (the provider upload succeeded), but `img_thumbnail` remains null.
+  - **Security safeguard — max pixels**: before decoding, the server MUST check the image header dimensions. If `width * height` exceeds `thumbnail_max_pixels` (default: 100,000,000), thumbnail generation is skipped. The header-dimension check is a pre-screening heuristic only, not a security boundary — malformed images may advertise small header dimensions while expanding to gigabytes on decode. Therefore, the `image` crate MUST be invoked with a size-limited `Read` wrapper that caps the total bytes the decoder may consume to `thumbnail_max_decode_bytes` (default: 33,554,432 bytes / 32 MiB, deployment-configurable) regardless of header dimensions. If decoding exceeds `thumbnail_max_decode_bytes`, thumbnail generation MUST be aborted and the attachment may still become `ready` with `img_thumbnail = null`.
   - **Failure tolerance**: if thumbnail generation fails for any reason (decode error, unsupported sub-format, memory pressure), the attachment processing MAY still succeed — the attachment transitions to `ready` with `img_thumbnail = null`. Thumbnail failure does not set `error_code` on the attachment; `error_code` is only set when the attachment itself fails (e.g., provider upload failure).
 
   **Thumbnail configuration knobs** (deployment config):
@@ -1158,7 +1338,8 @@ sequenceDiagram
   | `thumbnail_width` | integer | 128 | Target thumbnail width in pixels |
   | `thumbnail_height` | integer | 128 | Target thumbnail height in pixels |
   | `thumbnail_max_bytes` | integer | 131072 | Maximum decoded thumbnail size in bytes (128 KiB) |
-  | `thumbnail_max_pixels` | integer | 100000000 | Maximum source image pixel count (`width * height`) before skipping thumbnail generation |
+  | `thumbnail_max_pixels` | integer | 100000000 | Maximum source image pixel count (`width * height`) before skipping thumbnail generation (pre-screening heuristic) |
+  | `thumbnail_max_decode_bytes` | integer | 33554432 | Maximum bytes the image decoder may consume before aborting (32 MiB). Security boundary against pixel-bomb attacks where malformed images advertise small header dimensions but expand to gigabytes on decode. |
 
 Attachment kind is derived from `content_type`: MIME types matching `image/png`, `image/jpeg`, or `image/webp` are classified as `image`; all other supported types are classified as `document`.
 
@@ -1228,7 +1409,20 @@ sequenceDiagram
 
 **Description**: Thread summary is updated asynchronously after a chat turn when trigger conditions are met. Summary generation is a background task and MUST be attributed as `requester_type=system` so that its usage is not charged to an arbitrary end user.
 
-Summary quality gate (P1): the system MUST detect and mitigate obviously-bad summaries without ML-based evaluation.
+**P1 — Simple summarization (no quality gate):**
+
+- The background worker calls the LLM with a summarization prompt over the old messages batch.
+- If the LLM call succeeds: save the new `thread_summary` and mark the batch as `is_compressed = true`.
+- If the LLM call fails (provider error, timeout): keep the previous summary unchanged; do NOT mark messages as compressed; log the failure and increment `mini_chat_summary_fallback_total`.
+- No length or entropy validation is performed in P1.
+
+Observability (P1):
+
+- Increment `mini_chat_summary_fallback_total` when the worker falls back due to provider failure.
+
+**P2+ — Summary quality gate (deferred):**
+
+The following quality gate is deferred to P2+. It is preserved here for forward design continuity.
 
 - After generating a summary, the domain service MUST validate the candidate summary text.
 - If summary length < `X` OR entropy < `Y`, the domain service MUST attempt regeneration.
@@ -1238,10 +1432,10 @@ Summary quality gate (P1): the system MUST detect and mitigate obviously-bad sum
 
 `H_norm = (-sum(p_i * log2(p_i))) / log2(N)` where `p_i` is the empirical frequency of token `i` and `N` is the number of distinct tokens.
 
-Observability:
+Observability (P2+):
 
 - Increment `mini_chat_summary_regen_total{reason}` for each regeneration attempt (`reason` from a bounded allowlist such as `too_short|low_entropy|provider_error|invalid_format`).
-- Increment `mini_chat_summary_fallback_total` when the fallback behavior above is used.
+- Increment `mini_chat_summary_fallback_total` when the fallback behavior above is used (replaces the P1 metric of the same name).
 
 ### 3.7 Database Schemas & Tables
 
@@ -1260,14 +1454,14 @@ Observability:
 | title | VARCHAR(255) | Chat title (user-set or auto-generated) |
 | is_temporary | BOOLEAN | If true, auto-deleted after 24h (P2; default false at P1) |
 | created_at | TIMESTAMPTZ | Creation time |
-| updated_at | TIMESTAMPTZ | Last activity time |
+| updated_at | TIMESTAMPTZ | Last activity time (NOT NULL; always updated on message creation, turn creation, title change, etc.) |
 | deleted_at | TIMESTAMPTZ | Soft delete timestamp (nullable) |
 
 **PK**: `id`
 
-**Constraints**: NOT NULL on `tenant_id`, `user_id`, `created_at`
+**Constraints**: NOT NULL on `tenant_id`, `user_id`, `created_at`, `updated_at`
 
-**Indexes**: `(tenant_id, user_id, updated_at DESC)` for listing chats
+**Indexes**: `(tenant_id, user_id, updated_at DESC) WHERE deleted_at IS NULL` for listing chats (partial index excluding soft-deleted rows)
 
 **Secure ORM**: `#[secure(tenant_col = "tenant_id", owner_col = "user_id", resource_col = "id", no_type)]`
 
@@ -1282,22 +1476,23 @@ Observability:
 | request_id | UUID | Client-generated idempotency key (nullable). Used for completed replay and traceability. Running state is tracked in `chat_turns`. |
 | role | VARCHAR(16) | `user`, `assistant`, or `system` |
 | content | TEXT | Message content |
+| content_type | VARCHAR(32) | Internal content type: `text`, `system`, `tool_call`, or `tool_result`. Default `text`. Does not change P1 API payload shape. |
 | token_estimate | INTEGER | Estimated token count |
-| provider_name | VARCHAR(128) | Provider GTS identifier for assistant messages (nullable). Example: `gts.x.genai.mini_chat.provider.v1~msft.azure.azure_ai.model_api.v1~` |
 | provider_response_id | VARCHAR(128) | Provider response ID for assistant messages (nullable) |
 | request_kind | VARCHAR(16) | `chat`, `summary`, or `doc_summary` (nullable) |
 | features_used | JSONB | Feature flags and counters (nullable) |
 | input_tokens | BIGINT | Actual input tokens for assistant messages (nullable) |
 | output_tokens | BIGINT | Actual output tokens for assistant messages (nullable) |
-| model | VARCHAR(64) | **effective_model**: actual model used for this turn after quota/policy evaluation (nullable; set for assistant messages). May differ from `chats.model` (selected_model) when a downgrade occurred. |
+| model | VARCHAR(64) | **effective_model**: actual model used for this turn after quota/policy evaluation (nullable; set for assistant messages). May differ from `chats.model` (selected_model) when a downgrade occurred. Derived from `chat_turns.effective_model`. |
 | is_compressed | BOOLEAN | True if included in a thread summary |
 | created_at | TIMESTAMPTZ | Creation time |
+| deleted_at | TIMESTAMPTZ | Soft-delete timestamp (nullable). List queries exclude deleted rows. |
 
 **PK**: `id`
 
-**Constraints**: NOT NULL on `chat_id`, `role`, `content`, `created_at`. FK `chat_id` -> `chats.id` ON DELETE CASCADE. UNIQUE on `(chat_id, request_id)` WHERE `request_id IS NOT NULL`.
+**Constraints**: NOT NULL on `chat_id`, `role`, `content`, `content_type`, `created_at`. FK `chat_id` -> `chats.id` ON DELETE CASCADE. UNIQUE on `(chat_id, request_id, role)` WHERE `request_id IS NOT NULL AND deleted_at IS NULL` (allows one user message and one assistant message per request_id; maintains idempotency).
 
-**Indexes**: `(chat_id, created_at)` for loading recent messages
+**Indexes**: `(chat_id, created_at) WHERE deleted_at IS NULL` for loading recent messages (partial index excluding soft-deleted rows)
 
 **Secure ORM**: No independent `#[secure]` — accessed through parent chat. Queries are filtered by `chat_id` obtained from a scoped chat query.
 
@@ -1323,7 +1518,9 @@ Tracks idempotency and in-progress generation state for `request_id`. This avoid
 | max_output_tokens_applied | INTEGER | The `max_output_tokens` value used at preflight for this turn. Persisted at preflight (same time as `reserve_tokens`). Nullable — NULL only for pre-reserve failures. Immutable after insert. Required for deterministic derivation of `estimated_input_tokens` at settlement time: `estimated_input_tokens = reserve_tokens - max_output_tokens_applied` (sections 5.8, 5.9). |
 | reserved_credits_micro | BIGINT | Worst-case credit reserve computed at preflight: `credits_micro(estimated_input_tokens, max_output_tokens_applied, in_mult, out_mult)` where `estimated_input_tokens = reserve_tokens - max_output_tokens_applied` (section 5.4.1), using multipliers from the policy snapshot identified by `policy_version_applied`. Persisted at preflight. Nullable — NULL only for pre-reserve failures. Immutable after insert. Used for reserve release/reconciliation at settlement (section 5.4.4). |
 | policy_version_applied | BIGINT | Monotonic version of the policy snapshot (section 5.2.1) used for this turn's preflight reserve, tier selection, and settlement. Persisted at preflight. Nullable — NULL only for pre-reserve failures. Immutable after insert. Required for deterministic credit computation at settlement and for CCM billing reconciliation. |
-| effective_model | VARCHAR(64) | Model resolved at preflight after quota downgrade cascade. Persisted at preflight. Nullable — NULL only for pre-reserve failures. Immutable after insert. Also recorded on `messages.model` for the assistant message. |
+| effective_model | VARCHAR(64) | Model resolved at preflight after quota downgrade cascade. Persisted at preflight. Nullable — NULL only for pre-reserve failures. Immutable after insert. **Single source of truth** for the model used in this turn. Also recorded on `messages.model` for the assistant message. |
+| minimal_generation_floor_applied | INTEGER | The `minimal_generation_floor` value from MiniChat config (NOT from CCM policy snapshot) captured at preflight. Persisted at preflight (same time as `reserve_tokens` and `policy_version_applied`). Nullable — NULL only for pre-reserve failures. Immutable after insert. Required for deterministic estimated settlement (sections 5.8, 5.9) when provider-reported usage is unavailable (aborted/failed/orphan outcomes). This is the ONLY estimation budget parameter that influences settlement; all other estimation budgets (bytes_per_token_conservative, safety_margin_pct, etc.) are preflight-only and MUST NOT affect settlement. |
+| error_detail | TEXT | Non-sensitive diagnostic information for failed turns (nullable). Not exposed in public API. |
 | deleted_at | TIMESTAMPTZ | Soft-delete timestamp for turn mutations (nullable). Set when a turn is replaced by retry or edit, or explicitly deleted. |
 | replaced_by_request_id | UUID | `request_id` of the new turn that replaced this one via retry or edit (nullable). Stored on the old (soft-deleted) turn to provide audit traceability. Not used by delete. |
 | started_at | TIMESTAMPTZ | DB-assigned turn creation timestamp (set on INSERT). Used for ordering and latest-turn selection in P1. |
@@ -1332,10 +1529,16 @@ Tracks idempotency and in-progress generation state for `request_id`. This avoid
 
 **PK**: `id`
 
-**Constraints**: UNIQUE on `(chat_id, request_id)`. FK `chat_id` -> `chats.id` ON DELETE CASCADE.
+**Constraints**:
+- UNIQUE on `(chat_id, request_id)`
+- FK `chat_id` -> `chats.id` ON DELETE CASCADE
+- CHECK `requester_type IN ('user', 'system')`
+- CHECK `(state IN ('completed', 'failed', 'cancelled') AND completed_at IS NOT NULL) OR (state NOT IN ('completed', 'failed', 'cancelled'))` — **Prevents half-finalized turns after crashes or partial writes**. Terminal states (completed/failed/cancelled) MUST have `completed_at` timestamp. This guarantees that any terminal state implies finalization timestamp is present, supporting exactly-once settlement/outbox semantics and simplifying crash recovery reasoning.
+- CHECK `(state = 'running' AND completed_at IS NULL) OR (state != 'running')` — **Running turns cannot have `completed_at` timestamp**. Prevents premature completion marking before finalization logic completes.
 
 **Indexes (P1)**:
 - `(chat_id, started_at DESC) WHERE deleted_at IS NULL`
+- `UNIQUE(chat_id) WHERE state = 'running' AND deleted_at IS NULL` (guarantees at most one concurrent running turn per chat)
 
 A `chat_turns` row MUST be created before starting the outbound provider request; initial state is `running`.
 
@@ -1361,9 +1564,11 @@ Soft-delete rules:
 | id | UUID | Attachment identifier |
 | tenant_id | UUID | Owning tenant |
 | chat_id | UUID | Parent chat (FK -> chats.id) |
+| uploaded_by_user_id | UUID | User who uploaded the attachment. Required for audit and delete scenarios. |
 | filename | VARCHAR(255) | Original filename |
 | content_type | VARCHAR(128) | MIME type |
 | size_bytes | BIGINT | File size |
+| storage_backend | VARCHAR(32) | Internal storage routing: `azure` (default). Not exposed in public API. Does NOT store URLs. |
 | provider_file_id | VARCHAR(128) | LLM provider file ID - OpenAI `file-*` or Azure OpenAI `assistant-*` (nullable until upload completes). Internal-only; MUST NOT be exposed via any API response. |
 | status | VARCHAR(16) | `pending`, `ready`, `failed` |
 | attachment_kind | VARCHAR(16) | `document` or `image`. Derived from `content_type` on INSERT: MIME types `image/png`, `image/jpeg`, `image/webp` -> `image`; all others -> `document`. Stored explicitly for efficient query filtering. |
@@ -1378,10 +1583,11 @@ Soft-delete rules:
 | last_cleanup_error | TEXT | Last cleanup error (nullable) |
 | cleanup_updated_at | TIMESTAMPTZ | When cleanup state was last updated (nullable) |
 | created_at | TIMESTAMPTZ | Upload time |
+| deleted_at | TIMESTAMPTZ | Soft-delete timestamp (nullable). Queries exclude deleted rows. |
 
 **PK**: `id`
 
-**Constraints**: NOT NULL on `tenant_id`, `chat_id`, `filename`, `status`, `attachment_kind`, `created_at`. FK `chat_id` -> `chats.id` ON DELETE CASCADE. CHECK `attachment_kind IN ('document', 'image')`.
+**Constraints**: NOT NULL on `tenant_id`, `chat_id`, `uploaded_by_user_id`, `filename`, `status`, `attachment_kind`, `storage_backend`, `created_at`. FK `chat_id` -> `chats.id` ON DELETE CASCADE. CHECK `attachment_kind IN ('document', 'image')`.
 
 **Secure ORM**: No independent `#[secure]` — accessed through parent chat. Owner isolation inherited from chat-level scoping (`chat_id` obtained from a scoped chat query).
 
@@ -1396,11 +1602,12 @@ Soft-delete rules:
 | summary_text | TEXT | Compressed conversation summary |
 | summarized_up_to | UUID | Last message ID included in this summary |
 | token_estimate | INTEGER | Estimated token count of summary |
-| updated_at | TIMESTAMPTZ | Last update time |
+| created_at | TIMESTAMPTZ | Creation time (NOT NULL, DEFAULT now()) |
+| updated_at | TIMESTAMPTZ | Last update time (NOT NULL, DEFAULT now()) |
 
 **PK**: `id`
 
-**Constraints**: UNIQUE on `chat_id`. FK `chat_id` -> `chats.id` ON DELETE CASCADE.
+**Constraints**: UNIQUE on `chat_id`. FK `chat_id` -> `chats.id` ON DELETE CASCADE. NOT NULL on `created_at`, `updated_at`. 1:1 relationship with chat enforced by UNIQUE(chat_id).
 
 **Secure ORM**: No independent `#[secure]` — accessed through parent chat.
 
@@ -1491,7 +1698,7 @@ If the chat is soft-deleted before vector store creation completes, the creation
 | user_id | UUID | User |
 | period_type | VARCHAR(16) | `daily` or `monthly` (P2+: `4h`, `weekly`) |
 | period_start | DATE | Start of the period |
-| bucket | VARCHAR(32) | Quota enforcement scope. NOT NULL. Canonical values: `total` (overall cap — includes all tiers), `tier:premium` (premium-only subcap). A `tier:standard` bucket MAY exist for analytics but MUST NOT be required for enforcement correctness. |
+| bucket | VARCHAR(32) | Quota enforcement scope. NOT NULL. Canonical values: `total` (overall cap across ALL tiers — this is the global ceiling), `tier:premium` (premium-only subcap). A `tier:standard` bucket MAY exist for analytics but MUST NOT be required for enforcement correctness. |
 | spent_credits_micro | BIGINT | Total committed (settled) credits in micro-credits for this bucket (default 0). Incremented atomically at settlement by `actual_credits_micro` (section 5.4.4). This is the credit-denominated enforcement counter. |
 | reserved_credits_micro | BIGINT | Sum of in-flight (unsettled) credit reserves for this bucket (default 0). Incremented at preflight by the turn's `reserved_credits_micro`; decremented at settlement by the same amount (section 5.4.3–5.4.4). Used to prevent parallel requests from overspending. |
 | calls | INTEGER | Number of completed turns settled against this bucket (default 0). Incremented by 1 at settlement. In bucket `total` this counts all turns; in bucket `tier:premium` only premium-tier turns. Telemetry only — NOT used for enforcement. |
@@ -1516,8 +1723,8 @@ If the chat is soft-deleted before vector store creation completes, the creation
   - Standard-tier turns do NOT require a `tier:premium` row update.
 
 - **At settlement (commit)**:
-  - Always (bucket `total`): `reserved_credits_micro -= turn_reserved_credits_micro; spent_credits_micro += actual_credits_micro; calls += 1; input_tokens += actual_input_tokens; output_tokens += actual_output_tokens`.
-  - If the turn ran on premium tier (bucket `tier:premium`): `reserved_credits_micro -= turn_reserved_credits_micro; spent_credits_micro += actual_credits_micro; calls += 1`.
+  - Always (bucket `total`): `reserved_credits_micro -= turn_reserved_credits_micro; spent_credits_micro += turn_actual_credits_micro; calls += 1; input_tokens += actual_input_tokens; output_tokens += actual_output_tokens`.
+  - If the turn ran on premium tier (bucket `tier:premium`): `reserved_credits_micro -= turn_reserved_credits_micro; spent_credits_micro += turn_actual_credits_micro; calls += 1`.
   - Token telemetry counters (`input_tokens`, `output_tokens`) are updated only in bucket `total`.
 
 Both operations MUST target the correct `(tenant_id, user_id, period_type, period_start, bucket)` row(s) within the finalization transaction. Image accounting: on each turn that includes images, increment `image_inputs` by the number of images in the request on the `total` bucket row. On each image upload, increment `image_upload_bytes` by the uploaded file size on the `total` bucket row. Preflight checks MUST validate `image_upload_bytes` caps on upload requests and MUST validate `image_inputs` caps on send-message requests (plus any optional per-turn byte caps computed from attachment metadata).
@@ -1529,6 +1736,45 @@ Both operations MUST target the correct `(tenant_id, user_id, period_type, perio
 **Indexes**: `(tenant_id, user_id, period_type, period_start, bucket)` for quota lookups
 
 **Secure ORM**: `#[secure(tenant_col = "tenant_id", owner_col = "user_id", resource_col = "id", no_type)]`
+
+#### Bucket Semantics and Naming Clarification (Normative)
+
+**The `total` bucket is the GLOBAL CEILING:**
+
+The bucket named `total` represents the overall quota limit across ALL model tiers. This is confusingly mapped to `user_limits.standard.limit_{period}` in configuration, but the semantics are:
+
+- **`total` bucket = global ceiling** (sum of all tiers' spend)
+- **`tier:premium` bucket = premium subcap** (premium-only spend, must be ≤ total)
+
+**Concrete example:**
+
+Policy configuration:
+```yaml
+user_limits:
+  standard:
+    limit_daily: 1000  # GLOBAL daily cap, NOT standard-tier-only
+    limit_monthly: 30000
+  premium:
+    limit_daily: 300   # Premium subcap (≤ standard.limit_daily)
+    limit_monthly: 8000
+```
+
+Interpretation:
+- User has 1000 credits/day total (bucket `total`)
+- User can spend at most 300 credits/day on premium models (bucket `tier:premium`)
+- When premium quota is exhausted, user can still use standard models until the total (1000) is exhausted
+
+**Why is it named this way?**
+
+The "standard tier" limit serves double duty:
+1. It's the global ceiling (all tiers combined)
+2. It's also the effective limit for standard-tier-only usage (when premium is not used)
+
+Alternative naming (NOT in P1):
+- `global.limit_daily` instead of `standard.limit_daily` would be clearer
+- Deferred to P2+ configuration refactor
+
+**Enforcement algorithm:** See `tier_available()` function in section 5.4.2 for how these buckets are checked during the downgrade cascade.
 
 #### Table: message_reactions
 
@@ -1886,6 +2132,7 @@ A turn is a user-message + assistant-response pair identified by `request_id` in
 3. Retry, edit, and delete are allowed only if the target turn is in a terminal state (`completed`, `failed`, or `cancelled`). If the turn is `running`, reject with `400 Bad Request` — the client must wait for completion or cancel by disconnecting the SSE stream (see `cpt-cf-mini-chat-seq-cancellation`).
 4. Retry and edit soft-delete the previous turn (set `deleted_at`) and set `replaced_by_request_id` on the old turn pointing to the new turn's `request_id`. Delete sets `deleted_at` only (no replacement turn). Mutation eligibility considers only non-deleted turns, so delete cannot target an already replaced (soft-deleted) turn.
 5. Soft-deleted turns (`deleted_at IS NOT NULL`) are excluded from active conversation history and context assembly but retained in storage for audit traceability.
+6. **Atomicity invariant (normative)**: The "latest turn" identity check (rule 1), the terminal state check (rule 3), the soft-delete of the old turn, and the INSERT of the new `running` turn MUST all execute within a single DB transaction using `SELECT FOR UPDATE` or equivalent serializable isolation. Without this, two concurrent retry/edit requests for the same turn can both pass the validation checks simultaneously, both soft-delete the old turn (the second soft-delete is a no-op since `deleted_at` is already set), and both attempt to INSERT a new running turn — which violates the `UNIQUE(chat_id) WHERE state = 'running' AND deleted_at IS NULL` index. If the new running turn INSERT fails due to this unique constraint (concurrent race condition), the mutation MUST return `409 Conflict` with `code = "generation_in_progress"` (not HTTP 500).
 
 #### Turn Mutation API Contracts
 
@@ -2157,6 +2404,43 @@ This instruction is a **soft guideline** appended to the system prompt only when
 
 **Citations**: Web search results are mapped to `event: citations` items with `source: "web"`, `url`, `title`, and `snippet` fields via the same provider event translation layer used for file_search.
 
+#### Web Search Quota Enforcement (P1 Determinism Rules)
+
+Web search quota enforcement follows deterministic preflight checks with no retroactive refunds:
+
+**Preflight Checks** (executed BEFORE opening SSE stream):
+
+1. **Kill Switch Check**: If `disable_web_search=true` AND `request.web_search.enabled=true`:
+   - Reject with HTTP 400
+   - Error code: `"web_search_disabled"`
+   - Error message: "Web search is currently disabled"
+   - quota_scope: omitted (not a quota issue)
+
+2. **Daily Quota Check**: If `request.web_search.enabled=true`:
+   - Load user's daily web_search_calls usage from `quota_usage`
+   - If `daily_usage >= daily_quota`:
+     - Reject with HTTP 429
+     - Error code: `"quota_exceeded"`
+     - Error message: "Daily web search quota exceeded"
+     - quota_scope: `"web_search"` (distinguishes from token quota)
+
+**Mid-Turn Hard Limit Enforcement**:
+
+3. **Per-Message Tool Call Limit**: During turn execution, track web_search tool calls made by the provider.
+   - Hard limit: `max_calls_per_message` (configurable, default: 2)
+   - If exceeded mid-turn:
+     - Finalize turn as `failed` with `error_code = "web_search_calls_exceeded"` (not `quota_exceeded`)
+     - Settle tokens based on actual/estimated usage at that point
+     - **NO REFUNDS**: Do NOT attempt to refund surcharge tokens
+     - Emit outbox event with `outcome="failed"`, `settlement_method="actual"` (if provider reported partial usage) OR `"estimated"` (if no usage available)
+
+**No Refund Logic**: If tool call limit is breached mid-turn, the system finalizes the turn as failed and settles using available usage data. The web_search_surcharge_tokens applied at preflight are NOT refunded. Mid-turn failures are treated as normal terminal errors with deterministic settlement (section 5.7).
+
+**Error Codes Summary**:
+- `web_search_disabled` → HTTP 400 (kill switch active)
+- `quota_exceeded` with quota_scope=`"web_search"` → HTTP 429 (daily quota exhausted)
+- `web_search_calls_exceeded` → HTTP 200 + SSE `event: error` (per-message tool call limit breached mid-turn; not HTTP 429; turn finalized as `failed`)
+
 ### File Search Retrieval Scope
 
 **Physical store**: one dedicated vector store per chat (see `chat_vector_stores` table). Created on first document upload to the chat. All document attachments in a chat are indexed in the same physical vector store.
@@ -2215,6 +2499,18 @@ To prevent retrieval quality degradation on large document sets:
 All values are configurable per deployment. The domain service enforces `max_documents_per_chat`, `max_total_upload_mb_per_chat`, and `max_chunks_per_chat` at upload time (reject with HTTP 400 if exceeded). Retrieval-time controls (`max_retrieved_chunks_per_turn`, `max_retrieved_tokens_per_turn`, `retrieval_k`) are enforced during context plan assembly.
 
 Since each chat has a dedicated vector store, these limits directly bound the size of each vector store. The `max_chunks_per_chat` limit (default: 10,000) serves as both a RAG quality control and a vector store growth guardrail. No additional per-user aggregate limit is enforced at P1; operators can monitor total vector store count per user via metrics (`mini_chat_vector_stores_per_user` gauge).
+
+#### File Search Per-Message Call Limit Enforcement (P1)
+
+The file search per-message call limit (`max_calls_per_message`, default: 2) is enforced at **preflight only** in P1.
+
+**Preflight enforcement**: The `file_search_surcharge_tokens` budget included in the reserve estimate covers up to `max_calls_per_message` invocations. No mid-stream monitoring or hard stop is implemented for file_search calls in P1. There is no `file_search_calls_exceeded` error code or mid-turn finalization path for file_search at P1 scope.
+
+**Post-hoc accounting**: After the provider reports actual token usage, the system applies standard commit-vs-reserve settlement regardless of how many file_search calls the provider actually made. If the provider makes fewer calls than budgeted, actual token usage is lower and any underspend is released. If the provider makes more calls than `max_calls_per_message`, the additional token cost is subject to the standard `overshoot_tolerance_factor` cap — overruns beyond tolerance are capped at `reserve_tokens` per §5.4.5. No separate mid-stream enforcement, error_code, or settlement exception applies.
+
+**Rationale**: Unlike web search (which incurs discrete per-call surcharges tracked in a daily quota bucket requiring mid-turn enforcement), file_search surcharge tokens are a fixed per-turn budget estimate baked into the reserve. Enforcement at preflight by sizing the reserve to cover `max_calls_per_message` calls provides sufficient cost bounding without requiring SSE event monitoring. Mid-stream abort on file_search call count exceed (analogous to web search's Mid-Turn Hard Limit Enforcement) is deferred to P2+.
+
+**Scope note**: Operators can detect excessive file_search call usage via audit logs. Per-message mid-stream file_search call count enforcement is explicitly out of P1 scope.
 
 ### Model Catalog Configuration
 
@@ -2335,6 +2631,13 @@ fn remaining_credits(bucket, period) -> i64:
 #   bucket 'total'        -> user_limits.standard.limit_{period}  (overall cap)
 #   bucket 'tier:premium' -> user_limits.premium.limit_{period}   (premium subcap)
 
+**Variable naming convention in settlement pseudocode:**
+- `reserved_credits_micro`, `spent_credits_micro` — bucket row fields (accumulator state)
+- `turn_reserved_credits_micro` — the reserved value for THIS turn (from `chat_turns.reserved_credits_micro`)
+- `turn_actual_credits_micro` — the computed actual credits for THIS turn (from settlement formula)
+
+All pseudocode in this section follows this naming convention to distinguish row fields from turn-specific values.
+
 fn tier_available(tier, periods) -> bool:
     if tier == standard:
         # standard availability: overall cap only
@@ -2344,32 +2647,47 @@ fn tier_available(tier, periods) -> bool:
         return periods.iter().all(|p|
             remaining_credits('total', p) > 0
             AND remaining_credits('tier:premium', p) > 0)
+# NOTE: tier_available() above is an illustrative helper used in the
+# preflight pseudocode. It checks whether ANY credits remain but does NOT
+# account for the current request's reserve size. The normative availability
+# check that MUST be used in implementation is bucket_available() defined in
+# §5.4.2, which takes this_request_reserved_credits_micro as a parameter and
+# verifies that the current request's reserve fits within the remaining budget:
+#   spent + reserved_by_others + this_request_reserve <= limit
+# Using tier_available() alone without bucket_available() would allow a request
+# to proceed even when its reserve would exceed the remaining quota.
 
 Preflight (reserve) (before LLM call):
   estimated_input_tokens = tokens(ContextPlan) + surcharges   # see section 5.4.1
   max_output_tokens_applied = max_output_tokens                # persisted on chat_turns
   reserve_tokens = estimated_input_tokens + max_output_tokens_applied
-  reserved_credits = credits_micro(estimated_input_tokens, max_output_tokens_applied, in_mult, out_mult)
+  turn_reserved_credits_micro = credits_micro(estimated_input_tokens, max_output_tokens_applied, in_mult, out_mult)
   cascade = [premium, standard]  # fixed order
   effective_tier = first tier in cascade where tier_available(tier, [daily, monthly])
   if none -> reject with quota_exceeded (429)
-  reserve(effective_tier, reserved_credits)
+  reserve(effective_tier, turn_reserved_credits_micro)
   # reserve atomically increments quota_usage.reserved_credits_micro:
   #   - always: bucket 'total' for all applicable period rows
   #   - if effective_tier == premium: also bucket 'tier:premium' for all applicable period rows
 
 Commit (after done event):
-  actual_credits = credits_micro(usage.input_tokens, usage.output_tokens, in_mult, out_mult)
+  # in_mult, out_mult MUST be read from the PolicySnapshot identified by
+  # chat_turns.policy_version_applied (the version bound at preflight), NOT
+  # from the current live snapshot. See §5.2.9 settlement determinism rule.
+  turn_actual_credits_micro = credits_micro(usage.input_tokens, usage.output_tokens, in_mult, out_mult)
   # atomically for each applicable period row:
   #   bucket 'total':
-  #     reserved_credits_micro -= reserved_credits
-  #     spent_credits_micro += actual_credits
+  #     reserved_credits_micro -= turn_reserved_credits_micro
+  #     spent_credits_micro += turn_actual_credits_micro
   #     calls += 1; input_tokens += usage.input_tokens; output_tokens += usage.output_tokens
   #   if effective_tier == premium, also bucket 'tier:premium':
-  #     reserved_credits_micro -= reserved_credits
-  #     spent_credits_micro += actual_credits
+  #     reserved_credits_micro -= turn_reserved_credits_micro
+  #     spent_credits_micro += turn_actual_credits_micro
   #     calls += 1
-  (if actual_credits > reserved_credits -> debit overshoot, never cancel completed response)
+  # NOTE: when overshoot exceeds overshoot_tolerance_factor (§5.4.5), replace
+  # turn_actual_credits_micro with committed_credits_micro (= reserved_credits_micro)
+  # for the spent_credits_micro increment. See §5.3.1 glossary and §5.4.5.
+  (if turn_actual_credits_micro > turn_reserved_credits_micro -> debit overshoot, never cancel completed response)
 ```
 
 **Cascade evaluation example** (truth table):
@@ -2402,10 +2720,11 @@ The domain service resolves the effective model for each turn before any outboun
    a. If the tier is disabled by a kill switch, skip.
    b. Evaluate `tier_available(tier)`: the tier is available only if `remaining_credits(bucket, period) > 0` for ALL required buckets and ALL enabled periods (daily AND monthly). For standard: check bucket `total`. For premium: check buckets `total` AND `tier:premium`.
    c. If available, select a concrete model for that tier:
-      - Prefer the model marked `is_default: true` in that tier.
-      - If no default, choose the first enabled model in that tier (catalog order).
+      - Prefer the model marked `is_default: true` in that tier, **provided it has `global_enabled=true`**.
+      - If the default model is absent or has `global_enabled=false`, choose the first model in the tier with `global_enabled=true` (catalog order).
+      - If no `global_enabled=true` model exists for this tier (all individually disabled), treat the tier as unavailable and continue the cascade. Per-model disablement via `global_enabled=false` is orthogonal to tier-level quota and kill switches; a tier with quota remaining but no enabled models is still treated as exhausted.
    d. Set `effective_model` to the selected model and stop.
-4. If no tier is available after the full cascade, reject with HTTP 429 `quota_exceeded`.
+4. If no tier is available after the full cascade, reject with HTTP 429 `quota_exceeded`. This covers both quota exhaustion and the case where all models across all tiers have `global_enabled=false`.
 
 ```text
 fn resolve_effective_model(selected_model, catalog, usage, kill_switches) -> Result<Model, QuotaExceeded>:
@@ -2413,9 +2732,11 @@ fn resolve_effective_model(selected_model, catalog, usage, kill_switches) -> Res
     for tier in cascade:
         if kill_switches.is_disabled(tier): continue
         if tier_available(tier, usage):
-            model = catalog.default_for(tier)
+            # Only consider models with global_enabled=true
+            model = catalog.default_for_enabled(tier)
                     .or_else(|| catalog.first_enabled(tier))
-            return Ok(model)
+            if model.is_none(): continue  # all models in tier are individually disabled; try next tier
+            return Ok(model.unwrap())
     return Err(quota_exceeded)
 ```
 
@@ -2426,6 +2747,32 @@ fn resolve_effective_model(selected_model, catalog, usage, kill_switches) -> Res
 - **reject**: no tier available. Return HTTP 429 with error code `quota_exceeded`. The request never reaches OAGW.
 
 **P1 Invariant**: all enabled catalog models MUST include `VISION_INPUT` capability, so downgrade cannot cause an image request to fail due to missing vision support.
+
+#### Effective Model Computed Once (P1 Determinism Rule)
+
+**The `effective_model` is resolved ONCE at preflight and persisted in `chat_turns.effective_model`. Settlement MUST NEVER recompute the effective_model or re-run the downgrade cascade.**
+
+**Rationale**: Recomputing the effective_model at settlement time creates non-determinism and divergence risks:
+- Policy snapshots may have changed between preflight and settlement
+- Quota state may have changed (different downgrade decision)
+- Kill switches may have changed
+- This can result in billing/audit events with inconsistent model metadata
+
+**Preflight phase** (BEFORE any provider call):
+1. Call `resolve_effective_model(selected_model, catalog, usage, kill_switches)`
+2. Persist result in `chat_turns.effective_model`
+3. Persist `policy_version_applied` from the policy snapshot used for resolution
+4. Compute reserve and proceed with turn
+
+**Settlement phase** (after terminal event):
+1. Read `effective_model` from `chat_turns` row (IMMUTABLE)
+2. Read `policy_version_applied` from `chat_turns` row (IMMUTABLE)
+3. Load policy snapshot by version (NOT current policy)
+4. Get model multipliers from `catalog[effective_model]` within that snapshot
+5. Compute credits using stored effective_model multipliers
+6. NEVER call `resolve_effective_model()` again
+
+**Outbox emission**: The outbox payload MUST include both `effective_model` (from `chat_turns.effective_model`) and `selected_model` (from `chats.model`) so downstream systems can see both the user's choice and the actual model used. The `effective_model` in the outbox payload is the authoritative value for billing reconciliation.
 
 ### Provider Request Metadata
 
@@ -2624,6 +2971,21 @@ The following metric series MUST be exposed (types and label sets shown). These 
 - `mini_chat_audit_redaction_hits_total{pattern}` (counter; `pattern` MUST be from a bounded allowlist)
 - `mini_chat_audit_emit_latency_ms` (histogram)
 
+##### Outbox health and monitoring (P1)
+
+- `mini_chat_outbox_dead_total` (counter; total outbox events that reached `dead` status after max retry attempts)
+- `mini_chat_outbox_pending_age_seconds` (histogram; age of pending outbox events in seconds; measured from `created_at` to `now()`)
+- `mini_chat_outbox_dead_rows` (gauge; current count of dead outbox rows with `namespace='mini-chat'` and `status='dead'`)
+- `mini_chat_outbox_oldest_pending_age_seconds` (gauge; age of oldest pending row in seconds)
+- `mini_chat_outbox_enqueue_total{result}` (counter; `result`: `ok|dedupe`)
+- `mini_chat_outbox_dispatch_total{result}` (counter; `result`: `delivered|retryable_error|dead`)
+
+**Health degradation rules**:
+- If `mini_chat_outbox_dead_rows > 100` (configurable threshold): health status SHOULD be `degraded` with reason "Outbox has N dead rows (threshold: M)"
+- If `mini_chat_outbox_oldest_pending_age_seconds > 3600` (1 hour): health status SHOULD be `degraded` with reason "Oldest pending outbox event is N seconds old"
+
+**Periodic collector**: A background task MUST periodically (recommended: every 60 seconds) query `modkit_outbox_events` table to update gauge metrics (`mini_chat_outbox_dead_rows`, `mini_chat_outbox_oldest_pending_age_seconds`).
+
 ##### DB health (infra/storage)
 
 - `mini_chat_db_query_latency_ms{query}` (histogram; `query` from a bounded allowlist)
@@ -2748,16 +3110,60 @@ These are deployment constraints that must be validated during infrastructure se
 
 #### Turn State Model
 
-Every user-initiated streaming turn creates a `chat_turns` row with four possible states:
+Every user-initiated streaming turn that reaches preflight reserve creation inserts a `chat_turns` row with four possible states. Pre-reserve failures (validation errors, authorization denials before preflight completes) do not create a `chat_turns` row.
 
 | State | Meaning | Terminal? |
 |-------|---------|-----------|
 | `running` | Generation in progress; SSE stream active | No |
 | `completed` | Provider returned terminal `response.completed`; assistant message persisted | Yes |
-| `failed` | Provider error, preflight rejection, or orphan watchdog timeout | Yes |
+| `failed` | Provider error, post-reserve preflight rejection, or orphan watchdog timeout | Yes |
 | `cancelled` | Client disconnected and cancellation propagated | Yes |
 
 Allowed transitions: `running` → `completed` | `failed` | `cancelled`. No transitions out of terminal states.
+
+**Turn Lifecycle State Machine:**
+
+```mermaid
+stateDiagram-v2
+    [*] --> running: POST /messages:stream<br/>(creates chat_turns row)
+
+    running --> completed: Provider terminal done event<br/>(CAS: WHERE state='running')
+    running --> failed: Provider terminal error<br/>(CAS: WHERE state='running')
+    running --> cancelled: Client disconnect<br/>(CAS: WHERE state='running')
+    running --> failed: Orphan watchdog timeout<br/>(error_code='orphan_timeout')<br/>(CAS: WHERE state='running')
+
+    completed --> [*]: Terminal state<br/>(immutable)
+    failed --> [*]: Terminal state<br/>(immutable)
+    cancelled --> [*]: Terminal state<br/>(immutable)
+
+    note right of running
+        CAS Guard ensures mutual exclusion:
+        UPDATE chat_turns
+        SET state = :terminal_state
+        WHERE id = :turn_id
+          AND state = 'running'
+
+        Exactly one finalizer wins.
+    end note
+
+    note right of completed
+        Billing outcome: COMPLETED
+        Settlement: actual provider usage
+    end note
+
+    note right of failed
+        Billing outcome: FAILED or ABORTED
+        - FAILED: provider error
+        - ABORTED: orphan timeout
+        Settlement: actual or estimated
+    end note
+
+    note right of cancelled
+        Billing outcome: ABORTED
+        Settlement: estimated
+        (min(reserve, est_input + floor))
+    end note
+```
 
 **Key invariants**:
 - `(chat_id, request_id)` is unique (enforced by DB constraint on `chat_turns`).
@@ -2785,13 +3191,55 @@ A periodic background job detects and cleans up turns abandoned by crashed pods.
 
 **Timeout**: configurable per deployment; default: 5 minutes.
 
+> Where:
+>
+> * `:orphan_timeout` — interval duration in seconds. **Configuration source (P1)**: read from MiniChat ConfigMap key `orphan_watchdog.timeout_seconds` (integer). Default value: `300` (5 minutes). MUST be validated at startup: `60 <= timeout_seconds <= 3600`. Values outside this range MUST be rejected as invalid configuration.
+> * `started_at` — persisted timestamp from `chat_turns.started_at` (TIMESTAMPTZ, immutable after insert, set at turn creation)
+> * `now()` — current database server time (UTC). The watchdog query MUST use `now()` (Postgres server time) for monotonic clock consistency, not application-side timestamps.
+> * **Configuration change semantics**: changes to `orphan_watchdog.timeout_seconds` take effect at the next watchdog poll cycle. In-flight turns are subject to the timeout value active at the time the watchdog evaluates them. This means a ConfigMap change can immediately affect which turns are classified as orphaned (operational note; deterministic per evaluation instant).
+
 **Action** (all steps in a single DB transaction, using the finalization CAS guard defined in section 5.7):
 1. Execute: `UPDATE chat_turns SET state = 'failed', error_code = 'orphan_timeout', completed_at = now() WHERE id = :turn_id AND state = 'running'`. If `rows_affected = 0`, another finalizer already completed this turn — skip to step 4 (metric only).
 2. Commit a bounded best-effort quota debit for the turn (same rule as cancel/disconnect: debit the reserved estimate).
 3. Insert a `modkit_outbox_events` row with `outcome = "aborted"`, `settlement_method = "estimated"` (see section 5.7 turn finalization contract). The orphan watchdog uses billing outcome `"aborted"` (not `"failed"`) because the stream ended without a provider-issued terminal event — consistent with the ABORTED billing state (section 5.8).
 4. Emit metric: `mini_chat_orphan_turn_total` (counter, labeled by `chat_id` excluded — use only low-cardinality labels such as `{reason}` where `reason` = `timeout`).
 
-**Scheduling**: the watchdog runs as a periodic task within the module (e.g. every 60 seconds). It MUST be leader-elected or sharded to avoid duplicate transitions across replicas.
+**Scheduling**: the watchdog runs as a periodic task within the module (e.g. every 60 seconds). It MUST use leader election to ensure exactly one active watchdog instance per environment.
+
+##### Watchdog Single-Actor Guarantee (P1 Mandatory)
+
+**Mechanism: ModKit Leader Election**
+
+The orphan watchdog MUST use ModKit's leader election primitive (or equivalent distributed coordination if ModKit leader election is unavailable). Only the elected leader pod executes watchdog scans. All non-leader replicas MUST skip watchdog execution entirely.
+
+**Configuration Example (ConfigMap)**:
+
+```yaml
+orphan_watchdog:
+  enabled: true
+  scan_interval_secs: 60
+  timeout_threshold_secs: 300
+```
+
+**Watchdog Invariants (P1 Mandatory MUST statements)**:
+
+1. **CAS Finalization Guard**: The watchdog MUST use the identical CAS finalization pattern as all other terminal paths:
+   ```sql
+   UPDATE chat_turns SET state = 'failed', error_code = 'orphan_timeout', completed_at = now()
+   WHERE id = :turn_id AND state = 'running'
+   ```
+   If `rows_affected = 0`, the turn was already finalized by another path; the watchdog MUST skip it (no quota settlement, no outbox emission).
+
+2. **Idempotency**: The watchdog MUST be safe under retries and duplicate scans. The CAS guard ensures at-most-once finalization per turn. The outbox `dedupe_key` ensures at-most-once event emission.
+
+3. **No Duplicate Outbox Rows**: The watchdog MUST rely on the outbox `dedupe_key` uniqueness constraint (`{tenant_id}/{turn_id}/{request_id}`) to prevent duplicate billing events. It MUST NOT implement separate deduplication logic.
+
+4. **No Terminal State Overwrites**: The watchdog MUST NOT transition a turn that is already in a terminal state (`completed`, `failed`, `cancelled`). The CAS guard (`WHERE state = 'running'`) enforces this; any watchdog logic that bypasses this guard is a correctness violation.
+
+5. **Billing Outcome Consistency**: The watchdog MUST derive the outbox `outcome` field using the normative mapping in section 5.8 (Normative Billing Outcome Derivation). For orphan timeout, the mapping is: `state = 'failed'` + `error_code = 'orphan_timeout'` → billing outcome `ABORTED` → outbox `outcome = "aborted"`, `settlement_method = "estimated"`.
+
+**Failure Mode**:
+- **Leader election failure**: Automatic re-election ensures continuity. Temporary scan delays (bounded by re-election time + orphan timeout) are acceptable; the system remains correct.
 
 #### Idempotency Rules
 
@@ -2806,6 +3254,21 @@ When a `POST /v1/chats/{id}/messages:stream` request arrives with a `(chat_id, r
 
 A new `request_id` is required for every retry attempt. The system never overwrites or reuses a turn record.
 
+**Replay Side-Effect-Free Invariant (P1)**:
+
+When replaying a `completed` turn for an existing `(chat_id, request_id)`, the system MUST:
+- Fetch stored assistant message content from the database
+- Stream it back to the client as SSE events (delta + done)
+- **MUST NOT** take a new quota reserve
+- **MUST NOT** update `quota_usage` or debit tokens/credits
+- **MUST NOT** insert a new `modkit_outbox_events` row
+- **MUST NOT** emit audit or billing events
+- **MUST NOT** call the LLM provider
+
+Replay is a pure read-and-relay operation. Only the original CAS-winning finalizer writes settlement and outbox (section 5.7). Replays and CAS-losers MUST never perform quota settlement or outbox emission.
+
+**Implementation requirement**: Replay MUST use a separate code path from normal turn execution. The replay handler MUST NOT have access to functions that perform quota reservation, settlement, or outbox enqueue. This separation prevents accidental side effects during replay.
+
 #### Parallel Turn Policy (P1)
 
 P1 enforces **at most one running turn per chat**. When a new `POST /messages:stream` request arrives for a chat that already has a `chat_turns` row with `state='running'`:
@@ -2813,7 +3276,27 @@ P1 enforces **at most one running turn per chat**. When a new `POST /messages:st
 - The request is rejected with `409 Conflict`.
 - The client must wait for the existing turn to reach a terminal state (or disconnect to trigger cancellation) before sending a new message.
 
-Enforcement: the domain service checks for an existing `running` turn in `chat_turns` before inserting a new row. The `(chat_id, request_id)` unique constraint prevents duplicate inserts; the single-running-turn check prevents concurrent generations within the same chat.
+**Check Priority Order (Normative)**:
+
+The domain service MUST perform checks in the following order to correctly handle idempotency vs parallel turn conflicts:
+
+1. **Idempotency check (highest priority)**: Query for existing `(chat_id, request_id)` in `chat_turns`:
+   - If found with `state = 'completed'` → **replay immediately** (side-effect-free, no further checks)
+   - If found with `state = 'running'` → **reject with `409 request_id_conflict`** ("active generation in progress for this request_id")
+   - If found with `state = 'failed'` or `'cancelled'` → **reject with `409 request_id_conflict`** ("client MUST use a new request_id to retry")
+   - If not found → proceed to step 2
+
+2. **Parallel turn check (second priority)**: Query for ANY `running` turn in this chat (any `request_id`):
+   - If found → **reject with `409 generation_in_progress`** ("a generation is already running for this chat")
+   - If not found → proceed to step 3
+
+3. **Preflight and insert**: Perform quota reserve, preflight validations, and insert new `chat_turns` row
+
+**Rationale for ordering**: Idempotency MUST be checked first to enable client reconnect with the same `request_id` during a later concurrent turn. If parallel turn check ran first, clients could not replay completed turns when a different request is running, breaking crash recovery.
+
+**Implementation trap**: Reversing this order (checking "any running turn" before "same request_id completed") will cause incorrect 409 responses when clients attempt idempotent replay during concurrent activity, amplifying retry storms and breaking the side-effect-free replay guarantee.
+
+Enforcement: The `(chat_id, request_id)` unique constraint prevents duplicate inserts; the single-running-turn check prevents concurrent generations within the same chat.
 
 ##### 409 Recovery and UX Invariant (P1)
 
@@ -2939,6 +3422,12 @@ Contents (logically):
   - `safety_margin_pct` (integer; percentage safety margin applied to text estimation; see section 5.5.4; e.g. 20 for 20%)
   - `minimal_generation_floor` (integer; minimum output token charge for streams that reached the provider; used as `charged_output_tokens` in estimated settlement paths; see section 5.8; MUST satisfy `0 < minimal_generation_floor <= max_output_tokens`)
 
+**Estimation Budgets Source (P1)**:
+
+In P1, `estimation_budgets` (image_token_budget, tool_surcharge_tokens, web_search_surcharge_tokens, bytes_per_token_conservative, fixed_overhead_tokens, safety_margin_pct, minimal_generation_floor) are configured **locally in MiniChat** via Kubernetes ConfigMap (or equivalent deployment configuration file). CCM PolicySnapshot in P1 does NOT include `estimation_budgets`.
+
+These budgets are used ONLY for preflight reserve estimation and admission control. They MUST be loaded at MiniChat startup and validated (non-negative values, sane bounds, `minimal_generation_floor <= max_output_tokens`). ConfigMap/config changes are operationally expected to be rolled out consistently across MiniChat pods (best-effort operational note; config drift detection is out of scope for P1).
+
 - `user_limits` (per user allocation; delivered/derived per-user, but tied to `policy_version`):
 
   - for each tier:
@@ -3002,7 +3491,7 @@ A PolicySnapshot is a versioned, immutable configuration object published by CCM
 
 - `policy_version` (monotonic identifier)
 - `model_catalog` (model entries with credit multipliers, capabilities, tier, display metadata)
-- `estimation_budgets` (fixed surcharge token budgets for preflight reserve estimation)
+- `estimation_budgets` (fixed surcharge token budgets for preflight reserve estimation). **Source split (normative)**: the fields `bytes_per_token_conservative`, `fixed_overhead_tokens`, `safety_margin_pct`, `image_token_budget`, `tool_surcharge_tokens`, and `web_search_surcharge_tokens` are part of this PolicySnapshot and versioned by `policy_version`. The field `minimal_generation_floor` is sourced from the MiniChat ConfigMap (NOT from this PolicySnapshot) and is captured per-turn into `chat_turns.minimal_generation_floor_applied` at preflight. PolicySnapshot-sourced values take effect when CCM publishes a new `policy_version`. ConfigMap-sourced values take effect on the next preflight after the ConfigMap is reloaded.
 - global kill switches (`disable_premium_tier`, `force_standard_tier`, `disable_web_search`)
 
 PolicySnapshot rules:
@@ -3112,6 +3601,13 @@ Quota settlement MUST be deterministic and reproducible from persisted data alon
 - If CCM changes allocation rules, it MUST bump `policy_version`. New turns will bind to the new version; existing turns remain settled under their bound version.
 - The outbox usage event MUST include `policy_version_applied` so that downstream consumers (CCM) can reconstruct the exact multipliers and verify the debited credits.
 
+**Config change isolation (P1)**:
+
+- Changes to MiniChat ConfigMap `estimation_budgets` (bytes_per_token_conservative, safety_margin_pct, image_token_budget, tool_surcharge_tokens, web_search_surcharge_tokens, minimal_generation_floor) MUST NOT affect settlement of already-started turns.
+- Estimated settlement (sections 5.8, 5.9) reads ONLY persisted per-turn fields (`reserve_tokens`, `max_output_tokens_applied`, `minimal_generation_floor_applied`) and policy snapshot multipliers (via `policy_version_applied`).
+- `minimal_generation_floor_applied` is captured at preflight and persisted on `chat_turns` to ensure deterministic settlement independent of future ConfigMap changes.
+- All other estimation budget parameters (bytes_per_token_conservative, safety_margin_pct, image_token_budget, tool_surcharge_tokens, web_search_surcharge_tokens) are preflight-only and MUST NOT be persisted or used by settlement logic.
+
 ### 5.3 Credit Arithmetic
 
 From here on we distinguish:
@@ -3162,6 +3658,94 @@ Where:
 - `input_tokens_credit_multiplier > 0` always
 - `output_tokens_credit_multiplier > 0` always
 
+#### Overflow Protection (Normative)
+
+**Problem:** The formula `input_tokens * in_mult` and `output_tokens * out_mult` can overflow i64 if token counts or multipliers are unbounded.
+
+**Mitigation strategy (defense in depth):**
+
+1. **Input validation bounds (enforced at multiple layers):**
+   - `input_tokens`, `output_tokens` ≤ 10,000,000 (ten million tokens, well above any P1 model context window)
+   - `in_mult`, `out_mult` ≤ 10,000,000,000 (ten billion micro-credits per 1K tokens = $10K per 1K tokens, absurdly high)
+   - These bounds MUST be validated:
+     - At policy snapshot load time (multipliers)
+     - At preflight when estimating input (estimated_input_tokens)
+     - At provider response parse time (actual usage from provider)
+   - Validation failure MUST reject the operation before attempting credit computation
+
+2. **Overflow detection (mandatory for production code):**
+
+   Implementations MUST use checked arithmetic or explicit overflow detection:
+
+   **Rust example (normative pattern):**
+   ```rust
+   fn credits_micro_checked(
+       input_tokens: i64,
+       output_tokens: i64,
+       in_mult: i64,
+       out_mult: i64,
+   ) -> Result<i64, OverflowError> {
+       // Validate inputs
+       const MAX_TOKENS: i64 = 10_000_000;
+       const MAX_MULT: i64 = 10_000_000_000;
+
+       if input_tokens < 0 || input_tokens > MAX_TOKENS {
+           return Err(OverflowError::InvalidTokenCount);
+       }
+       if output_tokens < 0 || output_tokens > MAX_TOKENS {
+           return Err(OverflowError::InvalidTokenCount);
+       }
+       if in_mult <= 0 || in_mult > MAX_MULT {
+           return Err(OverflowError::InvalidMultiplier);
+       }
+       if out_mult <= 0 || out_mult > MAX_MULT {
+           return Err(OverflowError::InvalidMultiplier);
+       }
+
+       // Checked multiplication
+       let input_product = input_tokens
+           .checked_mul(in_mult)
+           .ok_or(OverflowError::MultiplicationOverflow)?;
+       let output_product = output_tokens
+           .checked_mul(out_mult)
+           .ok_or(OverflowError::MultiplicationOverflow)?;
+
+       // Compute ceil_div components
+       let input_credits = ceil_div_checked(input_product, 1000)?;
+       let output_credits = ceil_div_checked(output_product, 1000)?;
+
+       // Checked addition
+       input_credits
+           .checked_add(output_credits)
+           .ok_or(OverflowError::AdditionOverflow)
+   }
+
+   fn ceil_div_checked(n: i64, d: i64) -> Result<i64, OverflowError> {
+       let result = (n / d) + if n % d != 0 { 1 } else { 0 };
+       Ok(result)  // Division by 1000 cannot overflow when n < i64::MAX
+   }
+   ```
+
+   **Other languages:** Use equivalent checked arithmetic primitives or explicit pre-check formulas.
+
+3. **Unreachability in P1:**
+
+   Given P1 constraints:
+   - Max context window: ~200K tokens (largest model)
+   - Max multiplier: ~10x credit per 1K tokens (conservative estimate)
+   - Product: 200,000 * 10,000 = 2,000,000,000 (well below i64::MAX ≈ 9.2e18)
+
+   Overflow SHOULD be unreachable in P1 under normal operation. The checks exist as:
+   - Defense against malicious provider responses
+   - Defense against configuration errors (e.g., multiplier typo: 10000000 instead of 10)
+   - Forward compatibility for future model scaling
+
+**Error handling:** Overflow detection failure MUST be treated as a critical error:
+- Log the overflow attempt with all inputs (tenant_id, user_id, turn_id, token counts, multipliers)
+- Reject the turn finalization
+- Emit a metric: `mini_chat_credits_overflow_total`
+- Return HTTP 500 to the client with error code `internal_error`
+
 #### 5.3.1 Reserve vs Settlement Variables (Canonical Glossary)
 
 All variable names below are normative. All sections in this document MUST use these names when referring to these quantities.
@@ -3182,15 +3766,30 @@ All variable names below are normative. All sections in this document MUST use t
 |----------|------------|
 | `actual_input_tokens` | Provider-reported input tokens (`response.usage.input_tokens`). Available only for COMPLETED and some FAILED/ABORTED outcomes. |
 | `actual_output_tokens` | Provider-reported output tokens (`response.usage.output_tokens`). |
-| `actual_credits_micro` | `credits_micro(actual_input_tokens, actual_output_tokens, in_mult, out_mult)`. Authoritative amount debited from `quota_usage` and sent to CCM via outbox. |
+| `actual_credits_micro` | `credits_micro(actual_input_tokens, actual_output_tokens, in_mult, out_mult)`. Represents credits derived from provider-reported actual usage. **This field name is reused in three contexts** — see "Name reuse note" below. `in_mult` and `out_mult` MUST be read from the PolicySnapshot identified by `chat_turns.policy_version_applied`, not from the current live snapshot. |
 
 **Estimated settlement variables** — used when provider did not report actual usage (ABORTED / FAILED post-provider-start):
 
 | Variable | Definition |
 |----------|------------|
-| `charged_output_tokens` | The output token count charged in estimated settlement. Equals `minimal_generation_floor` (from `estimation_budgets` in the policy snapshot identified by `policy_version_applied`). |
-| `charged_tokens` | `min(reserve_tokens, estimated_input_tokens + charged_output_tokens)` — total token charge (section 5.8). |
-| `actual_credits_micro` (estimated path) | `credits_micro(estimated_input_tokens, charged_output_tokens, in_mult, out_mult)`. Same field name as the actual path; the settlement_method outbox field distinguishes the two. |
+| `charged_output_tokens` | The output token count charged in estimated settlement. Equals `minimal_generation_floor_applied` (read from persisted `chat_turns.minimal_generation_floor_applied` column; captured at preflight from MiniChat ConfigMap; NOT from CCM policy snapshot). |
+| `charged_tokens` | `min(reserve_tokens, estimated_input_tokens + charged_output_tokens)` — total token charge (section 5.8). This is the canonical unified term for "tokens billed to quota on the estimated path." For the completed-with-overshoot path, the equivalent variable is `committed_tokens` (section 5.4.5); they represent the same concept under different settlement paths. |
+| `actual_credits_micro` (estimated path) | `credits_micro(estimated_input_tokens, charged_output_tokens, in_mult, out_mult)`. Same outbox field name as the actual path; the `settlement_method` outbox field (`"estimated"` vs `"actual"`) distinguishes the two. `in_mult` and `out_mult` MUST be read from the PolicySnapshot identified by `chat_turns.policy_version_applied`. |
+
+**Overshoot-cap variables** — used when COMPLETED and `actual_tokens > reserve_tokens` (section 5.4.5):
+
+| Variable | Definition |
+|----------|------------|
+| `committed_tokens` | The token count charged to quota for a COMPLETED turn after applying the overshoot cap. Equals `actual_tokens` when overshoot is within `overshoot_tolerance_factor`; equals `reserve_tokens` when overshoot exceeds the factor. This is the COMPLETED-path equivalent of `charged_tokens` (estimated path). |
+| `committed_credits_micro` | `credits_micro(committed_input_tokens, committed_output_tokens, in_mult, out_mult)` — credit amount charged to quota and emitted in the outbox `actual_credits_micro` field for COMPLETED turns. Equals the uncapped `actual_credits_micro` when within tolerance; equals `reserved_credits_micro` when capped. The quota counter (`quota_usage.spent_credits_micro`) MUST be incremented by `committed_credits_micro`, not by `actual_credits_micro`, to enforce the cap. |
+
+**Name reuse note — `actual_credits_micro` outbox field**: the outbox field `actual_credits_micro` carries the authoritative billing debit for CCM across all settlement paths, but its computation differs by path:
+- **COMPLETED, within overshoot tolerance**: `credits_micro(actual_input_tokens, actual_output_tokens, in_mult, out_mult)` (= uncapped `actual_credits_micro`)
+- **COMPLETED, overshoot exceeds tolerance**: `reserved_credits_micro` (= `committed_credits_micro`, capped at reserve)
+- **FAILED / ABORTED, usage known**: `credits_micro(actual_input_tokens, actual_output_tokens, in_mult, out_mult)`
+- **FAILED / ABORTED, usage unknown (estimated)**: `credits_micro(estimated_input_tokens, charged_output_tokens, in_mult, out_mult)`
+
+In all cases `settlement_method` and (for capped overshoot) `overshoot_capped: true` provide context for the value. CCM MUST use the emitted `actual_credits_micro` value directly and MUST NOT recompute it.
 
 ### 5.4 Quota Enforcement Flow: Reserve → Execute → Settle
 
@@ -3212,7 +3811,27 @@ For each turn, the quota enforcement flow proceeds in five steps:
 The following terms are used throughout sections 5.4–5.9:
 
 - **Provider request started**: the domain service has initiated the outbound HTTP request to the provider via OAGW. Once the request is sent, provider resources may be consumed regardless of whether a response is received.
+
+> **Precise boundary (normative)**: "started" means the OAGW client has successfully sent the HTTP request headers and body to the provider endpoint and received an HTTP status code (1xx, 2xx, 3xx, 4xx, or 5xx) OR the first SSE event from a streaming response. This boundary is tracked as an **in-memory flag within the originating request handler process only** (not DB-persisted in P1). It is NOT accessible across process boundaries — the orphan watchdog, a replacement pod, or any other process observing the `chat_turns` DB row cannot read this flag. For the live request handler: a turn in `running` state with the in-memory `started_at` flag set is presumed to have "started". For all other finalization paths (orphan watchdog, new-pod recovery after crash): the flag is unavailable and the watchdog MUST apply estimated settlement conservatively (Case B behavior, see below), treating the turn as if the provider was called. This conservative default is normative for P1.
+>
+> **Provider Request Start Boundary Implementation Note (P1)**:
+>
+> **Design Choice**: The "provider request started" boundary is tracked as an in-memory flag (not persisted to DB) to minimize latency on the critical streaming path.
+>
+> **Crash Recovery Impact**: If a pod crashes after taking a quota reserve but BEFORE setting the in-memory "started" flag, the orphan watchdog cannot distinguish between:
+> - Case A: Reserve taken, provider never called → ideally `settlement_method="released"`
+> - Case B: Reserve taken, provider called, crash before terminal → `settlement_method="estimated"`
+>
+> The watchdog conservatively applies estimated settlement (Case B behavior) to avoid free resource exploitation.
+>
+> **Expected Frequency**: The time window between reserve and provider-start is <50ms in normal operation. Combined with typical pod crash rates, this affects <0.01% of turns.
+>
+> **P2 Enhancement Option**: Add `chat_turns.provider_request_started_at TIMESTAMPTZ` column for perfect crash recovery if operational metrics show meaningful impact.
+
 - **Usage known**: the provider returned actual token counts (`usage.input_tokens`, `usage.output_tokens`) — either via a terminal `response.completed` event or via error metadata. Settlement uses `settlement_method = "actual"`.
+
+> **Canonical provider usage fields (normative)**: the authoritative usage metadata is read from the provider's terminal response event. The canonical field names are `usage.input_tokens` (integer, non-negative) and `usage.output_tokens` (integer, non-negative). These field names are part of the Mini-Chat ↔ OAGW contract. If a provider uses different field names (e.g., `prompt_tokens`, `completion_tokens`), OAGW MUST normalize them to `usage.input_tokens` / `usage.output_tokens` before returning the response to Mini-Chat. Mini-Chat MUST NOT implement provider-specific usage field mapping. If `usage` object is present but either field is missing, treat the missing field as `0`. If the `usage` object is absent entirely, usage is "unknown" (estimated settlement path).
+
 - **Usage unknown**: the provider did not return actual token counts (stream interrupted, pod crash, client disconnect before provider terminal event, orphan timeout). Settlement uses the deterministic estimated formula and `settlement_method = "estimated"`.
 - **No-free-cancel rule**: if the provider request has started, settlement MUST NOT be `"released"` even if the client disconnects immediately. The provider consumed compute resources and a non-zero debit MUST be applied (actual or estimated). `settlement_method = "released"` is permitted only when the provider request was never started (pre-provider failures).
 
@@ -3222,10 +3841,10 @@ mini-chat selects `effective_model` (with downgrade if needed) based on the curr
 
 Then it computes:
 
-- `estimated_text_tokens` (roughly: text + metadata + retrieved chunks)
-- `image_surcharge_tokens` (if images are present; fixed conservative budget)
-- `tool_surcharge_tokens` (if tools are present; fixed conservative budget)
-- `web_search_surcharge_tokens` (if web_search is enabled; fixed conservative budget)
+- `estimated_text_tokens` — sum of text content, metadata, and retrieved chunks (see ConfigMap `estimation_budgets`, line 3194)
+- `image_surcharge_tokens` — if images present, apply `estimation_budgets.image_token_budget` per image (ConfigMap-defined conservative estimate, line 3195)
+- `tool_surcharge_tokens` — apply `estimation_budgets.tool_surcharge_tokens` if tool use enabled (line 3196)
+- `web_search_surcharge_tokens` — apply `estimation_budgets.web_search_surcharge_tokens` if web search enabled (line 3197)
 - `max_output_tokens_applied` — the `max_output_tokens` value used for this turn; persisted on `chat_turns.max_output_tokens_applied` (immutable after insert)
 - model credit multipliers (`in_mult`, `out_mult`) for the chosen model from the policy snapshot
 
@@ -3261,16 +3880,85 @@ fn bucket_available(bucket, period, this_request_reserved_credits_micro) -> bool
            <= limit_credits_micro(bucket, period)
 ```
 
+> Where:
+>
+> * `period.type` — one of the enabled period types: `"daily"` or `"monthly"` (maps to `quota_usage.period_type` column, VARCHAR)
+> * `period.start` — UTC-truncated period boundary timestamp (for daily: UTC day start 00:00:00; for monthly: UTC month start, day 1, 00:00:00). Maps to `quota_usage.period_start` column (DATE). Note: DATE type stores calendar dates without time-of-day; period boundaries are conceptually midnight UTC but stored as DATE for efficient period-key indexing and to avoid timezone-related bugs. Immutable for a given period row.
+>
+> **Normative Conversion Algorithm (P1)**:
+>
+> To compute the `period_start` DATE value for a given UTC timestamp:
+>
+> ```sql
+> -- For daily period:
+> period_start_date = DATE(date_trunc('day', current_timestamp AT TIME ZONE 'UTC'))
+>
+> -- For monthly period:
+> period_start_date = DATE(date_trunc('month', current_timestamp AT TIME ZONE 'UTC'))
+> ```
+>
+> **Examples**:
+> - UTC `2026-02-28T15:30:00Z` (daily) → period_start = `2026-02-28`
+> - UTC `2026-02-28T15:30:00Z` (monthly) → period_start = `2026-02-01`
+> - UTC `2026-02-28T23:59:59Z` (daily) → period_start = `2026-02-28`
+> - UTC `2026-03-01T00:00:00Z` (daily) → period_start = `2026-03-01`
+>
+> **Determinism Property**: Two concurrent requests at the same UTC second MUST compute identical `period_start` values and contend on the same `quota_usage` row.
+>
+> * `row = quota_usage[...]` — denotes a SELECT query: `SELECT * FROM quota_usage WHERE tenant_id = :tenant_id AND user_id = :user_id AND period_type = :period_type AND period_start = :period_start AND bucket = :bucket`. If no row exists, treat as `spent_credits_micro = 0`, `reserved_credits_micro = 0`.
+
 **Tier availability** (calls `bucket_available` for the required buckets):
 
 - **Standard tier**: available if `bucket_available('total', period, ...)` for ALL enabled periods.
 - **Premium tier**: available if `bucket_available('total', period, ...)` AND `bucket_available('tier:premium', period, ...)` for ALL enabled periods.
 
+**Tier Availability Evaluation Atomicity (Normative):**
+
+When evaluating tier availability, the system MUST read all required `quota_usage` rows (all periods × all buckets for the tier) within a SINGLE database transaction.
+
+**Required snapshot consistency:**
+
+- All `quota_usage` row reads for a single tier availability check MUST observe a consistent snapshot.
+- Minimum isolation level: READ COMMITTED (prevents dirty reads).
+- Recommended isolation level: REPEATABLE READ (prevents non-repeatable reads between period checks).
+
+**Example:** For premium tier availability check with daily + monthly periods, the following rows MUST be read atomically:
+```
+SELECT * FROM quota_usage WHERE tenant_id = :tid AND user_id = :uid AND bucket = 'total' AND period_type = 'daily' AND period_start = :daily_start
+SELECT * FROM quota_usage WHERE tenant_id = :tid AND user_id = :uid AND bucket = 'total' AND period_type = 'monthly' AND period_start = :monthly_start
+SELECT * FROM quota_usage WHERE tenant_id = :tid AND user_id = :uid AND bucket = 'tier:premium' AND period_type = 'daily' AND period_start = :daily_start
+SELECT * FROM quota_usage WHERE tenant_id = :tid AND user_id = :uid AND bucket = 'tier:premium' AND period_type = 'monthly' AND period_start = :monthly_start
+```
+
+All four SELECTs MUST execute in the same transaction to ensure consistent snapshot.
+
+**TOCTOU Prevention (Time-of-Check-Time-of-Use):**
+
+The tier availability check and subsequent reserve operation (incrementing `reserved_credits_micro`) MUST execute in the same transaction. This prevents races where:
+1. Thread A checks tier availability (passes)
+2. Thread B exhausts quota
+3. Thread A reserves credits (should have failed)
+
+**Implementation requirement:**
+
+The preflight reserve algorithm (section 5.4.1) MUST use a single database transaction that:
+1. Reads all required `quota_usage` rows for tier evaluation
+2. Evaluates tier availability using the read snapshot
+3. If available, atomically increments `reserved_credits_micro` on the same rows
+4. Commits the transaction
+
+If another concurrent request modifies quota between step 1 and step 3, the database row-level locks or optimistic concurrency control will cause one transaction to retry or fail, ensuring correctness.
+
+**PostgreSQL implementation note:** Using `SELECT ... FOR UPDATE` on the `quota_usage` rows during the availability check provides pessimistic locking and guarantees no TOCTOU races. Alternative: optimistic locking with version columns and retry on conflict.
+
 Where:
 - `row.spent_credits_micro` — the `quota_usage.spent_credits_micro` value from the bucket row matching `(tenant_id, user_id, period_type, period_start, bucket)`. In bucket `total` this includes credits spent across **all** tiers (overall cap). In bucket `tier:premium` this includes only credits spent on premium-tier turns (subcap).
 - `row.reserved_credits_micro` — the `quota_usage.reserved_credits_micro` value from the same bucket row. Represents the sum of in-flight reserves from other concurrent requests against this bucket.
 - `this_request_reserved_credits_micro` — the `reserved_credits_micro` computed in section 5.4.1 for the current request.
-- `limit_credits_micro(bucket, period)` — the per-user limit from the policy snapshot `user_limits` for the given bucket and period. Mapping: bucket `total` uses `user_limits.standard.limit_{period}` (overall cap); bucket `tier:premium` uses `user_limits.premium.limit_{period}` (premium subcap). Read-only at enforcement time; derived by CCM.
+- `limit_credits_micro(bucket, period)` — the per-user limit from the policy snapshot `user_limits` for the given bucket and period. Mapping (normative):
+  - bucket `total` → `user_limits.standard.limit_{period}`. **Rationale**: "standard" tier limits serve as the GLOBAL CEILING for all usage. This is confusingly named: "standard.limit" is NOT a "standard-tier-only cap" — it is the TOTAL quota available across all tiers. Premium tier has a SUBCAP (bucket `tier:premium`) that is ≤ the total. Example: `standard.limit_daily = 1000` credits, `premium.limit_daily = 300` credits means user has 1000 credits total per day, of which at most 300 can be spent on premium models. Remaining 700 can be spent on standard models. When premium subcap is exhausted, standard models are still available until the total cap is exhausted.
+  - bucket `tier:premium` → `user_limits.premium.limit_{period}`. This is a subcap (NOT independent budget). Premium usage counts against BOTH the `tier:premium` bucket AND the `total` bucket.
+  - Read-only at enforcement time; derived by CCM.
 
 The rule "a tier is available only if all buckets pass in all enabled periods" means:
 
@@ -3354,18 +4042,24 @@ Interpretation:
 - if `delta_credits_micro = 0` — worst-case equals actual; nothing is unfrozen
 - if `delta_credits_micro < 0` — **overshoot / underestimation**: actual spend exceeded the reserve. In this case you debit the actual, and the overshoot is reflected as quota overrun from the perspective of `spent` counters.
 
-If usage is unavailable (e.g., orphan/disconnect and no terminal usage), the policy must be deterministic. A typical option:
+If usage is unavailable (e.g., orphan/disconnect and no terminal usage), the policy must be deterministic:
 
-- if the provider was not called — `actual_credits_micro = 0`
-- if the provider was called but usage is unknown — `actual_credits_micro = reserved_credits_micro` (conservative)
+- if the provider was not called — `charged_tokens = 0`, `settlement_method = "released"` (pre-provider failure path; see §5.9 case B)
+- if the provider was called but usage is unknown — use the deterministic estimated formula (normative, §5.8): `charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor_applied)`, `settlement_method = "estimated"`. **Do NOT use `reserved_credits_micro` as the charge** — that formula overcharges by including the full `max_output_tokens_applied`, whereas the §5.8 formula charges estimated input plus the minimal floor only. `minimal_generation_floor_applied` is read from `chat_turns.minimal_generation_floor_applied` (persisted at preflight, immutable).
 
 Then mini-chat performs atomically, in a single transaction (CAS on `chat_turn.state` — see section 5.7 for the normative finalization contract):
 
 1. CAS on `chat_turn.state` (first terminal wins)
 2. update bucket rows for each applicable period:
 
-   - **Always (bucket `total`)**: `spent_credits_micro += actual_credits_micro; reserved_credits_micro -= reserved_credits_micro; calls += 1; input_tokens += actual_input_tokens; output_tokens += actual_output_tokens`
-   - **If turn ran on premium tier (bucket `tier:premium`)**: `spent_credits_micro += actual_credits_micro; reserved_credits_micro -= reserved_credits_micro; calls += 1`
+   - **Always (bucket `total`)**: `spent_credits_micro += committed_credits_micro; reserved_credits_micro -= turn_reserved_credits_micro; calls += 1; input_tokens += actual_input_tokens; output_tokens += actual_output_tokens`
+   - **If turn ran on premium tier (bucket `tier:premium`)**: `spent_credits_micro += committed_credits_micro; reserved_credits_micro -= turn_reserved_credits_micro; calls += 1`
+
+   > Where (per §5.3.1 canonical glossary):
+   >
+   > - `turn_reserved_credits_micro` — the per-turn preflight reserve from `chat_turns.reserved_credits_micro` (persisted, immutable after insert). MUST NOT be confused with `quota_usage.reserved_credits_micro`, which is the bucket-level accumulator across all in-flight turns. The decrement releases only this turn's share of the in-flight reserve.
+   > - `committed_credits_micro` — the credit amount actually charged for this turn (section 5.4.5). Equals `credits_micro(actual_input_tokens, actual_output_tokens, in_mult, out_mult)` for normal COMPLETED turns; equals `reserved_credits_micro` (capped) when overshoot exceeds `overshoot_tolerance_factor`. See §5.4.5 "Actual vs Committed Usage" for the normative definition. Using `actual_credits_micro` here is incorrect when overshoot capping applies.
+   > - "premium tier" — determined by `chat_turns.effective_model`'s tier at preflight, not by the current catalog state. Read from `chat_turns.effective_model` and look up tier from the PolicySnapshot identified by `chat_turns.policy_version_applied`.
 
 3. write a usage event into the outbox with fields:
 
@@ -3383,7 +4077,7 @@ If the LLM crashed or was cancelled:
 
   - if the provider was not called — debit 0, `settlement_method = "released"`
   - if the provider was called and usage was returned — debit actual, `settlement_method = "actual"`
-  - if unknown (orphan, disconnect, crash) — debit bounded estimate using `min(reserve_tokens, estimated_input_tokens + minimal_generation_floor)`, `settlement_method = "estimated"`
+  - if unknown (orphan, disconnect, crash) — debit bounded estimate using `min(reserve_tokens, estimated_input_tokens + minimal_generation_floor_applied)`, `settlement_method = "estimated"`
 
 - The orphan watchdog (P1 mandatory) MUST detect turns stuck in `running` state beyond a configurable timeout (default: 5 min) and finalize them using the same CAS guard and the deterministic formula above. The watchdog MUST write the quota settlement and the `modkit_outbox_events` row in the same DB transaction.
 
@@ -3402,7 +4096,121 @@ In the normal scheme you should not exceed limits, because:
 **What can realistically go wrong**:
 
 1. **Estimate below actual (overshoot)**: actual tokens exceeded max_output or input estimate.
-   Solution: hard cap max_output at the provider/request level. Then overshoot does not exist.
+
+   **Reserve Overshoot Reconciliation Rule (normative for COMPLETED turns)**:
+
+   When a COMPLETED turn reports actual usage that exceeds the reserve, the system MUST apply the following bounded overshoot reconciliation:
+
+   ```pseudocode
+   // CRITICAL: all values here are token counts (integers from provider or persisted state)
+   // Division MUST be floating-point to compare against the threshold accurately
+
+   IF actual_tokens > reserve_tokens AND outcome = COMPLETED:
+       // Compute overshoot factor as float
+       // Cast integers to f64 (Rust) / double (other languages) before division
+       overshoot_factor: f64 = (actual_tokens as f64) / (reserve_tokens as f64)
+
+       // overshoot_tolerance_factor is a deployment config value (e.g., 1.10)
+       // Type: f64, constraint: >= 1.0
+       IF overshoot_factor <= overshoot_tolerance_factor:
+           // Allow bounded overshoot: commit actual usage
+           committed_tokens = actual_tokens
+           committed_credits_micro = credits_micro(actual_input_tokens, actual_output_tokens, in_mult, out_mult)
+
+           // Log overshoot metric for monitoring
+           mini_chat_quota_overshoot_tokens.observe(actual_tokens - reserve_tokens)
+           mini_chat_quota_overshoot_total{period}.inc()
+       ELSE:
+           // Overshoot exceeds tolerance: cap billing at reserve
+           // CRITICAL: Keep turn as COMPLETED (never retroactively cancel completed response)
+           // Billing is capped; response remains delivered to user
+           committed_tokens = reserve_tokens
+           committed_credits_micro = reserved_credits_micro
+
+           // Log severe overshoot for operator investigation
+           mini_chat_quota_overshoot_exceeded_total.inc()
+           log.error("Overshoot exceeded tolerance", {
+               turn_id, actual_tokens, reserve_tokens, overshoot_factor
+           })
+   ```
+
+   **Type specifications (normative):**
+   - `actual_tokens`, `reserve_tokens` — BIGINT / i64 (token counts from provider or persisted state)
+   - `overshoot_factor` — f64 / double (MUST use floating-point division)
+   - `overshoot_tolerance_factor` — f64 / double (deployment config, e.g., 1.10, constraint: >= 1.0)
+   - Division operator: MUST perform floating-point division (NOT integer division)
+   - Comparison: floating-point comparison with epsilon tolerance if needed for the target language
+
+   **Implementation note:** In Rust: `(actual_tokens as f64) / (reserve_tokens as f64)`. In languages with implicit type coercion, ensure at least one operand is cast to float/double before division to avoid integer division truncation.
+
+   **Configuration (P1)**:
+   - `overshoot_tolerance_factor`: configurable via MiniChat ConfigMap key `quota.overshoot_tolerance_factor` (float). Default: `1.10` (allow 10% overshoot).
+   - Valid range: `1.00` (no overshoot allowed) to `1.50` (allow 50% overshoot). Values outside this range MUST be rejected at startup.
+   - Rationale: Provider token counting is exact, but preflight estimates may underestimate due to tokenizer differences, model updates, or conservative surcharge budgets. A bounded tolerance prevents quota drift while accommodating reasonable estimation variance.
+
+   **P1 constraint**: `max_output_tokens` is a hard cap sent to the provider, so output token overshoot should not occur under normal operation. Overshoot typically occurs on the input side due to underestimation of multimodal surcharges (images, tools, web_search) or retrieved context. Operators SHOULD tune estimation budgets (section 5.5) to minimize overshoot occurrences.
+
+   **Monitoring**:
+   - If `mini_chat_quota_overshoot_total` exceeds 5% of completed turns, operators SHOULD review estimation budgets (image_token_budget, tool_surcharge_tokens, web_search_surcharge_tokens, safety_margin_pct) and consider increasing conservative margins.
+   - If `mini_chat_quota_overshoot_exceeded_total` fires (overshoot > tolerance), this indicates a severe estimation failure requiring immediate investigation. The response was delivered to the user but billing was capped at reserve to prevent unbounded quota drift.
+
+   **Invariant (P1 normative)**: A COMPLETED turn MUST remain COMPLETED regardless of overshoot magnitude. The "never retroactively cancel a completed response" principle is absolute. Overshoot beyond tolerance caps billing at reserve_tokens, logs the anomaly, but does NOT change turn state to FAILED or prevent response delivery.
+
+   #### Actual vs Committed Usage (Normative)
+
+   **Definitions:**
+
+   - **Actual usage** — provider-reported token counts (source of truth for what happened)
+   - **Committed usage** — tokens charged to quota and billing (may be capped at reserve when overshoot exceeds tolerance)
+   - **Committed credits** — credits debited to quota and billing (derived from committed usage)
+
+   **Storage and emission rules:**
+
+   1. **Database columns (`chat_turns`):**
+      - Store ACTUAL values: `actual_input_tokens`, `actual_output_tokens` (from provider)
+      - Store COMMITTED credits: `committed_credits_micro` (what was charged)
+      - When overshoot is capped: `actual_input_tokens + actual_output_tokens > reserve_tokens` but `committed_credits_micro = reserved_credits_micro`
+
+   2. **Quota counters (`quota_usage`):**
+      - Increment by COMMITTED credits: `spent_credits_micro += committed_credits_micro`
+      - Increment telemetry by ACTUAL tokens: `input_tokens += actual_input_tokens; output_tokens += actual_output_tokens`
+
+   3. **Outbox events (usage snapshots):**
+      - Emit COMMITTED credits: `actual_credits_micro` field contains `committed_credits_micro` (confusing name, intentional for backward compat — do NOT rename; see migration note)
+      - **Emit `committed_credits_micro` as an explicit mandatory field** alongside `actual_credits_micro`. This is the authoritative billing amount. Downstream consumers (CCM) MUST use `committed_credits_micro` as the definitive charge; `actual_credits_micro` is retained for legacy compatibility only.
+      - Emit ACTUAL tokens for telemetry: `usage.input_tokens`, `usage.output_tokens`
+      - Emit overshoot flag: `overshoot_capped: bool` (true when committed < actual)
+      - **Migration note**: renaming `actual_credits_micro` → `committed_credits_micro` is deferred to P2+. For P1, both fields MUST be emitted with the same value. CCM MUST be explicitly instructed during integration to use `committed_credits_micro` as the authoritative billing amount.
+
+   4. **Audit events:**
+      - Log BOTH actual and committed values for reconciliation
+      - Include `overshoot_factor` and `overshoot_capped` flag
+
+   **Example (overshoot exceeds tolerance):**
+
+   ```
+   Provider reports: input_tokens=11000, output_tokens=500
+   Reserve: reserve_tokens=10000, reserved_credits_micro=2500000
+   Overshoot: 11500 / 10000 = 1.15 (exceeds tolerance 1.10)
+
+   Stored in chat_turns:
+     actual_input_tokens = 11000  (source of truth)
+     actual_output_tokens = 500
+     committed_credits_micro = 2500000  (capped at reserve)
+
+   Stored in quota_usage:
+     spent_credits_micro += 2500000  (committed, not actual)
+     input_tokens += 11000  (actual, for telemetry)
+     output_tokens += 500
+
+   Emitted in outbox:
+     usage: { input_tokens: 11000, output_tokens: 500 }  (actual)
+     actual_credits_micro: 2500000  (committed, despite name — legacy field for backward compat)
+     committed_credits_micro: 2500000  (authoritative billing amount; CCM MUST use this field)
+     overshoot_capped: true
+   ```
+
+   **Rationale:** Storing actual usage preserves source of truth for auditing and debugging. Charging committed usage prevents unbounded quota overspend. Downstream billing systems use committed credits as authoritative charge.
 
 2. **Policy changes mid-turn**: not a problem because the turn records `policy_version_applied`. It is computed under that version.
 
@@ -3510,7 +4318,7 @@ Where (all values from `estimation_budgets` in the policy snapshot, section 5.2.
 
 - `BYTES_PER_TOKEN_CONSERVATIVE` — `estimation_budgets.bytes_per_token_conservative` (integer; e.g. 3). Policy-snapshot-versioned.
 - `fixed_overhead_tokens` — `estimation_budgets.fixed_overhead_tokens` (integer). Policy-snapshot-versioned.
-- `safety_margin` — `estimation_budgets.safety_margin_pct / 100` (integer percentage; e.g. 20 → 0.20). Applied as: `estimated_text_tokens = ceil(base_estimate * (1 + safety_margin_pct / 100))`. Policy-snapshot-versioned.
+- `safety_margin` — `estimation_budgets.safety_margin_pct / 100.0` (integer percentage stored in snapshot; e.g. stored as `20` meaning 20%). Applied as: `estimated_text_tokens = ceil(base_estimate * (1 + safety_margin_pct / 100.0))`. The division MUST use floating-point arithmetic — integer division (e.g. `20 / 100 = 0` in Rust/Java/Go) MUST NOT be used. Type: `safety_margin_pct` is stored as integer; the division result is f64/double. Policy-snapshot-versioned.
 
 Underestimation is unacceptable.
 Overestimation is acceptable.
@@ -3538,23 +4346,21 @@ Important:
 
 #### 5.5.6 Web Search / Tools
 
-Because the provider may add hidden prompt:
+Because the provider may add hidden prompt content for tool wiring and web search results:
 
-In P1 we use a fixed surcharge:
-
-```
-tool_surcharge_tokens = ...
-```
-
-or
+In P1 we use a fixed per-turn surcharge (applied once per request, not per invocation):
 
 ```
-web_search_surcharge_tokens = ...
+tool_surcharge_tokens = estimation_budgets.tool_surcharge_tokens   # if tool use enabled for this turn
+web_search_surcharge_tokens = estimation_budgets.web_search_surcharge_tokens  # if web_search enabled for this turn
 ```
 
-Where:
-- `tool_surcharge_tokens` — `estimation_budgets.tool_surcharge_tokens` from the policy snapshot (section 5.2.1). Policy-snapshot-versioned.
-- `web_search_surcharge_tokens` — `estimation_budgets.web_search_surcharge_tokens` from the policy snapshot (section 5.2.1). Policy-snapshot-versioned.
+> Where:
+>
+> - `tool_surcharge_tokens` — direct lookup of `estimation_budgets.tool_surcharge_tokens` from the PolicySnapshot identified by `policy_version_applied` for this turn. Non-negative integer. Applied once per turn when `file_search` or any tool is enabled, regardless of the number of internal tool invocations the provider performs. Policy-snapshot-versioned.
+> - `web_search_surcharge_tokens` — direct lookup of `estimation_budgets.web_search_surcharge_tokens` from the same PolicySnapshot. Non-negative integer. Applied once per turn when `web_search.enabled = true`. Policy-snapshot-versioned.
+> - If a feature is not enabled for this turn, its surcharge contribution is `0`.
+> - Both values are preflight-only: they contribute to `estimated_input_tokens` and `reserve_tokens` but are NOT persisted per-turn and are NOT used at settlement time.
 
 ##### Tool and Web Search Cost Model (P1 Scope Clarification)
 
@@ -3592,7 +4398,7 @@ Where:
 
 A tier is considered available only if, for each required bucket, the following holds:
 
-```
+```text
 quota_usage[bucket].spent_credits_micro + quota_usage[bucket].reserved_credits_micro + this_request_reserved_credits_micro
     <= limit_credits_micro(bucket, period)
 ```
@@ -3704,6 +4510,48 @@ This constraint ensures:
 - **Crash-safe settlement** — the orphan watchdog and any recovery path can finalize a turn using only persisted data; no ephemeral runtime context is required.
 - **Consistent replay behavior** — re-running the settlement formula on the same inputs always produces the same `actual_credits_micro` value, satisfying the replay invariant (5.5.12 item 7).
 
+#### 5.5.14 Deterministic Estimated Settlement (P1)
+
+Settlement for turns without provider-reported usage (aborted, failed post-provider-start, or orphan outcomes; see sections 5.7, 5.8, 5.9) MUST be reproducible using only persisted per-turn fields and policy snapshot multipliers. This ensures that ConfigMap changes to `estimation_budgets` do not retroactively alter settlement of already-started turns.
+
+**Settlement inputs for estimated path** (normative, complete list):
+
+- Persisted per-turn fields from `chat_turns`:
+  - `reserve_tokens` (immutable after insert)
+  - `max_output_tokens_applied` (immutable after insert)
+  - `minimal_generation_floor_applied` (immutable after insert; captured from MiniChat ConfigMap at preflight; NOT from CCM policy snapshot)
+  - `policy_version_applied` (immutable after insert)
+  - Derived: `estimated_input_tokens = reserve_tokens - max_output_tokens_applied`
+- Policy snapshot (loaded via `policy_version_applied`):
+  - Model entry for `effective_model` (from `chat_turns.effective_model`)
+  - `input_tokens_credit_multiplier_micro`
+  - `output_tokens_credit_multiplier_micro`
+
+**Preflight-only estimation budgets** (MUST NOT influence settlement):
+
+The following `estimation_budgets` parameters are used ONLY for preflight reserve estimation and admission control. They MUST NOT be persisted per-turn and MUST NOT be used by settlement logic for any outcome (completed, failed, aborted, orphan):
+
+- `bytes_per_token_conservative` — preflight text estimation only
+- `fixed_overhead_tokens` — preflight text estimation only
+- `safety_margin_pct` — preflight text estimation only
+- `image_token_budget` — preflight vision surcharge only
+- `tool_surcharge_tokens` — preflight tool surcharge only
+- `web_search_surcharge_tokens` — preflight web search surcharge only
+
+**Exception**: `minimal_generation_floor` is the ONLY estimation budget parameter that influences estimated settlement. It is captured at preflight from MiniChat ConfigMap and persisted as `chat_turns.minimal_generation_floor_applied` to ensure deterministic settlement independent of future ConfigMap changes.
+
+**Estimated settlement formula** (sections 5.8, 5.9):
+
+```
+charged_output_tokens = minimal_generation_floor_applied
+charged_tokens = min(reserve_tokens, estimated_input_tokens + charged_output_tokens)
+actual_credits_micro = credits_micro(estimated_input_tokens, charged_output_tokens, in_mult, out_mult)
+```
+
+Where `in_mult` and `out_mult` are read from the policy snapshot identified by `policy_version_applied`.
+
+**Determinism invariant**: re-running estimated settlement on the same `chat_turns` row MUST always produce the same `actual_credits_micro` value, regardless of current ConfigMap state or current policy version.
+
 ### 5.6 Reliable Usage Event Publication (Outbox Pattern)
 
 **Problem**: after a turn completes, the domain service commits quota usage and must publish a usage event to the billing system. If the process crashes after the DB commit but before the event is durably persisted for delivery, the usage event is lost. CyberChatManager never learns about the consumed usage, causing credit balance drift.
@@ -3715,10 +4563,54 @@ This constraint ensures:
 Mini-Chat usage events use:
 - `namespace = "mini-chat"`
 - `topic = "usage_snapshot"`
-- `dedupe_key` — **canonical format (normative)**: `"{tenant_id}/{turn_id}/{request_id}"` where all three components are UUID v7 hex strings. This is the sole stable idempotency key for Mini-Chat outbox events. No other format is permitted.
-- `payload` (JSONB): contains all mini-chat-specific fields (`tenant_id`, `user_id`, `chat_id`, `turn_id`, `request_id`, `event_type`, `effective_model`, `selected_model`, `policy_version_applied`, `usage`, `outcome`, `settlement_method`, etc.)
+- `dedupe_key` — **canonical format (normative)**: `"{tenant_id}/{turn_id}/{request_id}"` where all three components are UUID hex strings (32 lowercase hexadecimal characters, no hyphens or braces). This is the sole stable idempotency key for Mini-Chat outbox events. No other format is permitted.
+
+> Where:
+>
+> * `tenant_id` — resolved UUID from parent chat's tenant_id (chats.tenant_id via chat_turns.chat_id FK relationship), normalized to 32-char lowercase hex (strip hyphens)
+> * `turn_id` — persisted UUID from `chat_turns.id`, normalized to 32-char lowercase hex (strip hyphens)
+> * `request_id` — persisted UUID from `chat_turns.request_id` (client-provided UUID v4 or server-generated UUID v4), normalized to 32-char lowercase hex (strip hyphens)
+
+#### UUID Normalization (Normative)
+
+**Problem:** UUIDs appear in three formats across the system:
+1. **Database storage** — PostgreSQL UUID type (hyphenated canonical form)
+2. **API serialization** — JSON strings with hyphens (RFC 4122 format)
+3. **Outbox dedupe_key** — 32-char lowercase hex (no hyphens)
+
+**Canonical normalization function (Rust):**
+
+```rust
+/// Normalizes a UUID to 32-character lowercase hexadecimal format (no hyphens).
+/// Used for constructing outbox dedupe_key components.
+fn normalize_uuid_for_dedupe_key(uuid: Uuid) -> String {
+    uuid.as_simple().to_string()  // Returns: "f47ac10b58cc4372a5670e02b2c3d479"
+}
+
+/// Example dedupe_key construction:
+fn construct_dedupe_key(tenant_id: Uuid, turn_id: Uuid, request_id: Uuid) -> String {
+    format!(
+        "{}/{}/{}",
+        normalize_uuid_for_dedupe_key(tenant_id),
+        normalize_uuid_for_dedupe_key(turn_id),
+        normalize_uuid_for_dedupe_key(request_id)
+    )
+}
+```
+
+**Application points:**
+- MUST be applied when constructing `dedupe_key` for outbox events
+- MUST be applied when extracting tenant_id from dedupe_key for downstream idempotency checks
+- MUST NOT be applied to API request/response serialization (use hyphenated RFC 4122 format)
+- MUST NOT be applied to database queries (Postgres uses native UUID type)
+
+**Rationale:** The 32-char hex format eliminates parsing ambiguity and reduces dedupe_key length (96 chars vs 114 chars for three hyphenated UUIDs + two slashes).
+
+- `payload` (JSONB): contains all mini-chat-specific fields (`tenant_id`, `user_id`, `chat_id`, `turn_id`, `request_id`, `effective_model`, `selected_model`, `policy_version_applied`, `usage`, `outcome`, `settlement_method`, etc.)
 
 **Dedupe / unique constraint**: the partial unique index `(namespace, topic, dedupe_key) WHERE dedupe_key IS NOT NULL` on `modkit_outbox_events` enforces at most one outbox event per turn invocation at the database level. All finalizers MUST insert the outbox row within the same transaction as the guarded state transition (CAS on `chat_turns.state = 'running'`, section 5.7) and quota settlement.
+
+**Initial row state (normative)**: outbox rows MUST be inserted with `status = 'pending'`, `attempts = 0`, `next_attempt_at = now()` (eligible for immediate dispatch), `locked_by = NULL`, `locked_until = NULL`. The `attempts` column MUST start at `0` so that the first claim increment produces `attempts = 1` and the first retry backoff is `min(2^1 * base_delay, max_delay)`. Inserting with `attempts = 1` would shift the entire backoff curve by one step and is incorrect.
 
 **Conflict semantics (normative)**: the outbox INSERT MUST use `INSERT ... ON CONFLICT (namespace, topic, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING` (or the equivalent ORM upsert-ignore). If the INSERT returns zero rows affected (dedupe conflict), the finalizer MUST treat the event as already emitted and MUST NOT re-emit. The finalizer MUST NOT raise an error to the caller on dedupe conflict — the duplicate is a normal idempotency outcome, not an error condition.
 
@@ -3728,8 +4620,28 @@ Mini-Chat usage events use:
 
 1. Publish the event to the selected `minichat-policy-plugin` plugin via `publish_usage(payload)`.
 2. On success, set `status = 'delivered'` and update `updated_at`.
-3. On transient failure, increment `attempts`, set `next_attempt_at` with exponential backoff (e.g., `now() + min(2^attempts * base_delay, max_delay)`), keep `status = 'pending'`.
+3. On transient failure, increment `attempts`, set `next_attempt_at` with exponential backoff: `now() + min(2^attempts * base_delay, max_delay)`, keep `status = 'pending'`.
+
+> Where:
+>
+> * `base_delay` — base retry delay in seconds. **Configuration source (P1)**: read from MiniChat ConfigMap key `outbox_dispatcher.base_delay_seconds` (integer). Default value: `2`. MUST be validated at startup: `1 <= base_delay_seconds <= 60`.
+> * `max_delay` — maximum retry delay cap in seconds. **Configuration source (P1)**: read from MiniChat ConfigMap key `outbox_dispatcher.max_delay_seconds` (integer). Default value: `300` (5 minutes). MUST be validated at startup: `base_delay_seconds <= max_delay_seconds <= 3600`.
+> * `now()` — current database server time (UTC)
+> * **Transient failure classification (P1 normative)**: The following error classes MUST be treated as transient (retried with exponential backoff):
+>   - Connection-level: TCP timeout, connection refused, DNS resolution failure
+>   - HTTP 408 (Request Timeout), HTTP 429 (Too Many Requests), HTTP 5xx (all server-side errors)
+>
+>   The following MUST be treated as immediately permanent (skip retry backoff, transition directly to `status = 'dead'`):
+>   - HTTP 400, 401, 403, 404, 410, 422 — client errors indicating the request is structurally invalid or permanently rejected by the plugin; retrying will not succeed.
+>
+>   All other error classes default to transient until `max_attempts` is exhausted.
+
 4. On permanent failure (attempts exceed configured max), set `status = 'dead'` and emit an alert metric.
+
+> Where:
+>
+> * `configured max` — maximum retry attempts before dead-lettering. **Configuration source (P1)**: read from MiniChat ConfigMap key `outbox_dispatcher.max_attempts` (integer). Default value: `10`. MUST be validated at startup: `3 <= max_attempts <= 100`.
+> * **Permanent failure classification (P1)**: `attempts > max_attempts` (retry exhaustion). Additional permanent error codes (e.g., HTTP 4xx indicating client error, explicit plugin rejection) MAY be added in future revisions but are not required in P1. When `status = 'dead'`, emit metric `mini_chat_outbox_dead_total` (counter, labels: `{namespace, topic}`).
 
 #### Outbox Dispatcher Concurrency and Row Claiming (P1)
 
@@ -3790,7 +4702,7 @@ At-least-once delivery is allowed; duplicates are possible (see Idempotency rule
 
    `last_error` MUST be sanitized to avoid provider identifier leakage (same redaction rules as audit events).
 
-**Lease expiry reclaim rule**: if `now() > locked_until` and `status = 'processing'`, any dispatcher MAY reclaim the row by transitioning it back to `pending` (setting `locked_by = NULL`, `locked_until = NULL`). This handles the case where the claiming dispatcher crashes after the claim transaction but before publishing.
+**Lease expiry reclaim rule**: if `now() > locked_until` and `status = 'processing'`, any dispatcher MAY reclaim the row by transitioning it back to `pending` (setting `locked_by = NULL`, `locked_until = NULL`). This handles the case where the claiming dispatcher crashes after the claim transaction but before publishing. **`attempts` MUST NOT be incremented during reclaim** — the count was already incremented when the row was originally claimed in step 2 above. Incrementing again on reclaim would over-count attempts and apply more aggressive exponential backoff than intended, risking premature dead-lettering on rows where the original dispatcher silently crashed.
 
 **State transition invariant**: a row transitions `pending → processing → delivered` monotonically. `delivered` is terminal. The only non-forward transition is `processing → pending` on publish failure or lease expiry, which allows retry. A row MUST NOT transition from `delivered` to any other status. Rows that exhaust `max_attempts` transition to `dead` (terminal).
 
@@ -3802,8 +4714,8 @@ At-least-once delivery is allowed; duplicates are possible (see Idempotency rule
 
 **Operational guidance (P1 minimum)**:
 
-- Dispatchers MUST use bounded retries: after `max_attempts` (configurable, default: 10) consecutive failures, set `status = 'dead'` and emit the `mini_chat_outbox_failed_total` alert metric.
-- Dispatchers MUST expose observability counters: `mini_chat_outbox_claimed_total`, `mini_chat_outbox_sent_total`, `mini_chat_outbox_failed_total`, `mini_chat_outbox_lease_expired_total`.
+- Dispatchers MUST use bounded retries: after `max_attempts` (configurable, default: 10) consecutive failures, set `status = 'dead'` and emit the `mini_chat_outbox_dead_total` alert metric.
+- Dispatchers MUST expose observability counters: `mini_chat_outbox_claimed_total`, `mini_chat_outbox_sent_total`, `mini_chat_outbox_dead_total`, `mini_chat_outbox_lease_expired_total`.
 - Batch size, retry base delay, max delay, and lease duration are deployment-configurable. Specific default values are deferred to P2+ operational runbooks.
 
 **Idempotency rule**: consumers (CyberChatManager) MUST deduplicate events by `(tenant_id, turn_id, request_id)`. At-least-once delivery means duplicates are possible; the consumer is responsible for ignoring replayed events.
@@ -3812,7 +4724,7 @@ At-least-once delivery is allowed; duplicates are possible (see Idempotency rule
 
 - **Plugin unavailable**: outbox rows accumulate in `pending` status. The dispatcher retries with backoff. No data is lost; delivery resumes when the plugin recovers.
 - **Duplicate publish**: the dispatcher may re-publish a row if it crashes after sending but before marking `delivered`. The consumer deduplicates using the idempotency key `(tenant_id, turn_id, request_id)` from the `dedupe_key`.
-- **Permanent failures**: rows in `dead` status trigger an alert via `mini_chat_outbox_failed_total` metric. Operators investigate and may replay manually or fix the root cause.
+- **Permanent failures**: rows in `dead` status trigger an alert via `mini_chat_outbox_dead_total` metric. Operators investigate and may replay manually or fix the root cause.
 
 **Scope**: the outbox mechanism is P1 mandatory — it is required for billing event completeness and MUST be implemented before any production deployment that processes quota-bearing turns. It is an internal reliability pattern that does not change any external API contract or introduce synchronous billing calls. The canonical outbox table schema and API are defined in [outbox-pattern.md](features/outbox-pattern.md). Detailed event payload schemas and envelope definitions remain deferred to P2+ (see section 5.6).
 
@@ -3832,7 +4744,7 @@ Note: "disconnected" is not a separate internal state. Client disconnects are de
 
 **P1 client disconnect rules**:
 
-1. **Disconnect before terminal provider event**: the server does NOT emit an SSE `event: error` (the stream is already broken). The turn transitions to `cancelled` internally via the CAS finalizer. Billing settlement follows ABORTED rules. The Turn Status API (`GET /turns/{request_id}`) is the authoritative source of final state.
+1. **Disconnect before terminal provider event**: the server does NOT emit an SSE `event: error` (the stream is already broken). The turn transitions to `cancelled` internally via the CAS finalizer. Billing settlement follows ABORTED rules. The Turn Status API (`GET /v1/chats/{chat_id}/turns/{request_id}`) is the authoritative source of final state.
 2. **Disconnect after provider terminal `done` or `error`**: the terminal outcome from the provider stands. The disconnect does not alter the billing state or produce a second terminal event.
 3. **SSE does not guarantee delivery of the terminal event to the client**. The terminal state is authoritative in the database, not in the SSE stream. After any disconnect, clients MUST use the Turn Status API to resolve uncertainty about the turn outcome.
 
@@ -3851,6 +4763,91 @@ Deterministic reconciliation for `ABORTED` and post-provider-start `FAILED` outc
 #### FinalizeTurn Invariant
 
 **This is the single universal finalization algorithm. Every terminal path MUST use it. No exceptions.**
+
+**Implementation requirement (P1)**: The finalization logic MUST be implemented as a **single shared function** (e.g., `finalize_turn_cas()`) that ALL terminal paths invoke. This function MUST encapsulate:
+1. The CAS guard (conditional DB update)
+2. Quota settlement (actual or estimated)
+3. Outbox enqueue (in same transaction)
+
+#### Dedupe Key Requirement for Quota-Bearing Events (Normative)
+
+**Problem:** The generic outbox library allows `dedupe_key` to be NULL (enforced only by partial unique index), but billing/quota-bearing events MUST be idempotent and MUST have non-null `dedupe_key` for at-least-once delivery semantics without duplicate charges.
+
+**Rule:**
+
+- **Quota-bearing events** (all events in `usage_snapshot` topic that result in quota debit or credit) MUST have non-null `dedupe_key`
+- **Non-quota-bearing events** (e.g., informational telemetry, system notifications) MAY have NULL `dedupe_key` if idempotency is not required
+
+**Mini-Chat application:**
+
+ALL Mini-Chat turn finalization events (completed, failed, cancelled) that invoke the outbox enqueue function MUST provide a non-null `dedupe_key` constructed from the canonical format:
+
+```
+"{tenant_id}/{turn_id}/{request_id}"
+```
+
+Where:
+- `tenant_id` — normalized to 32-char hex using `normalize_uuid_for_dedupe_key()` (see section 4.5.1)
+- `turn_id` — the `chat_turns.id` UUID, normalized to 32-char hex
+- `request_id` — the turn's correlation key UUID, normalized to 32-char hex
+
+**Enforcement layers:**
+
+1. **Generic outbox library (`modkit_db::outbox`):**
+   - Accepts NULL `dedupe_key` (backward compatible with non-billing use cases)
+   - Enforces at-most-once for non-NULL dedupe_key via partial unique index
+   - DOES NOT validate Mini-Chat-specific format
+
+2. **Mini-Chat domain layer (quota settlement code):**
+   - MUST validate that `dedupe_key` is non-null and well-formed BEFORE calling `enqueue`
+   - MUST validate that `tenant_id` component of `dedupe_key` matches the `tenant_id` column
+   - Validation failure MUST abort the transaction and return an internal error
+
+**Rationale:**
+
+Billing correctness depends on idempotent event delivery. If `dedupe_key` is NULL:
+- The partial unique index does not prevent duplicate inserts
+- Downstream consumers cannot deduplicate based on turn identity
+- Retry/replay scenarios could result in double-charging
+
+By requiring non-null `dedupe_key` for quota-bearing events at the domain layer, we enforce billing idempotency while keeping the generic outbox library flexible for other use cases.
+
+**Error handling:**
+
+If `dedupe_key` is NULL in Mini-Chat quota settlement code:
+```rust
+return Err(Error::MissingDedupeKey {
+    context: "quota-bearing outbox events MUST have non-null dedupe_key",
+    tenant_id,
+    turn_id,
+    request_id,
+});
+```
+
+This error MUST be logged as CRITICAL and MUST prevent the transaction from committing.
+
+#### Outbox Enqueue Validation (Mini-Chat Domain Layer)
+
+When Mini-Chat code calls `modkit_db::outbox::enqueue`, it MUST validate the consistency of `tenant_id` and `dedupe_key` BEFORE the call:
+
+```rust
+fn validate_outbox_message(tenant_id: Uuid, dedupe_key: &str) -> Result<()> {
+    let tenant_hex = tenant_id.as_simple().to_string(); // 32-char hex
+    if !dedupe_key.starts_with(&format!("{}/", tenant_hex)) {
+        return Err(Error::InvalidDedupeKey {
+            expected_prefix: tenant_hex,
+            actual_key: dedupe_key.to_string(),
+        });
+    }
+    Ok(())
+}
+```
+
+This validation is a Mini-Chat domain invariant, not a generic outbox library concern. The validation ensures that the `tenant_id` column matches the tenant component of the `dedupe_key` before enqueue, preventing inconsistencies that could cause downstream idempotency failures.
+
+Having multiple code paths that independently perform CAS + settlement + outbox is FORBIDDEN. This creates risk of divergence, bugs, and missed side effects. ALL terminal triggers (provider done, provider error, disconnect, watchdog, internal abort) MUST call the same shared finalization function.
+
+**Rationale**: A single function ensures that exactly-once semantics, transaction boundaries, and outbox emission logic are maintained consistently across all terminal paths. Any change to finalization semantics (e.g., adding a new outbox field, changing settlement formula) is made in one place and applies uniformly.
 
 Exactly one finalizer may transition a turn from `IN_PROGRESS` (`running`) to a terminal billing state (`COMPLETED`/`FAILED`/`ABORTED`). This MUST be enforced at the database level using a single conditional update (CAS guard), not in-memory locks.
 
@@ -3883,6 +4880,61 @@ WHERE id = :turn_id AND state = 'running'
 
 No finalization path is exempt from this guard. The orphan watchdog uses the identical CAS pattern (`WHERE state = 'running'`) and cannot "finalize late" if the stream already completed or was already finalized by another path.
 
+#### Terminal SSE Event Emission Guard (P1)
+
+**Rule: Terminal SSE events MUST be gated on successful CAS finalization.**
+
+The streaming execution path (provider → HTTP handler → SSE client) and the finalization path (CAS → quota settlement → outbox) are architecturally separate but must be coordinated to ensure correctness. A terminal SSE event (`done` or `error`) MUST only be emitted to the client after the CAS finalization succeeds.
+
+**Implementation Pattern:**
+
+When the provider returns terminal data (`done` or `error` event):
+
+1. **Do NOT immediately emit the terminal SSE event** to the client stream
+2. **Attempt CAS finalization first**:
+   ```sql
+   UPDATE chat_turns
+   SET state = :terminal_state, completed_at = now(), ...
+   WHERE id = :turn_id AND state = 'running'
+   ```
+3. **Check `rows_affected` and gate SSE emission**:
+   - **If `rows_affected = 1`** (CAS winner):
+     - Proceed with quota settlement and outbox insertion within the same transaction
+     - Commit the transaction
+     - **Only after successful commit**: emit the terminal SSE event (`done` or `error`) to the client
+     - Flush and close the SSE stream
+   - **If `rows_affected = 0`** (CAS loser):
+     - Another finalization path won the race (e.g., concurrent client disconnect)
+     - **Do NOT emit any terminal SSE event**, even though provider terminal data is available
+     - Close the SSE stream immediately without additional events
+     - The client will use Turn Status API to resolve the authoritative outcome
+
+**Race Scenarios:**
+
+- **Provider terminal event + concurrent client disconnect**:
+  - Both paths attempt CAS finalization
+  - Whichever wins determines the billing outcome and SSE event (if client is still connected)
+  - The loser path becomes a no-op (no SSE emission, no quota/outbox changes)
+
+- **Disconnect before provider terminal**:
+  - Stream is already broken; no SSE emission possible
+  - Disconnect path wins CAS and finalizes as `cancelled` / billing `ABORTED`
+  - Provider terminal arrives later but CAS fails → provider data is discarded
+
+- **Provider terminal before disconnect**:
+  - Normal flow: CAS succeeds, terminal SSE emitted, transaction committed
+  - Any subsequent disconnect is a no-op (turn already finalized)
+
+**Correctness Property:**
+
+This guard ensures that if a terminal SSE event is delivered to the client, it always matches the finalized billing outcome committed to the database. It prevents ambiguous cases where:
+- Client receives SSE `error` but database shows `cancelled` (billing `ABORTED`)
+- Client receives SSE `done` but database shows `failed`
+
+Without this guard, the SSE stream and the database state can become inconsistent during race conditions, violating the "database is authoritative" principle (section 5.7, P1 client disconnect rule 3).
+
+**Note:** This rule applies only to **terminal** SSE events (`done`, `error`). Non-terminal events (`delta`, `tool`, `citations`) are emitted as they arrive from the provider without gating, as these do not affect billing finalization semantics.
+
 #### Forbidden Patterns
 
 The following patterns are explicitly prohibited. Any implementation that matches these patterns is a correctness violation:
@@ -3910,7 +4962,7 @@ A turn MUST NOT transition to `completed` unless the full assistant message cont
 - Settle using actual provider usage (`response.usage.input_tokens` + `response.usage.output_tokens`).
 - Release unused reserve, commit actual usage to `quota_usage` bucket rows (bucket `total` always; bucket `tier:premium` if premium turn).
 - If actual exceeds estimate (overshoot), commit the overshoot; never retroactively cancel a completed response.
-- Emit outbox event: `event_type = 'usage_finalized'`, `payload_json` MUST include:
+- Emit usage settlement outbox event with `payload_json` that MUST include:
   - `outcome`: `"completed"`
   - `settlement_method`: `"actual"`
   - `effective_model`, `selected_model`, `quota_decision` (and `downgrade_from`, `downgrade_reason` if present)
@@ -3928,12 +4980,12 @@ Three subcases:
 
 - **failed_pre_reserve**: error before a quota reserve is taken (validation error, authorization denial, quota preflight rejection — no `chat_turns` row with a reserve exists). No settlement occurs and no quota debit applies. Emitting a `modkit_outbox_events` row is OPTIONAL (the "exactly one event per reserve" invariant does not apply because no reserve was created). If the system does emit one for observability, the row MUST use `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }`.
 - **failed_post_reserve_pre_provider**: a quota reserve was taken (the `chat_turns` row entered `IN_PROGRESS`) but the provider request was NOT issued (e.g., context assembly error, internal timeout, transient infrastructure failure between successful preflight and the outbound call). The reserve MUST be fully released (`charged_tokens = 0`). A `modkit_outbox_events` row MUST be emitted with `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }` to satisfy the exactly-once billing event invariant. The reserve release, `chat_turns` state transition to `failed`, and outbox insertion MUST occur in a single atomic DB transaction.
-- **failed_post_provider_start**: provider call started (stream may have begun), then a terminal error occurs (`provider_error`, `provider_timeout`, or internal error). If the provider reported usage, settle on actual usage. Otherwise settle using a bounded estimate: `charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor)`. Emit outbox event with `outcome = "failed"`, `settlement_method = "actual"` or `"estimated"`, and `usage` reflecting the settled amount.
+- **failed_post_provider_start**: provider call started (stream may have begun), then a terminal error occurs (`provider_error`, `provider_timeout`, or internal error). If the provider reported usage, settle on actual usage. Otherwise settle using a bounded estimate: `charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor_applied)` where `minimal_generation_floor_applied` is read from `chat_turns.minimal_generation_floor_applied`. Emit outbox event with `outcome = "failed"`, `settlement_method = "actual"` or `"estimated"`, and `usage` reflecting the settled amount.
 
 **3) aborted** (client disconnect / pod crash / orphan watchdog / internal abort):
 
-- If provider usage is known (provider sent a partial usage report before the stream ended), settle on actual usage.
-- Otherwise settle using the deterministic charged token formula: `charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor)`, consistent with the cancel/disconnect rule (see section 3.2) and the aborted-stream reconciliation (section 5.8).
+- If provider usage is known (provider sent a partial usage report before the stream ended), settle on actual usage. **"Usage known" requires a `usage` object with at least one non-zero field** (`input_tokens > 0` OR `output_tokens > 0`). A `usage` object present with both fields equal to zero (or missing) is treated as "usage unknown" and MUST follow the estimated path — not the actual path. This prevents zero-charge exploitation: the no-free-cancel rule (§5.4 Settlement Definitions) mandates a non-zero debit whenever the provider request started; the estimated path enforces this via `minimal_generation_floor_applied`.
+- Otherwise settle using the deterministic charged token formula: `charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor_applied)` where `minimal_generation_floor_applied` is read from `chat_turns.minimal_generation_floor_applied` (persisted at preflight from MiniChat ConfigMap, immutable after insert), consistent with the cancel/disconnect rule (see section 3.2) and the aborted-stream reconciliation (section 5.8).
 - Emit outbox event with `outcome = "aborted"`, `settlement_method = "actual"` or `"estimated"`.
 
 #### Reconciliation backstop
@@ -3969,6 +5021,63 @@ When a provider request is issued (after preflight passes and before the first o
 
 Each turn MUST reach exactly one terminal billing state. Terminal states are immutable.
 
+**Billing State Machine:**
+
+```mermaid
+stateDiagram-v2
+    [*] --> IN_PROGRESS: Quota reserve taken<br/>(chat_turns.state = 'running')
+
+    IN_PROGRESS --> COMPLETED: Provider terminal done event<br/>(response.completed)
+    IN_PROGRESS --> FAILED: Provider terminal error<br/>OR pre-provider error after reserve
+    IN_PROGRESS --> ABORTED: No provider terminal event<br/>(client disconnect, pod crash,<br/>orphan timeout, internal abort)
+
+    COMPLETED --> [*]: Settlement: actual<br/>(provider-reported usage)
+    FAILED --> [*]: Settlement: actual/estimated/released<br/>(depends on provider call status)
+    ABORTED --> [*]: Settlement: actual or estimated<br/>(see §5.8 normative table)
+
+    note right of IN_PROGRESS
+        Preflight reserve persisted:
+        - reserve_tokens
+        - reserved_credits_micro
+        - policy_version_applied
+        - minimal_generation_floor_applied
+    end note
+
+    note right of COMPLETED
+        Outbox outcome: "completed"
+        Settlement method: "actual"
+        Charge: credits_micro(
+          actual_input_tokens,
+          actual_output_tokens,
+          multipliers)
+    end note
+
+    note right of FAILED
+        Outbox outcome: "failed"
+        Settlement method:
+        - "released" (pre-provider)
+        - "actual" (post-provider, usage known)
+        - "estimated" (post-provider, usage unknown)
+    end note
+
+    note right of ABORTED
+        Outbox outcome: "aborted"
+        Settlement method:
+        - "actual" (if provider sent partial usage
+          before disconnect/abort)
+        - "estimated" (otherwise; all orphan_timeout
+          cases always use estimated)
+        Estimated charged tokens = min(
+          reserve_tokens,
+          estimated_input_tokens +
+          minimal_generation_floor_applied)
+
+        Maps to internal state:
+        - cancelled (client disconnect)
+        - failed (orphan timeout, always estimated)
+    end note
+```
+
 **Mapping to internal `chat_turns.state`**:
 
 | Billing State | Internal State | Notes |
@@ -3977,6 +5086,104 @@ Each turn MUST reach exactly one terminal billing state. Terminal states are imm
 | `FAILED` | `failed` | 1:1 mapping (includes `failed_pre_provider` and `failed_post_provider_start`) |
 | `ABORTED` | `cancelled` or `failed` (`error_code = 'orphan_timeout'`) | Unifies all non-terminal stream ends under one billing reconciliation rule |
 
+**Critical Distinction: Internal State vs Billing Outcome (Normative)**
+
+**Internal turn state** (`chat_turns.state`) is an implementation detail tracking the lifecycle transition. **Billing outcome** (outbox `outcome` field) is the semantic classification that determines settlement rules.
+
+The orphan watchdog demonstrates this separation:
+- Sets internal state: `failed` with `error_code = 'orphan_timeout'` (because timeout is an error condition)
+- Emits billing outcome: `"aborted"` with `settlement_method = "estimated"` (because stream ended without provider terminal event)
+
+**Implementation guard**: Any code that keys billing logic, settlement rules, or outbox emission off internal `chat_turns.state` instead of explicitly-set billing outcome is incorrect and will cause billing drift. Billing outcome MUST be determined by the finalization path based on terminal trigger classification (provider done/error vs client disconnect vs orphan timeout), NOT by reading `chat_turns.state`.
+
+#### Internal Error Code Taxonomy (Normative)
+
+**Authoritative enum (closed set for P1):**
+
+```rust
+pub enum TurnErrorCode {
+    // Provider-side errors (terminal, after stream started)
+    ProviderError,        // LLM provider returned terminal error
+    ProviderTimeout,      // Provider request timed out
+    RateLimited,          // Provider throttling after retries exhausted
+
+    // Tool enforcement errors (terminal, mid-turn, after stream started)
+    WebSearchCallsExceeded, // Per-message web_search tool call limit breached mid-turn
+
+    // Pre-provider errors (terminal, before stream started)
+    ContextLengthExceeded, // Context budget exceeded at preflight
+    ValidationError,       // Request validation failed (malformed input)
+
+    // System-side errors (terminal, stream ended without provider event)
+    OrphanTimeout,        // Watchdog timeout for stuck 'running' turns
+}
+
+impl TurnErrorCode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ProviderError => "provider_error",
+            Self::ProviderTimeout => "provider_timeout",
+            Self::RateLimited => "rate_limited",
+            Self::WebSearchCallsExceeded => "web_search_calls_exceeded",
+            Self::ContextLengthExceeded => "context_length_exceeded",
+            Self::ValidationError => "validation_error",
+            Self::OrphanTimeout => "orphan_timeout",
+        }
+    }
+}
+```
+
+**Persistence:** Stored as VARCHAR in `chat_turns.error_code` using the `as_str()` representation.
+
+**Extension rule:** Adding new error codes requires:
+1. Update this enum
+2. Update the billing outcome mapping table (below)
+3. Update unit tests to verify new code's billing classification
+4. Document in CHANGELOG as potentially breaking change for downstream consumers
+
+**Unknown error code handling:** If settlement code encounters an error_code not in this enum (e.g., from a newer deployment or database corruption), it MUST:
+- Log a critical error with the unknown code
+- Classify as `FAILED` with `settlement_method="estimated"`
+- Emit metric: `mini_chat_unknown_error_code_total{code}`
+
+#### Normative Billing Outcome Derivation (P1 Mandatory)
+
+**CRITICAL RULE**: The outbox `outcome` field for `event_type = 'usage_finalized'` events MUST be derived from the billing outcome classification below, **NOT** from the `chat_turns.state` string directly. Any implementation that keys outbox `outcome` off `chat_turns.state` without applying this mapping is incorrect and will cause billing drift.
+
+**Authoritative Mapping Table** (exhaustive; covers ALL finalization paths):
+
+| Internal Terminal Condition | Billing Outcome | Outbox `outcome` | Outbox `settlement_method` | Notes |
+|------------------------------|-----------------|------------------|---------------------------|-------|
+| `state = 'completed'` | `COMPLETED` | `"completed"` | `"actual"` | Normal success; provider reported full usage |
+| `state = 'failed'` AND `error_code IN ('provider_error', 'provider_timeout', 'rate_limited')` | `FAILED` | `"failed"` | `"actual"` (if provider reported partial usage) OR `"estimated"` (if no usage available) | Provider terminal error after streaming started |
+| `state = 'failed'` AND `error_code = 'web_search_calls_exceeded'` | `FAILED` | `"failed"` | `"actual"` (if provider reported partial usage) OR `"estimated"` (if no usage available) | Per-message tool call limit breached mid-turn; turn was post-provider-start; mirrors `provider_error` settlement. MUST NOT use `"released"` even if partial usage is unavailable — the provider was already called. |
+| `state = 'failed'` AND `error_code IN ('context_length_exceeded', 'validation_error')` AND reserve was taken | `FAILED` | `"failed"` | `"released"` | Pre-provider failure after reserve; zero charge |
+| `state = 'cancelled'` (client disconnect) | `ABORTED` | `"aborted"` | `"actual"` (if provider reported partial usage) OR `"estimated"` (use deterministic formula) | Stream ended without provider terminal event |
+| `state = 'failed'` AND `error_code = 'orphan_timeout'` (watchdog) | `ABORTED` | `"aborted"` | `"estimated"` (MUST use deterministic formula from section 5.8) | Watchdog cleanup; no provider terminal event received |
+
+**Rationale for error code classification (addressing settlement_method="released" correctness)**:
+
+The mapping table uses `error_code` values as predicates to classify pre-provider vs post-provider failures. This design is safe because:
+
+1. **Error codes `context_length_exceeded` and `validation_error` are ONLY generated during preflight validation** — they occur when assembling the request payload, before the outbound HTTP request to the provider is issued. These codes can NEVER be generated after the provider request starts. Therefore, using these error codes to infer "pre-provider failure → settlement_method='released'" is semantically correct.
+
+2. **Error codes `provider_error`, `provider_timeout`, and `rate_limited` are ONLY generated after the provider request has started** — they represent terminal errors from the provider or network layer. Therefore, these codes correctly map to post-provider failures that use "actual" or "estimated" settlement.
+
+3. **Pod crash/timeout edge case**: If a pod crashes AFTER taking a reserve but BEFORE issuing the provider request (a <50ms window in normal operation), the orphan watchdog cannot distinguish this from a post-provider crash. The watchdog conservatively applies `settlement_method="estimated"` (NOT "released") to prevent free resource exploitation. This is a documented tradeoff (see section 5.4, Provider Request Start Boundary Implementation Note) - the system errs on the side of charging to avoid abuse.
+
+4. **No misclassification risk**: Because error code generation is coupled to the code path (preflight errors generate pre-provider codes, provider response handling generates post-provider codes), the error code taxonomy is a reliable proxy for the "provider request started" boundary without requiring an additional persisted flag.
+
+**Alternative considered**: Persist `chat_turns.provider_request_started_at` timestamp for perfect crash recovery. Deferred to P2+ due to write latency on critical path (see section 5.4).
+
+**Settlement Method Selection for ABORTED**:
+- If the provider reported partial `usage` before disconnect/timeout, use `settlement_method = "actual"` and charge the reported tokens.
+- Otherwise (no provider usage available), use `settlement_method = "estimated"` and apply the deterministic charged token formula (section 5.8).
+
+**Enforcement**:
+- This mapping MUST be implemented in a **single shared function** used by ALL finalization code paths: normal completion handler, error handler, disconnect/cancellation handler, and orphan watchdog.
+- EVERY terminal code path MUST call this function to derive the outbox payload; no path may construct outbox rows using ad-hoc logic.
+- Unit tests MUST verify that each internal condition row in the table above produces the exact `outcome` and `settlement_method` specified.
+
 **Watchdog determinism rule**: the orphan turn watchdog (section 3, `cpt-cf-mini-chat-component-orphan-watchdog`) MUST use the exact same deterministic charged token formula defined below for `ABORTED` streams — no separate estimation path. The watchdog MUST perform (1) quota settlement using the formula, (2) `chat_turns` state transition, and (3) `modkit_outbox_events` insertion in a single atomic DB transaction. It MUST be impossible for a turn to remain in `IN_PROGRESS` indefinitely; the watchdog timeout (default: 5 minutes) is the hard upper bound on turn duration without a terminal provider event.
 
 #### Deterministic Charged Token Formula (Aborted Streams)
@@ -3984,15 +5191,15 @@ Each turn MUST reach exactly one terminal billing state. Terminal states are imm
 When a stream reaches the `ABORTED` billing state and the provider did not report actual usage, the system MUST compute charged tokens deterministically:
 
 ```text
-charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor)
+charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor_applied)
 ```
 
 Where:
-- `reserve_tokens` — persisted on `chat_turns.reserve_tokens` (BIGINT, immutable after insert). Set at preflight. Read from the DB row at settlement time (not from in-memory state).
-- `estimated_input_tokens` — derived deterministically from persisted columns: `chat_turns.reserve_tokens - chat_turns.max_output_tokens_applied`. Both values are immutable after insert and available on the `chat_turns` row. The derivation MUST NOT use deployment config values that may have changed since preflight.
-- `minimal_generation_floor` — a configurable constant representing the minimum output token charge for any stream that reached the provider (default: 50 tokens). This prevents zero-charge exploitation via immediate disconnect after the provider begins processing. **Configuration source**: this value is part of the policy snapshot `estimation_budgets.minimal_generation_floor` (section 5.2.1). The value applied for a given turn is determined by `chat_turns.policy_version_applied`, ensuring determinism even if the policy changes between turn start and settlement. Configuration constraints: `minimal_generation_floor` MUST satisfy `0 < minimal_generation_floor <= max_output_tokens` (deployment-configured hard cap), and MUST be validated at snapshot load time. A value exceeding `max_output_tokens` MUST be rejected as invalid configuration.
+- `reserve_tokens` — persisted value from `chat_turns.reserve_tokens` (BIGINT, immutable after insert). Set at preflight. Read from the DB row at settlement time (not from in-memory state).
+- `estimated_input_tokens` — derived deterministically from persisted columns: `chat_turns.reserve_tokens - chat_turns.max_output_tokens_applied`. Both source values are immutable after insert and available on the `chat_turns` row. The derivation MUST NOT use deployment config values that may have changed since preflight.
+- `minimal_generation_floor_applied` — persisted value from `chat_turns.minimal_generation_floor_applied` (INTEGER, immutable after insert). This represents the minimum output token charge for any stream that reached the provider. This prevents zero-charge exploitation via immediate disconnect after the provider begins processing. **Configuration source (P1)**: this value is captured at preflight from MiniChat ConfigMap `estimation_budgets.minimal_generation_floor` (NOT from CCM policy snapshot) and persisted on the `chat_turns` row to ensure deterministic settlement independent of future ConfigMap changes. Configuration constraints: the ConfigMap value MUST satisfy `0 < minimal_generation_floor <= max_output_tokens` (deployment-configured hard cap), and MUST be validated at MiniChat startup when loading the ConfigMap. A value exceeding `max_output_tokens` or ≤ 0 MUST be rejected as invalid configuration. The persisted `chat_turns.minimal_generation_floor_applied` value is runtime-immutable; once written at preflight, it is never updated.
 
-**Credit conversion** (estimated path): when no actual usage is available, define `charged_output_tokens = minimal_generation_floor`. The credit conversion is:
+**Credit conversion** (estimated path): when no actual usage is available, define `charged_output_tokens = minimal_generation_floor_applied` (read from `chat_turns.minimal_generation_floor_applied`). The credit conversion is:
 
 ```text
 actual_credits_micro = credits_micro(estimated_input_tokens, charged_output_tokens, in_mult, out_mult)
@@ -4006,7 +5213,7 @@ where `in_mult` and `out_mult` come from the model catalog entry for `chat_turns
 actual_credits_micro = credits_micro(actual_input_tokens, actual_output_tokens, in_mult, out_mult)
 ```
 
-The formula is deliberately conservative (charges less than or equal to the reserve) to avoid overcharging users for incomplete work, while the `minimal_generation_floor` ensures non-zero billing for provider resources consumed.
+The formula is deliberately conservative (charges less than or equal to the reserve) to avoid overcharging users for incomplete work, while the persisted `minimal_generation_floor_applied` (from `chat_turns.minimal_generation_floor_applied`) ensures non-zero billing for provider resources consumed.
 
 #### Outbox Emission Requirement (Aborted Streams)
 
@@ -4014,7 +5221,6 @@ When a turn transitions to `ABORTED`, the system MUST emit a `modkit_outbox_even
 
 | Field | Value |
 |-------|-------|
-| `event_type` | `usage_finalized` |
 | `outcome` | `"aborted"` |
 | `settlement_method` | `"estimated"` (or `"actual"` if provider reported partial usage) |
 | `usage` | `{ input_tokens, output_tokens }` (token-denominated; actual if known, or estimated split) |
@@ -4082,6 +5288,16 @@ Section 5.7 defines the `failed` outcome taxonomy (pre-provider vs. post-provide
 
 - No quota settlement occurs (there is no reserve to release).
 - Emitting a `modkit_outbox_events` row is OPTIONAL. The "exactly one event per reserve" invariant does not apply because no reserve was created. If the system does emit one for observability, the row MUST use `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }`, and MUST use a stable `dedupe_key` derived from `(tenant_id, turn_id, request_id)` so that consumers can safely ignore duplicates.
+
+> **turn_id generation for pre-reserve failures**: if no `chat_turns` row exists (failure during validation or authorization before INSERT), the implementation MUST either (1) not emit an outbox event (OPTIONAL branch) or (2) use the **all-zeros sentinel UUID** (`00000000-0000-0000-0000-000000000000`) as the `turn_id` component of the dedupe_key. Using a per-invocation random UUID v4 as `turn_id` is **PROHIBITED**: client retries generate new random UUIDs per attempt, producing a different `dedupe_key` for each retry of the same logical request — defeating idempotency and allowing duplicate pre-reserve events. The sentinel `turn_id` is stable across retries of the same `request_id`. Dedupe key format: `{tenant_id_hex}/00000000000000000000000000000000/{request_id_hex}` (all UUIDs normalized to lowercase 32-char hex). The `request_id` is always available (client-provided or server-generated per standard turn semantics). The `tenant_id` is available from the authenticated request context.
+
+> **Consumer Warning for Optional Pre-Reserve Events**: If the system emits optional outbox events for pre-reserve failures, consumers MUST be aware that:
+> 1. The `turn_id` in the event is the all-zeros sentinel UUID (`00000000-0000-0000-0000-000000000000`), not a real `chat_turns` row identifier
+> 2. JOIN operations to `chat_turns` by this `turn_id` will fail or return no rows
+> 3. Optional pre-reserve events represent zero billing impact and exist for observability/debugging only
+> 4. Consumers MUST check `settlement_method = "released"` and `usage = { input_tokens: 0, output_tokens: 0 }` to identify these events
+> 5. Consumers MUST NOT assume all `usage_finalized` events correspond to persisted `chat_turns` rows when optional pre-reserve events are enabled
+
 - No billing state transition applies (no `chat_turns` row was created, or the row never entered `IN_PROGRESS`).
 - Pre-reserve failures are NOT part of "reserve settlement". They exist outside the billing lifecycle that begins with reserve creation.
 
@@ -4106,18 +5322,18 @@ When the provider issues a terminal `event: error` after streaming has started, 
 
 2. **If the provider did NOT report actual usage**:
    ```text
-   charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor)
+   charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor_applied)
    ```
    Where:
    - `reserve_tokens` — the persisted preflight reserve from the `chat_turns` row.
    - `estimated_input_tokens` — token estimate of the `ContextPlan` sent to the provider (derived deterministically from persisted columns: `chat_turns.reserve_tokens - chat_turns.max_output_tokens_applied`).
-   - `minimal_generation_floor` — the same configurable constant used in the ABORTED formula (section 5.8, default: 50 tokens).
+   - `minimal_generation_floor_applied` — read from the persisted per-turn column `chat_turns.minimal_generation_floor_applied`. This is the same value used in the ABORTED formula (section 5.8). Captured at preflight from MiniChat ConfigMap (NOT from CCM policy snapshot) to ensure deterministic settlement independent of future ConfigMap changes.
 
-**Credit conversion**: identical to section 5.8. For case 1 (actual): `actual_credits_micro = credits_micro(actual_input_tokens, actual_output_tokens, in_mult, out_mult)`. For case 2 (estimated): `charged_output_tokens = minimal_generation_floor` and `actual_credits_micro = credits_micro(estimated_input_tokens, charged_output_tokens, in_mult, out_mult)`. Multipliers come from the policy snapshot identified by `chat_turns.policy_version_applied`.
+**Credit conversion**: identical to section 5.8. For case 1 (actual): `actual_credits_micro = credits_micro(actual_input_tokens, actual_output_tokens, in_mult, out_mult)`. For case 2 (estimated): `charged_output_tokens = minimal_generation_floor_applied` (read from `chat_turns.minimal_generation_floor_applied`) and `actual_credits_micro = credits_micro(estimated_input_tokens, charged_output_tokens, in_mult, out_mult)`. Multipliers come from the policy snapshot identified by `chat_turns.policy_version_applied`.
 
-**Critical constraint**: the system MUST NEVER charge the full `reserve_tokens` unless the provider explicitly reports usage equal to or exceeding the reserve. When no provider usage is available, the charge is bounded by the estimated input cost plus `minimal_generation_floor`, reflecting that the provider received the prompt and may have consumed resources before the error.
+**Critical constraint**: the system MUST NEVER charge the full `reserve_tokens` unless the provider explicitly reports usage equal to or exceeding the reserve. When no provider usage is available, the charge is bounded by the estimated input cost plus `minimal_generation_floor_applied` (the persisted per-turn floor value from `chat_turns.minimal_generation_floor_applied`), reflecting that the provider received the prompt and may have consumed resources before the error.
 
-**Consistency with ABORTED formula (section 5.8)**: The `minimal_generation_floor` is applied identically in both the ABORTED and the post-stream terminal error reconciliation formulas. In both cases, the provider request was issued and the provider may have consumed compute resources even if it did not report usage. The floor ensures a non-zero minimum charge for any invocation that reached the provider, regardless of whether the stream ended with an explicit terminal error or an unacknowledged interruption. If the provider reports actual usage (case 1 above), those tokens are charged directly, making the floor unnecessary.
+**Consistency with ABORTED formula (section 5.8)**: The persisted `minimal_generation_floor_applied` (from `chat_turns.minimal_generation_floor_applied`) is applied identically in both the ABORTED and the post-stream terminal error reconciliation formulas. In both cases, the provider request was issued and the provider may have consumed compute resources even if it did not report usage. The floor ensures a non-zero minimum charge for any invocation that reached the provider, regardless of whether the stream ended with an explicit terminal error or an unacknowledged interruption. If the provider reports actual usage (case 1 above), those tokens are charged directly, making the floor unnecessary.
 
 #### State Transition
 
@@ -4135,7 +5351,6 @@ When a post-stream terminal error is finalized, the system MUST emit a `modkit_o
 
 | Field | Value |
 |-------|-------|
-| `event_type` | `usage_finalized` |
 | `outcome` | `"failed"` |
 | `settlement_method` | `"actual"` if provider reported usage; `"estimated"` otherwise |
 | `usage` | `{ input_tokens, output_tokens }` (token-denominated; actual if known, or estimated split) |
@@ -4422,3 +5637,269 @@ The system **MUST** finalize turns using CAS on `chat_turn.state` and MUST emit 
 
 ### Internal
 - [Outbox Pattern](features/outbox-pattern.md) — transactional outbox pattern specification (P1)
+
+---
+
+# Appendix A — CCM Policy & Usage API Contract (P1)
+
+This appendix reproduces the CCM Policy & Usage API contract as defined in the official CCM specification (see referenced document). It is consumed by `mini-chat-policy-plugin` and governs policy distribution and usage ingestion for P1. This appendix does not redefine MiniChat internal algorithms.
+
+## A.1 Policy Distribution API
+
+### Policy Version Semantics
+
+A monotonic, strictly increasing integer that identifies a specific immutable policy snapshot.
+
+**Core Principle**: For a fixed `(tenant_id, policy_version)`, CCM must return exactly the same snapshot forever.
+
+**Bump Triggers**:
+- Changes to model catalog
+- Changes to credit multipliers (`input_tokens_credit_multiplier`, `output_tokens_credit_multiplier`)
+- Changes to kill switches (`disable_premium_tier`, `force_standard_tier`, `disable_web_search`)
+- User allocation logic changes affecting `GetUserLimits` output
+- User entitlements/plan changes
+
+**Note (P1)**: Estimation budgets (image_token_budget, tool_surcharge_tokens, web_search_surcharge_tokens, etc.) are configured **locally in MiniChat ConfigMap**, NOT in CCM PolicySnapshot. Changes to estimation budgets do NOT trigger CCM policy version bumps. See section 5.2.1 "Estimation Budgets Source (P1)" for details.
+
+**MiniChat Integration**:
+- MiniChat caches snapshots keyed by `(tenant_id, policy_version)`.
+- MiniChat caches user limits keyed by `(tenant_id, user_id, policy_version)`.
+- CCM is NOT on the per-turn hot path.
+
+### GetCurrentPolicyVersion
+
+**Purpose**: Bootstrap and recovery mechanism.
+
+**Request**:
+```json
+{
+  "tenant_id": "uuid"
+}
+```
+
+**Response**:
+```json
+{
+  "tenant_id": "uuid",
+  "policy_version": 12345,
+  "generated_at": "2026-02-27T13:00:00Z"
+}
+```
+
+**Key requirement**: Must be monotonic (never decreases).
+
+### GetPolicySnapshot
+
+**Purpose**: Retrieve immutable shared policy configuration by version.
+
+**Request**:
+```json
+{
+  "tenant_id": "uuid",
+  "policy_version": 12345
+}
+```
+
+**Response**:
+```json
+{
+  "tenant_id": "uuid",
+  "policy_version": 12345,
+  "snapshot": {
+    "model_catalog": [
+      {
+        "model_id": "gpt-5.2",
+        "display_name": "GPT-5.2",
+        "provider_display_name": "Azure OpenAI",
+        "tier": "premium",
+        "global_enabled": true,
+        "description": "Best for complex reasoning tasks",
+        "multimodal_capabilities": [
+          "VISION_INPUT",
+          "IMAGE_GENERATION",
+          "AUDIO_INPUT",
+          "SPEECH_OUTPUT"
+        ],
+        "context_window": 128000,
+        "max_output_tokens": 4096,
+        "input_tokens_credit_multiplier_micro": 2500000,
+        "output_tokens_credit_multiplier_micro": 2500000,
+        "multiplier_display": "2.5x"
+      }
+    ],
+    "kill_switches": {
+      "disable_web_search": false,
+      "disable_file_search": false
+    }
+  }
+}
+```
+
+**Critical constraints**:
+- For a fixed `(tenant_id, policy_version)`, CCM must return exactly the same snapshot forever.
+- Multipliers represent micro-credits per 1,000 tokens and must be positive integers.
+- `provider_display_name` is UI-only and MUST NOT be a routing key, deployment handle, or internal provider identifier.
+
+**P1 Note — Estimation Budgets**:
+- In P1, `estimation_budgets` (image_token_budget, tool_surcharge_tokens, web_search_surcharge_tokens, bytes_per_token_conservative, fixed_overhead_tokens, safety_margin_pct, minimal_generation_floor) are NOT supplied by CCM.
+- `estimation_budgets` are configured locally in MiniChat via Kubernetes ConfigMap (or equivalent deployment config file).
+- MiniChat persists `minimal_generation_floor_applied` per turn (on `chat_turns` table) for deterministic estimated settlement independent of ConfigMap changes.
+- CCM PolicySnapshot in P1 MUST NOT include `estimation_budgets` fields. The snapshot example above omits them intentionally.
+
+**Multimodal Capability Flags**: Enumerated values include:
+- `VISION_INPUT`
+- `IMAGE_GENERATION`
+- `IMAGE_EDITING`
+- `AUDIO_INPUT`
+- `SPEECH_OUTPUT`
+- `VIDEO_INPUT`
+- `VIDEO_GENERATION`
+- `CROSS_MODAL_REASONING`
+- `RAG`
+
+### GetUserLimits
+
+**Purpose**: Retrieve per-user credit allocations keyed by policy version.
+
+**Request**:
+```json
+{
+  "tenant_id": "uuid",
+  "user_id": "uuid",
+  "policy_version": 12345
+}
+```
+
+**Response**:
+```json
+{
+  "tenant_id": "uuid",
+  "user_id": "uuid",
+  "policy_version": 12345,
+  "user_limits": {
+    "standard": {
+      "limit_daily_credits_micro": 120000000,
+      "limit_monthly_credits_micro": 2500000000
+    },
+    "premium": {
+      "limit_daily_credits_micro": 40000000,
+      "limit_monthly_credits_micro": 800000000
+    }
+  },
+  "computed_at": "2026-02-27T13:00:02Z"
+}
+```
+
+**Critical design principle**: If the user's entitlements/plan changes such that limits change, CCM must bump `policy_version`.
+
+### Policy Change Notification (Optional)
+
+**Purpose**: Optional asynchronous notification of policy updates.
+
+**Endpoint**: `POST /internal/policy:notify`
+
+**Request**:
+```json
+{
+  "tenant_id": "uuid",
+  "policy_version": 12346
+}
+```
+
+**Response**:
+```json
+{
+  "accepted": true
+}
+```
+
+## A.2 Credit Accounting Model
+
+### Unit Definition
+
+- 1 credit = 1,000,000 `credits_micro`
+- All computations use integer arithmetic exclusively.
+
+### Canonical Credit Formula
+
+```
+fn credits_micro(input_tokens, output_tokens, in_mult, out_mult) ->
+    ceil_div(input_tokens * in_mult, 1000)
+  + ceil_div(output_tokens * out_mult, 1000)
+
+fn ceil_div(n, d) -> (n + d - 1) / d
+```
+
+**Critical rule**: Floating-point arithmetic MUST NOT be used in credit computation.
+
+**MiniChat Authority**:
+- MiniChat is settlement authority.
+- CCM MUST NOT recompute credits.
+- CCM MUST treat `actual_credits_micro` as authoritative.
+
+## A.3 Usage Reporting API (PublishUsage)
+
+**Endpoint**: `POST /v1/usage/publish`
+
+This endpoint accepts usage settlement events from MiniChat for finalized turn outcomes.
+
+**Payload**:
+```json
+{
+  "tenant_id": "uuid",
+  "user_id": "uuid",
+  "chat_id": "uuid",
+  "turn_id": "uuid",
+  "request_id": "uuid",
+  "policy_version_applied": 12345,
+  "selected_model": "string",
+  "effective_model": "string",
+  "outcome": "completed | failed | aborted",
+  "settlement_method": "actual | estimated",
+  "usage": {
+    "input_tokens": 123,
+    "output_tokens": 456
+  },
+  "actual_credits_micro": 3750000,
+  "reserved_credits_micro": 4000000,
+  "error_code": null
+}
+```
+
+**Authority model**: MiniChat is the settlement authority: it computes `actual_credits_micro`. CCM is the ledger and balance authority.
+
+**Idempotency requirement**: CCM MUST ensure idempotency using the composite key `(tenant_id, turn_id, request_id)`.
+
+**Success Response**:
+```json
+{
+  "status": "accepted"
+}
+```
+
+**MiniChat Delivery Guarantees**:
+- Delivery is at-least-once (due to outbox pattern).
+- CCM MUST implement idempotency on `(tenant_id, turn_id, request_id)`.
+- 200 OK MUST be returned for idempotent duplicate events.
+
+## A.4 Policy Version Retention
+
+CCM MUST retain immutable snapshots per `(tenant_id, policy_version)` for at least the billing/audit retention window. Snapshots must remain retrievable during that period. This preserves deterministic replay and auditability.
+
+**MiniChat caching strategy**:
+- Policy snapshots: Persist by `(tenant_id, policy_version)`; bounded LRU memory cache.
+- User limits: Bounded LRU cache with 60–300 second TTL; key by `(tenant_id, user_id, policy_version)`.
+
+## A.5 Separation of Concerns
+
+**This appendix defines**:
+- Policy distribution
+- Usage ingestion
+
+**It does NOT define**:
+- Provider routing
+- Token estimation internals
+- Billing plan logic outside P1
+
+**P1 Scope Exclusions**:
+The specification explicitly excludes per-user model multipliers, pricing overrides, provider interaction details, token estimation algorithms, and billing/payment processing from P1 scope.
