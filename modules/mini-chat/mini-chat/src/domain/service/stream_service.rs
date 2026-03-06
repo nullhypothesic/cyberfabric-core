@@ -93,6 +93,20 @@ pub enum StreamError {
     ChatNotFound { chat_id: Uuid },
 }
 
+impl From<authz_resolver_sdk::EnforcerError> for StreamError {
+    fn from(e: authz_resolver_sdk::EnforcerError) -> Self {
+        match e {
+            e @ authz_resolver_sdk::EnforcerError::Denied { .. } => Self::AuthorizationFailed {
+                source: DomainError::from(e),
+            },
+            e @ (authz_resolver_sdk::EnforcerError::EvaluationFailed(_)
+            | authz_resolver_sdk::EnforcerError::CompileFailed(_)) => Self::TurnCreationFailed {
+                source: DomainError::from(e),
+            },
+        }
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // FinalizationCtx — bundled context for atomic finalization in the spawned task
 // ════════════════════════════════════════════════════════════════════════════
@@ -292,10 +306,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static, CR: ChatRepo
         let scope = self
             .enforcer
             .access_scope(&ctx, &resources::CHAT, actions::SEND_MESSAGE, Some(chat_id))
-            .await
-            .map_err(|e| StreamError::AuthorizationFailed {
-                source: DomainError::from(e),
-            })?;
+            .await?;
 
         // Non-transactional connection for pre-stream checks (D6)
         let conn = self
@@ -1690,7 +1701,7 @@ mod tests {
         }
     }
 
-    /// Non-existent chat returns ChatNotFound.
+    /// Non-existent chat returns `ChatNotFound`.
     #[tokio::test]
     async fn run_stream_nonexistent_chat_returns_chat_not_found() {
         let db = mock_db_provider(inmem_db().await);
