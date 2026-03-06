@@ -3,8 +3,7 @@ use std::sync::Arc;
 use authz_resolver_sdk::PolicyEnforcer;
 use futures::StreamExt;
 use modkit_macros::domain_model;
-use modkit_security::AccessScope;
-use oagw_sdk::SecurityContext;
+use modkit_security::{AccessScope, SecurityContext};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -22,7 +21,7 @@ use crate::infra::llm::{
     Usage,
 };
 
-use super::DbProvider;
+use super::{DbProvider, actions, resources};
 
 // ════════════════════════════════════════════════════════════════════════════
 // StreamTerminal — service-level terminal classification
@@ -88,6 +87,10 @@ pub enum StreamError {
     Conflict { code: String, message: String },
     /// Turn creation or pre-stream DB operation failed.
     TurnCreationFailed { source: DomainError },
+    /// Authorization failed (enforcer denied access).
+    AuthorizationFailed { source: DomainError },
+    /// Chat does not exist or is not visible to the caller.
+    ChatNotFound { chat_id: Uuid },
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -284,7 +287,15 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static, CR: ChatRepo
     ) -> Result<tokio::task::JoinHandle<StreamOutcome>, StreamError> {
         let tenant_id = ctx.subject_tenant_id();
         let user_id = ctx.subject_id();
-        let scope = AccessScope::for_tenant(tenant_id);
+
+        // ── Authorization ──
+        let scope = self
+            .enforcer
+            .access_scope(&ctx, &resources::CHAT, actions::SEND_MESSAGE, Some(chat_id))
+            .await
+            .map_err(|e| StreamError::AuthorizationFailed {
+                source: DomainError::from(e),
+            })?;
 
         // Non-transactional connection for pre-stream checks (D6)
         let conn = self
@@ -293,6 +304,15 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static, CR: ChatRepo
             .map_err(|e| StreamError::TurnCreationFailed {
                 source: DomainError::from(e),
             })?;
+
+        // ── Verify chat exists (scoped) ──
+        self.chat_repo
+            .get(&conn, &scope, chat_id)
+            .await
+            .map_err(|e| StreamError::TurnCreationFailed { source: e })?
+            .ok_or(StreamError::ChatNotFound { chat_id })?;
+
+        let scope = scope.tenant_only();
 
         // ── Idempotency check ──
         if let Some(existing_turn) = self
@@ -1184,7 +1204,7 @@ mod tests {
     // ── Pre-stream check tests (7.6) ──
 
     use crate::domain::service::test_helpers::{
-        inmem_db, mock_db_provider, mock_enforcer, test_security_ctx,
+        inmem_db, mock_db_provider, mock_enforcer, test_security_ctx_with_id,
     };
 
     /// Build a `StreamService` with real DB repos and a mock LLM provider.
@@ -1246,7 +1266,7 @@ mod tests {
     }
 
     /// Insert a parent chat row (required by FK constraints).
-    async fn insert_test_chat(db: &Arc<DbProvider>, tenant_id: Uuid, chat_id: Uuid) {
+    async fn insert_test_chat(db: &Arc<DbProvider>, tenant_id: Uuid, user_id: Uuid, chat_id: Uuid) {
         use crate::infra::db::entity::chat::{ActiveModel, Entity as ChatEntity};
         use modkit_db::secure::secure_insert;
         use sea_orm::Set;
@@ -1256,7 +1276,7 @@ mod tests {
         let am = ActiveModel {
             id: Set(chat_id),
             tenant_id: Set(tenant_id),
-            user_id: Set(Uuid::new_v4()),
+            user_id: Set(user_id),
             model: Set("gpt-5.2".to_owned()),
             title: Set(Some("test".to_owned())),
             is_temporary: Set(false),
@@ -1275,9 +1295,10 @@ mod tests {
     async fn prestream_idempotency_returns_replay_for_existing_turn() {
         let db = mock_db_provider(inmem_db().await);
         let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
         let chat_id = Uuid::new_v4();
         let request_id = Uuid::new_v4();
-        insert_test_chat(&db, tenant_id, chat_id).await;
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
 
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["hi"]));
         let svc = build_stream_service(db.clone(), provider);
@@ -1325,7 +1346,7 @@ mod tests {
             .expect("complete turn");
 
         // Now run_stream with same request_id → should get Replay
-        let ctx = test_security_ctx(tenant_id);
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
         let (tx, _rx) = mpsc::channel(32);
         let cancel = CancellationToken::new();
 
@@ -1353,8 +1374,9 @@ mod tests {
     async fn prestream_parallel_guard_returns_conflict() {
         let db = mock_db_provider(inmem_db().await);
         let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
         let chat_id = Uuid::new_v4();
-        insert_test_chat(&db, tenant_id, chat_id).await;
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
 
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["hi"]));
         let svc = build_stream_service(db.clone(), provider);
@@ -1386,7 +1408,7 @@ mod tests {
             .expect("create running turn");
 
         // New request_id → passes idempotency, but hits parallel guard
-        let ctx = test_security_ctx(tenant_id);
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
         let (tx, _rx) = mpsc::channel(32);
         let cancel = CancellationToken::new();
 
@@ -1414,13 +1436,14 @@ mod tests {
     async fn prestream_happy_path_proceeds_to_stream() {
         let db = mock_db_provider(inmem_db().await);
         let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
         let chat_id = Uuid::new_v4();
-        insert_test_chat(&db, tenant_id, chat_id).await;
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
 
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["Hello"]));
         let svc = build_stream_service(db, provider);
 
-        let ctx = test_security_ctx(tenant_id);
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
         let (tx, mut rx) = mpsc::channel(32);
         let cancel = CancellationToken::new();
 
@@ -1463,15 +1486,16 @@ mod tests {
     async fn duplicate_request_id_returns_replay_with_turn_data() {
         let db = mock_db_provider(inmem_db().await);
         let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
         let chat_id = Uuid::new_v4();
         let request_id = Uuid::new_v4();
-        insert_test_chat(&db, tenant_id, chat_id).await;
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
 
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["hi"]));
         let svc = build_stream_service(db.clone(), provider);
 
         // First call succeeds — creates turn and streams
-        let ctx1 = test_security_ctx(tenant_id);
+        let ctx1 = test_security_ctx_with_id(tenant_id, user_id);
         let (tx1, mut rx1) = mpsc::channel(32);
         let cancel1 = CancellationToken::new();
         let handle = svc
@@ -1496,7 +1520,7 @@ mod tests {
         handle.await.expect("task complete");
 
         // Second call with same request_id → Replay with turn data
-        let ctx2 = test_security_ctx(tenant_id);
+        let ctx2 = test_security_ctx_with_id(tenant_id, user_id);
         let (tx2, _rx2) = mpsc::channel(32);
         let cancel2 = CancellationToken::new();
         let err = svc
@@ -1568,14 +1592,15 @@ mod tests {
 
         let db = mock_db_provider(inmem_db().await);
         let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
         let chat_id = Uuid::new_v4();
         let request_id = Uuid::new_v4();
-        insert_test_chat(&db, tenant_id, chat_id).await;
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
 
         let provider: Arc<dyn LlmProvider> = Arc::new(SlowMockProvider);
         let svc = build_stream_service(db.clone(), provider);
 
-        let ctx = test_security_ctx(tenant_id);
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
         let (tx, mut rx) = mpsc::channel(32);
         let cancel = CancellationToken::new();
 
@@ -1621,5 +1646,84 @@ mod tests {
             turn.completed_at.is_some(),
             "completed_at should be set after CAS finalization"
         );
+    }
+
+    // ── Authorization tests ──
+
+    /// Cross-tenant access: user from tenant B cannot stream on tenant A's chat.
+    /// The scoped `chat_repo.get()` returns `None` (chat invisible), yielding `ChatNotFound`.
+    #[tokio::test]
+    async fn run_stream_cross_tenant_returns_chat_not_found() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_a = Uuid::new_v4();
+        let user_a = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_a, user_a, chat_id).await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["hi"]));
+        let svc = build_stream_service(db, provider);
+
+        // User from a different tenant
+        let tenant_b = Uuid::new_v4();
+        let ctx = test_security_ctx_with_id(tenant_b, Uuid::new_v4());
+        let (tx, _rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+
+        let err = svc
+            .run_stream(
+                ctx,
+                chat_id,
+                Uuid::new_v4(),
+                "hello".into(),
+                "gpt-5.2".into(),
+                cancel,
+                tx,
+            )
+            .await
+            .expect_err("should be ChatNotFound");
+
+        match err {
+            StreamError::ChatNotFound { chat_id: id } => {
+                assert_eq!(id, chat_id);
+            }
+            other => panic!("expected ChatNotFound, got: {other:?}"),
+        }
+    }
+
+    /// Non-existent chat returns ChatNotFound.
+    #[tokio::test]
+    async fn run_stream_nonexistent_chat_returns_chat_not_found() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let bogus_chat_id = Uuid::new_v4();
+        // No chat inserted
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["hi"]));
+        let svc = build_stream_service(db, provider);
+
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let (tx, _rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+
+        let err = svc
+            .run_stream(
+                ctx,
+                bogus_chat_id,
+                Uuid::new_v4(),
+                "hello".into(),
+                "gpt-5.2".into(),
+                cancel,
+                tx,
+            )
+            .await
+            .expect_err("should be ChatNotFound");
+
+        match err {
+            StreamError::ChatNotFound { chat_id } => {
+                assert_eq!(chat_id, bogus_chat_id);
+            }
+            other => panic!("expected ChatNotFound, got: {other:?}"),
+        }
     }
 }

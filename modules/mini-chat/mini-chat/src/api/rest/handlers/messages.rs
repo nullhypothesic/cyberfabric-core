@@ -56,9 +56,6 @@ pub(crate) async fn stream_message(
         .into_response();
     }
 
-    // TODO P1: AuthZ (PolicyEnforcer::evaluate with send_message action)
-    // TODO P1: Chat existence check via AccessScope
-
     // ── Wire up streaming pipeline ─────────────────────────────────────
     let capacity = svc.stream.channel_capacity();
     let ping_secs = svc.stream.ping_interval_secs();
@@ -92,6 +89,15 @@ pub(crate) async fn stream_message(
         }
         Err(StreamError::Conflict { message, .. }) => {
             return Problem::new(StatusCode::CONFLICT, "Conflict", &message).into_response();
+        }
+        Err(StreamError::ChatNotFound { .. }) => {
+            return Problem::new(StatusCode::NOT_FOUND, "Not Found", "Chat not found")
+                .into_response();
+        }
+        Err(StreamError::AuthorizationFailed { source }) => {
+            warn!(error = %source, "stream authorization failed");
+            return Problem::new(StatusCode::FORBIDDEN, "Forbidden", "Access denied")
+                .into_response();
         }
         Err(StreamError::TurnCreationFailed { source }) => {
             warn!(error = %source, "pre-stream turn creation failed");
