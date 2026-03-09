@@ -1,5 +1,7 @@
 //! Database connection options and configuration types.
 
+use modkit_utils::env_expand::expand_env_vars;
+
 use crate::config::{DbConnConfig, DbEngineCfg, GlobalDatabaseConfig, PoolCfg};
 use crate::{DbError, DbHandle, Result};
 
@@ -685,22 +687,6 @@ fn parse_sqlite_path_from_dsn(dsn: &str) -> Result<std::path::PathBuf> {
             "Invalid SQLite DSN: {dsn}"
         )))
     }
-}
-
-/// Expand environment variables in a string.
-fn expand_env_vars(input: &str) -> Result<String> {
-    let re = regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-        .map_err(|e| DbError::InvalidParameter(e.to_string()))?;
-    let mut result = input.to_owned();
-
-    for caps in re.captures_iter(input) {
-        let full_match = &caps[0];
-        let var_name = &caps[1];
-        let value = std::env::var(var_name)?;
-        result = result.replace(full_match, &value);
-    }
-
-    Ok(result)
 }
 
 /// Resolve password from environment variable if it starts with ${VAR}.

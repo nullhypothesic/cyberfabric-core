@@ -232,6 +232,15 @@ pub enum DbError {
     ConnRequestedInsideTx,
 }
 
+impl From<modkit_utils::env_expand::ExpandEnvError> for DbError {
+    fn from(err: modkit_utils::env_expand::ExpandEnvError) -> Self {
+        match err {
+            modkit_utils::env_expand::ExpandEnvError::Var { source, .. } => Self::EnvVar(source),
+            modkit_utils::env_expand::ExpandEnvError::Regex(msg) => Self::InvalidParameter(msg),
+        }
+    }
+}
+
 impl From<crate::secure::ScopeError> for DbError {
     fn from(value: crate::secure::ScopeError) -> Self {
         // Scope errors are not infra connection errors, but they still originate from the DB
