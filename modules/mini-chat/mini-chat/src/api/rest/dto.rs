@@ -224,7 +224,7 @@ pub struct ModelListDto {
 // Streaming request DTOs
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Request body for `POST /v1/chats/{id}/messages/stream`.
+/// Request body for `POST /v1/chats/{id}/messages:stream`.
 #[derive(Debug, Clone, serde::Deserialize, ToSchema)]
 pub struct StreamMessageRequest {
     /// Message content (must be non-empty).

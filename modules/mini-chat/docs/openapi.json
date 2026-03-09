@@ -837,7 +837,7 @@
         }
       }
     },
-    "/v1/chats/{id}/turns/{request_id}:retry": {
+    "/v1/chats/{id}/turns/{request_id}/retry": {
       "parameters": [
         {
           "$ref": "#/components/parameters/ChatId"

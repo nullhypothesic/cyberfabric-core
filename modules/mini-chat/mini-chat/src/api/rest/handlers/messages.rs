@@ -37,7 +37,7 @@ pub(crate) async fn list_messages(
     Ok(Json(page))
 }
 
-/// POST /mini-chat/v1/chats/{id}/messages/stream
+/// POST /mini-chat/v1/chats/{id}/messages:stream
 ///
 /// Pre-stream validation returns JSON errors. On success, opens an SSE
 /// connection and relays events from the provider through a bounded channel.
