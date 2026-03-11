@@ -134,12 +134,25 @@ impl ProviderEntry {
         if self.host.trim().is_empty() {
             return Err(format!("provider '{provider_id}': host must not be empty"));
         }
-        for (tid, ovr) in &self.tenant_overrides {
-            if let Some(h) = &ovr.host
+        for (tid, tenant_override) in &self.tenant_overrides {
+            if let Some(h) = &tenant_override.host
                 && h.trim().is_empty()
             {
                 return Err(format!(
                     "provider '{provider_id}': tenant override '{tid}' host must not be empty"
+                ));
+            }
+
+            let overrides_auth =
+                tenant_override.auth_plugin_type.is_some() || tenant_override.auth_config.is_some();
+            let has_distinct_upstream =
+                tenant_override.host.is_some() || tenant_override.upstream_alias.is_some();
+
+            if overrides_auth && !has_distinct_upstream {
+                return Err(format!(
+                    "provider '{provider_id}': tenant override '{tid}' overrides auth \
+                     without host or upstream_alias - \
+                     set one to create a distinct upstream"
                 ));
             }
         }
@@ -814,5 +827,117 @@ mod tests {
         let err = entry.validate("azure_openai").unwrap_err();
         assert!(err.contains("bad-tenant"));
         assert!(err.contains("host must not be empty"));
+    }
+
+    #[test]
+    fn validate_rejects_auth_only_override_without_alias() {
+        let entry = ProviderEntry {
+            kind: crate::infra::llm::ProviderKind::OpenAiResponses,
+            upstream_alias: None,
+            host: "default.openai.azure.com".to_owned(),
+            api_path: "/v1/responses".to_owned(),
+            auth_plugin_type: None,
+            auth_config: None,
+            tenant_overrides: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "tenant-a".to_owned(),
+                    ProviderTenantOverride {
+                        host: None,
+                        upstream_alias: None,
+                        auth_plugin_type: Some("custom-plugin".to_owned()),
+                        auth_config: Some({
+                            let mut c = HashMap::new();
+                            c.insert("secret_ref".to_owned(), "tenant-a-key".to_owned());
+                            c
+                        }),
+                    },
+                );
+                m
+            },
+        };
+        let err = entry.validate("azure_openai").unwrap_err();
+        assert!(err.contains("tenant-a"));
+        assert!(err.contains("overrides auth"));
+    }
+
+    #[test]
+    fn validate_rejects_auth_plugin_type_only_override_without_alias() {
+        let entry = ProviderEntry {
+            kind: crate::infra::llm::ProviderKind::OpenAiResponses,
+            upstream_alias: None,
+            host: "default.openai.azure.com".to_owned(),
+            api_path: "/v1/responses".to_owned(),
+            auth_plugin_type: None,
+            auth_config: None,
+            tenant_overrides: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "tenant-b".to_owned(),
+                    ProviderTenantOverride {
+                        host: None,
+                        upstream_alias: None,
+                        auth_plugin_type: Some("different-plugin".to_owned()),
+                        auth_config: None,
+                    },
+                );
+                m
+            },
+        };
+        let err = entry.validate("azure_openai").unwrap_err();
+        assert!(err.contains("tenant-b"));
+        assert!(err.contains("overrides auth"));
+    }
+
+    #[test]
+    fn validate_accepts_auth_only_override_with_explicit_alias() {
+        let entry = ProviderEntry {
+            kind: crate::infra::llm::ProviderKind::OpenAiResponses,
+            upstream_alias: None,
+            host: "default.openai.azure.com".to_owned(),
+            api_path: "/v1/responses".to_owned(),
+            auth_plugin_type: None,
+            auth_config: None,
+            tenant_overrides: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "tenant-a".to_owned(),
+                    ProviderTenantOverride {
+                        host: None,
+                        upstream_alias: Some("azure-tenant-a".to_owned()),
+                        auth_plugin_type: Some("custom-plugin".to_owned()),
+                        auth_config: None,
+                    },
+                );
+                m
+            },
+        };
+        assert!(entry.validate("azure_openai").is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_host_differing_override_with_auth() {
+        let entry = ProviderEntry {
+            kind: crate::infra::llm::ProviderKind::OpenAiResponses,
+            upstream_alias: None,
+            host: "default.openai.azure.com".to_owned(),
+            api_path: "/v1/responses".to_owned(),
+            auth_plugin_type: None,
+            auth_config: None,
+            tenant_overrides: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "tenant-a".to_owned(),
+                    ProviderTenantOverride {
+                        host: Some("tenant-a.openai.azure.com".to_owned()),
+                        upstream_alias: None,
+                        auth_plugin_type: Some("custom-plugin".to_owned()),
+                        auth_config: None,
+                    },
+                );
+                m
+            },
+        };
+        assert!(entry.validate("azure_openai").is_ok());
     }
 }

@@ -164,6 +164,8 @@ modules:
       #           header: "api-key"
       #           prefix: ""
       #           secret_ref: "cred://azure-openai-key-tenant-b"
+      #     # NOTE: tenant secret_ref values need matching entries under
+      #     # modules.static-credstore-plugin.config.secrets
 
   static-mini-chat-audit-plugin:
     config:

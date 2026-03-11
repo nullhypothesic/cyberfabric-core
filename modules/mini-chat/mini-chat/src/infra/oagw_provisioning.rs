@@ -48,12 +48,21 @@ pub async fn register_oagw_upstreams(
         // Register tenant-specific upstreams (share the same route/api_path).
         let tenant_ids: Vec<String> = entry.tenant_overrides.keys().cloned().collect();
         for tenant_id in &tenant_ids {
+            let tenant_override = &entry.tenant_overrides[tenant_id];
+            if tenant_override.host.is_none() && tenant_override.upstream_alias.is_none() {
+                anyhow::bail!(
+                    "provider '{provider_id}': tenant override '{tenant_id}' \
+                     has no host and no upstream_alias - \
+                     cannot create distinct upstream"
+                );
+            }
+
             let label = format!("{provider_id}[tenant={tenant_id}]");
             if let Some(alias) =
                 create_tenant_upstream(gateway, &ctx, &label, entry, tenant_id).await
-                && let Some(ovr) = entry.tenant_overrides.get_mut(tenant_id)
+                && let Some(tenant_override) = entry.tenant_overrides.get_mut(tenant_id)
             {
-                ovr.upstream_alias = Some(alias);
+                tenant_override.upstream_alias = Some(alias);
             }
         }
     }
