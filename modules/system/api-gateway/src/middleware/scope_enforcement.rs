@@ -70,6 +70,24 @@ impl ScopeEnforcementRules {
         })
     }
 
+    /// Check if the given path matches any protected route.
+    ///
+    /// Returns `true` if the path matches at least one scope enforcement rule.
+    fn matches_protected_route(&self, path: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+
+        let match_opts = MatchOptions {
+            require_literal_separator: true,
+            ..MatchOptions::default()
+        };
+
+        self.rules
+            .iter()
+            .any(|rule| rule.pattern.matches_with(path, match_opts))
+    }
+
     /// Check if the given path and token scopes satisfy the scope requirements.
     ///
     /// Returns `Ok(())` if access is allowed, or `Err(problem)` if denied.
@@ -143,18 +161,28 @@ pub async fn scope_enforcement_middleware(
         return next.run(req).await;
     }
 
-    // Get the matched path (use MatchedPath if available, otherwise URI path)
-    let path = req
-        .extensions()
-        .get::<axum::extract::MatchedPath>()
-        .map_or_else(|| req.uri().path().to_owned(), |p| p.as_str().to_owned());
-
-    let path = common::resolve_path(&req, path.as_str());
+    // Use the concrete URI path for glob pattern matching (not MatchedPath which
+    // returns the route template like "/{*path}" for catch-all routes).
+    let path = req.uri().path();
+    let path = common::resolve_path(&req, path);
 
     // Get SecurityContext from request extensions (populated by auth middleware)
     let Some(security_context) = req.extensions().get::<SecurityContext>() else {
-        // No SecurityContext means auth middleware didn't run or request is unauthenticated
-        // Let it pass through - the handler will deal with missing auth
+        // No SecurityContext means auth middleware didn't run or request is unauthenticated.
+        // If the path matches a protected route, reject with 401 Unauthorized.
+        // Otherwise, let it pass through for public/unprotected routes.
+        if state.rules.matches_protected_route(&path) {
+            tracing::debug!(
+                path = %path,
+                "Gateway scope check failed: no SecurityContext for protected route"
+            );
+            return Problem::new(
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+                "Authentication required for this resource",
+            )
+            .into_response();
+        }
         return next.run(req).await;
     };
 
@@ -265,8 +293,8 @@ mod tests {
         let config = build_config(true, vec![("/admin/*", vec!["admin"])]);
         let rules = ScopeEnforcementRules::from_config(&config).unwrap();
 
-        // Route doesn't match any pattern, should pass
-        let scopes: Vec<String> = vec![];
+        // Route doesn't match any pattern, should pass even with unrelated scope
+        let scopes = vec!["unrelated:scope".to_owned()];
         assert!(rules.check("/public/health", &scopes).is_ok());
     }
 
@@ -282,8 +310,12 @@ mod tests {
         assert!(rules.check("/api/v2/items", &scopes).is_ok());
 
         // Multiple segments do NOT match single * pattern (no scope check triggered)
-        let no_scopes: Vec<String> = vec![];
-        assert!(rules.check("/api/v1/nested/items", &no_scopes).is_ok()); // doesn't match pattern
+        let unrelated_scopes = vec!["unrelated:scope".to_owned()];
+        assert!(
+            rules
+                .check("/api/v1/nested/items", &unrelated_scopes)
+                .is_ok()
+        ); // doesn't match pattern
     }
 
     #[test]
@@ -330,5 +362,32 @@ mod tests {
 
         // Wrong scope for events route
         assert!(rules.check("/events/v1/list", &admin_scopes).is_err());
+    }
+
+    #[test]
+    fn matches_protected_route_returns_true_for_matching_path() {
+        let config = build_config(true, vec![("/admin/*", vec!["admin"])]);
+        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+
+        assert!(rules.matches_protected_route("/admin/users"));
+        assert!(rules.matches_protected_route("/admin/settings"));
+    }
+
+    #[test]
+    fn matches_protected_route_returns_false_for_non_matching_path() {
+        let config = build_config(true, vec![("/admin/*", vec!["admin"])]);
+        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+
+        assert!(!rules.matches_protected_route("/public/health"));
+        assert!(!rules.matches_protected_route("/api/v1/users"));
+    }
+
+    #[test]
+    fn matches_protected_route_returns_false_when_disabled() {
+        let config = build_config(false, vec![("/admin/*", vec!["admin"])]);
+        let rules = ScopeEnforcementRules::from_config(&config).unwrap();
+
+        // Even matching paths return false when enforcement is disabled
+        assert!(!rules.matches_protected_route("/admin/users"));
     }
 }
