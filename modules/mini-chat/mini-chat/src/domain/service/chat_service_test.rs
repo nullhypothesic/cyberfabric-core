@@ -1007,3 +1007,124 @@ async fn update_chat_tenant_only_authz_cross_owner_not_found() {
         "Expected ChatNotFound for cross-owner update with tenant-only authz"
     );
 }
+
+// ── Filter by title tests ──
+
+#[tokio::test]
+async fn list_chats_filter_contains_title() {
+    let db = inmem_db().await;
+    let svc = build_service(db);
+    let ctx = test_security_ctx(Uuid::new_v4());
+
+    for title in ["Q3 Financial Report", "Weekly Standup", "Report Draft"] {
+        svc.create_chat(
+            &ctx,
+            NewChat {
+                model: Some("gpt-5.2".to_owned()),
+                title: Some(title.to_owned()),
+                is_temporary: false,
+            },
+        )
+        .await
+        .expect("create failed");
+    }
+
+    // contains(title, 'Report') should match 2 chats
+    let filter = modkit_odata::ast::Expr::Function(
+        "contains".to_owned(),
+        vec![
+            modkit_odata::ast::Expr::Identifier("title".to_owned()),
+            modkit_odata::ast::Expr::Value(modkit_odata::ast::Value::String("Report".to_owned())),
+        ],
+    );
+    let query = ODataQuery::default().with_filter(filter);
+    let page = svc.list_chats(&ctx, &query).await.expect("list failed");
+
+    assert_eq!(page.items.len(), 2, "Expected 2 chats matching 'Report'");
+    assert!(
+        page.items
+            .iter()
+            .all(|c| c.title.as_deref().unwrap_or("").contains("Report")),
+        "All results must contain 'Report' in title"
+    );
+}
+
+#[tokio::test]
+async fn list_chats_filter_contains_title_no_match() {
+    let db = inmem_db().await;
+    let svc = build_service(db);
+    let ctx = test_security_ctx(Uuid::new_v4());
+
+    svc.create_chat(
+        &ctx,
+        NewChat {
+            model: Some("gpt-5.2".to_owned()),
+            title: Some("Weekly Standup".to_owned()),
+            is_temporary: false,
+        },
+    )
+    .await
+    .expect("create failed");
+
+    let filter = modkit_odata::ast::Expr::Function(
+        "contains".to_owned(),
+        vec![
+            modkit_odata::ast::Expr::Identifier("title".to_owned()),
+            modkit_odata::ast::Expr::Value(modkit_odata::ast::Value::String(
+                "xyz_nonexistent".to_owned(),
+            )),
+        ],
+    );
+    let query = ODataQuery::default().with_filter(filter);
+    let page = svc.list_chats(&ctx, &query).await.expect("list failed");
+
+    assert_eq!(page.items.len(), 0, "No chats should match");
+}
+
+#[tokio::test]
+async fn list_chats_filter_contains_title_excludes_null_titles() {
+    let db = inmem_db().await;
+    let svc = build_service(db);
+    let ctx = test_security_ctx(Uuid::new_v4());
+
+    // Chat with title
+    svc.create_chat(
+        &ctx,
+        NewChat {
+            model: Some("gpt-5.2".to_owned()),
+            title: Some("Q3 Report".to_owned()),
+            is_temporary: false,
+        },
+    )
+    .await
+    .expect("create failed");
+
+    // Chat without title (NULL)
+    svc.create_chat(
+        &ctx,
+        NewChat {
+            model: Some("gpt-5.2".to_owned()),
+            title: None,
+            is_temporary: false,
+        },
+    )
+    .await
+    .expect("create failed");
+
+    let filter = modkit_odata::ast::Expr::Function(
+        "contains".to_owned(),
+        vec![
+            modkit_odata::ast::Expr::Identifier("title".to_owned()),
+            modkit_odata::ast::Expr::Value(modkit_odata::ast::Value::String("Report".to_owned())),
+        ],
+    );
+    let query = ODataQuery::default().with_filter(filter);
+    let page = svc.list_chats(&ctx, &query).await.expect("list failed");
+
+    assert_eq!(page.items.len(), 1, "Only the titled chat should match");
+    assert_eq!(
+        page.items[0].title.as_deref(),
+        Some("Q3 Report"),
+        "Matched chat must be the one with title"
+    );
+}

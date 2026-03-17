@@ -100,13 +100,16 @@
         "operationId": "listChats",
         "tags": ["chats"],
         "summary": "List chats for the current user",
-        "description": "Returns chats for the authenticated user ordered by most recent activity (`updated_at` DESC, `id` DESC tiebreaker). Supports cursor-based pagination via `limit` and `cursor` parameters.",
+        "description": "Returns chats for the authenticated user ordered by most recent activity (`updated_at` DESC, `id` DESC tiebreaker). Supports cursor-based pagination via `limit` and `cursor` parameters.\n\n**OData support**:\n- `$filter`: `title` — string functions `contains(title, '...')`, `startswith(title, '...')`, `endswith(title, '...')`; comparison operators `eq`, `ne`. Also supports `updated_at` (eq, ne, gt, ge, lt, le) and `id` (eq, ne).",
         "parameters": [
           {
             "$ref": "#/components/parameters/PaginationLimit"
           },
           {
             "$ref": "#/components/parameters/PaginationCursor"
+          },
+          {
+            "$ref": "#/components/parameters/ODataFilter"
           }
         ],
         "responses": {
@@ -522,16 +525,13 @@
         "operationId": "listMessages",
         "tags": ["messages"],
         "summary": "List messages with cursor pagination",
-        "description": "Returns paginated messages for a chat using cursor-based pagination with OData query support. Default ordering is `created_at asc` (chronological). Use `$orderby`, `$filter`, and `$select` for advanced queries.\n\n**OData support**:\n- `$orderby`: `created_at asc|desc`, `id asc|desc`\n- `$filter`: `created_at` (eq, ne, gt, ge, lt, le), `role` (eq, ne, in), `id` (eq, ne, in)\n- `$select`: any top-level field (including `attachments`)",
+        "description": "Returns paginated messages for a chat using cursor-based pagination with OData query support. Default ordering is `created_at asc` (chronological). Use `$orderby` and `$filter` for advanced queries.\n\n**OData support**:\n- `$orderby`: `created_at asc|desc`, `id asc|desc`\n- `$filter`: `created_at` (eq, ne, gt, ge, lt, le), `role` (eq, ne, in), `id` (eq, ne, in)",
         "parameters": [
           {
             "$ref": "#/components/parameters/PaginationLimit"
           },
           {
             "$ref": "#/components/parameters/PaginationCursor"
-          },
-          {
-            "$ref": "#/components/parameters/ODataSelect"
           },
           {
             "$ref": "#/components/parameters/ODataOrderBy"
@@ -1243,15 +1243,6 @@
         "in": "query",
         "required": false,
         "description": "Opaque cursor for fetching the next or previous page.",
-        "schema": {
-          "type": "string"
-        }
-      },
-      "ODataSelect": {
-        "name": "$select",
-        "in": "query",
-        "required": false,
-        "description": "OData v4 field projection. Comma-separated list of top-level fields. Case-insensitive.",
         "schema": {
           "type": "string"
         }
