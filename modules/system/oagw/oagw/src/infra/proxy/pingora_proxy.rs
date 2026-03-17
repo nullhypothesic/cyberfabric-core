@@ -601,12 +601,11 @@ impl ProxyHttp for PingoraProxy {
                 .into(),
                 instance,
             },
-            pingora_core::ErrorType::ConnectionClosed => DomainError::IdleTimeout {
-                detail: "upstream connection closed (idle timeout)".into(),
-                instance,
-            },
             _ => DomainError::DownstreamError {
                 detail: match &e.etype {
+                    pingora_core::ErrorType::ConnectionClosed => {
+                        "upstream connection closed (peer disconnect)"
+                    }
                     pingora_core::ErrorType::ConnectRefused => "upstream connection refused",
                     pingora_core::ErrorType::TLSHandshakeFailure
                     | pingora_core::ErrorType::TLSHandshakeTimedout => {
