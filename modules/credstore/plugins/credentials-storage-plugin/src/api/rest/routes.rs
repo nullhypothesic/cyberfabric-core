@@ -197,11 +197,7 @@ pub fn register_routes(
         .require_license_features::<License>([])
         .json_request::<UpdateCredentialRequest>(openapi, "Credential update data")
         .handler(handlers::update_credential)
-        .json_response_with_schema::<CredentialDto>(
-            openapi,
-            StatusCode::OK,
-            "Credential updated",
-        )
+        .json_response_with_schema::<CredentialDto>(openapi, StatusCode::OK, "Credential updated")
         .standard_errors(openapi)
         .register(router, openapi);
 

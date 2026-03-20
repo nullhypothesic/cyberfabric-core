@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Extension, Path};
 use axum::response::IntoResponse;
-use axum::Json;
 use modkit::api::prelude::*;
 use modkit_security::SecurityContext;
 use uuid::Uuid;
@@ -83,8 +83,10 @@ pub async fn list_definitions(
     Extension(svc): Extension<Arc<CredentialsStorageService>>,
 ) -> ApiResult<impl IntoResponse> {
     let defs = svc.definitions.list().await?;
-    let dtos: Vec<CredentialDefinitionDto> =
-        defs.into_iter().map(CredentialDefinitionDto::from).collect();
+    let dtos: Vec<CredentialDefinitionDto> = defs
+        .into_iter()
+        .map(CredentialDefinitionDto::from)
+        .collect();
     Ok((StatusCode::OK, Json(dtos)))
 }
 
@@ -111,7 +113,10 @@ pub async fn create_definition(
         allowed_app_ids: req.allowed_app_ids.unwrap_or_default(),
     };
     let created = svc.definitions.create(create).await?;
-    Ok((StatusCode::CREATED, Json(CredentialDefinitionDto::from(created))))
+    Ok((
+        StatusCode::CREATED,
+        Json(CredentialDefinitionDto::from(created)),
+    ))
 }
 
 pub async fn update_definition(

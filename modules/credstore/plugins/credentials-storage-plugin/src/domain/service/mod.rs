@@ -51,14 +51,13 @@ impl CredStorePluginClientV1 for CredentialsStorageService {
             Err(e) => return Err(e.into()),
         };
 
-        let secret_value =
-            SecretValue::from(serde_json::to_string(&value).unwrap_or_default());
+        let secret_value = SecretValue::from(serde_json::to_string(&value).unwrap_or_default());
 
         Ok(Some(SecretMetadata {
             value: secret_value,
-            owner_id: ctx.subject_id(),
+            owner_id: credstore_sdk::OwnerId(ctx.subject_id()),
             sharing: SharingMode::Tenant,
-            owner_tenant_id: tenant_id,
+            owner_tenant_id: credstore_sdk::TenantId(tenant_id),
         }))
     }
 }

@@ -32,7 +32,10 @@ impl CredentialDefinitionsService {
     }
 
     pub async fn list(&self) -> Result<Vec<credential_definition::Model>, ServiceError> {
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
         self.repo
             .find_all(&conn, self.application_id, None)
             .await
@@ -40,7 +43,10 @@ impl CredentialDefinitionsService {
     }
 
     pub async fn get(&self, id: Uuid) -> Result<credential_definition::Model, ServiceError> {
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
         let def = self
             .repo
             .find_by_id(&conn, id)
@@ -54,7 +60,8 @@ impl CredentialDefinitionsService {
         &self,
         create: CreateCredentialDefinition,
     ) -> Result<credential_definition::Model, ServiceError> {
-        self.validate_default_value(&create.schema_id, &create.default_value).await?;
+        self.validate_default_value(&create.schema_id, &create.default_value)
+            .await?;
         let model = credential_definition::Model {
             id: create.id.unwrap_or_else(Uuid::new_v4),
             name: create.name,
@@ -65,7 +72,10 @@ impl CredentialDefinitionsService {
             application_id: self.application_id,
             allowed_app_ids: create.allowed_app_ids,
         };
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
         self.repo.create(&conn, model).await.map_err(Into::into)
     }
 
@@ -75,8 +85,12 @@ impl CredentialDefinitionsService {
         params: UpdateCredentialDefinition,
     ) -> Result<credential_definition::Model, ServiceError> {
         let def = self.get(id).await?;
-        self.validate_default_value(&def.schema_id, &params.default_value).await?;
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        self.validate_default_value(&def.schema_id, &params.default_value)
+            .await?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
         self.repo
             .update(&conn, id, self.application_id, params)
             .await
@@ -84,7 +98,10 @@ impl CredentialDefinitionsService {
     }
 
     pub async fn delete(&self, id: Uuid) -> Result<(), ServiceError> {
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
         self.repo
             .delete(&conn, id, self.application_id)
             .await
@@ -116,7 +133,10 @@ impl CredentialDefinitionsService {
         schema_id: &Uuid,
         value: &Value,
     ) -> Result<(), ServiceError> {
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         let schema = self
             .schemas_repo

@@ -58,7 +58,10 @@ impl CredentialsService {
             )
             .await?;
 
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         let model = credential::Model {
             id: create_credential.id.unwrap_or_else(Uuid::new_v4),
@@ -92,7 +95,10 @@ impl CredentialsService {
             )
             .await?;
 
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         let existing = self
             .credentials_repo
@@ -125,7 +131,10 @@ impl CredentialsService {
     ) -> Result<(), ServiceError> {
         let definition = self.get_definition(definition_name).await?;
 
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         let deleted = self
             .credentials_repo
@@ -175,7 +184,10 @@ impl CredentialsService {
         tenant_id: Uuid,
         definition: &credential_definition::Model,
     ) -> Result<SelectedCredential, ServiceError> {
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         let credentials = self
             .credentials_repo
@@ -224,27 +236,37 @@ impl CredentialsService {
     ) -> Result<Value, ServiceError> {
         match credential {
             SelectedCredential::OwnTenant(c) => {
-                let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+                let conn = self
+                    .db
+                    .conn()
+                    .map_err(|e| ServiceError::Internal(e.to_string()))?;
                 let tenant_key = self
                     .tenant_keys_repo
                     .find_by_id(&conn, c.key_id, c.tenant_id)
                     .await?
-                    .ok_or_else(|| ServiceError::Internal(format!(
-                        "Tenant key with id {} not found for credential decryption",
-                        c.key_id
-                    )))?;
+                    .ok_or_else(|| {
+                        ServiceError::Internal(format!(
+                            "Tenant key with id {} not found for credential decryption",
+                            c.key_id
+                        ))
+                    })?;
                 crypto::decrypt_value(&c.encrypted_value, &tenant_key.key).map_err(Into::into)
             }
             SelectedCredential::Inherited(c) => {
-                let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+                let conn = self
+                    .db
+                    .conn()
+                    .map_err(|e| ServiceError::Internal(e.to_string()))?;
                 let tenant_key = self
                     .tenant_keys_repo
                     .find_by_id(&conn, c.key_id, CONSTRUCTOR_TENANT_ID)
                     .await?
-                    .ok_or_else(|| ServiceError::Internal(format!(
-                        "Tenant key with id {} not found for credential decryption",
-                        c.key_id
-                    )))?;
+                    .ok_or_else(|| {
+                        ServiceError::Internal(format!(
+                            "Tenant key with id {} not found for credential decryption",
+                            c.key_id
+                        ))
+                    })?;
                 crypto::decrypt_value(&c.encrypted_value, &tenant_key.key).map_err(Into::into)
             }
             // Credential from definition — already has decrypted value
@@ -256,7 +278,10 @@ impl CredentialsService {
         &self,
         name: &str,
     ) -> Result<credential_definition::Model, ServiceError> {
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
         self.definitions_repo
             .find_by_name(&conn, name)
             .await?
@@ -268,11 +293,21 @@ impl CredentialsService {
         definition_name: &str,
         tenant_id: Uuid,
         value: &Value,
-    ) -> Result<(Value, Vec<u8>, credential_definition::Model, tenant_key::Model), ServiceError>
-    {
+    ) -> Result<
+        (
+            Value,
+            Vec<u8>,
+            credential_definition::Model,
+            tenant_key::Model,
+        ),
+        ServiceError,
+    > {
         let definition = self.get_definition(definition_name).await?;
 
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
         let schema = self
             .schemas_repo
             .find_by_id(&conn, definition.schema_id)
@@ -299,7 +334,10 @@ impl CredentialsService {
         &self,
         tenant_id: Uuid,
     ) -> Result<tenant_key::Model, ServiceError> {
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
         if let Some(tenant_key) = self
             .tenant_keys_repo

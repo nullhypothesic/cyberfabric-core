@@ -28,12 +28,18 @@ impl SchemasService {
     }
 
     pub async fn list(&self) -> Result<Vec<schema::Model>, ServiceError> {
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
         self.repo.find_all(&conn, None).await.map_err(Into::into)
     }
 
     pub async fn get(&self, id: Uuid) -> Result<schema::Model, ServiceError> {
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
         self.repo
             .find_by_id(&conn, id)
             .await?
@@ -50,7 +56,10 @@ impl SchemasService {
             fields_to_mask: create.fields_to_mask,
             application_id: self.application_id,
         };
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
         self.repo.create(&conn, model).await.map_err(Into::into)
     }
 
@@ -60,7 +69,10 @@ impl SchemasService {
         params: UpdateSchema,
     ) -> Result<schema::Model, ServiceError> {
         Self::validate(&params.schema, &params.fields_to_mask)?;
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
         self.repo
             .update(&conn, id, self.application_id, params)
             .await
@@ -68,7 +80,10 @@ impl SchemasService {
     }
 
     pub async fn delete(&self, id: Uuid) -> Result<(), ServiceError> {
-        let conn = self.db.conn().map_err(|e| ServiceError::Internal(e.to_string()))?;
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| ServiceError::Internal(e.to_string()))?;
         self.repo
             .delete(&conn, id, self.application_id)
             .await

@@ -106,21 +106,30 @@ mod tests {
         let value = json!("test");
         let result = encrypt_value(&value, "too_short");
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().to_string(), "Encryption key must be 32 bytes long");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Encryption key must be 32 bytes long"
+        );
     }
 
     #[test]
     fn decrypt_short_key_returns_error() {
         let result = decrypt_value(&[0u8; 20], "too_short");
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().to_string(), "Encryption key must be 32 bytes long");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Encryption key must be 32 bytes long"
+        );
     }
 
     #[test]
     fn decrypt_data_too_short_returns_error() {
         let result = decrypt_value(&[0u8; 8], KEY_32);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().to_string(), "Encrypted data is too short");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Encrypted data is too short"
+        );
     }
 
     #[test]

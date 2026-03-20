@@ -1,4 +1,6 @@
-use modkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureInsertExt, secure_update_with_scope};
+use modkit_db::secure::{
+    DBRunner, SecureDeleteExt, SecureEntityExt, SecureInsertExt, secure_update_with_scope,
+};
 use modkit_security::AccessScope;
 use sea_orm::entity::prelude::Json;
 use sea_orm::sea_query::{Expr, Func};
