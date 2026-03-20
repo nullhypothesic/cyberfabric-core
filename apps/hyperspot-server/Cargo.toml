@@ -18,7 +18,12 @@ static-tenants = ["dep:static-tr-plugin"]
 static-authn = ["dep:static-authn-plugin"]
 static-authz = ["dep:static-authz-plugin"]
 static-credstore = ["dep:static-credstore-plugin"]
-mini-chat = ["dep:mini-chat", "dep:static-mini-chat-model-policy-plugin"]
+credentials-storage = ["dep:credentials-storage-plugin"]
+mini-chat = [
+  "dep:mini-chat",
+  "dep:static-mini-chat-model-policy-plugin",
+  "dep:static-mini-chat-audit-plugin",
+]
 otel = ["modkit/otel"]
 
 [dependencies]
@@ -47,6 +52,7 @@ static-authz-plugin = { package = "cf-static-authz-plugin", path = "../../module
 
 # Optional credstore plugins
 static-credstore-plugin = { package = "cf-static-credstore-plugin", path = "../../modules/credstore/plugins/static-credstore-plugin", optional = true }
+credentials-storage-plugin = { package = "cf-credentials-storage-plugin", path = "../../modules/credstore/plugins/credentials-storage-plugin", optional = true }
 
 # user modules
 file_parser = { package = "cf-file-parser", path = "../../modules/file-parser" }

@@ -1,5 +1,4 @@
 # CredStore
-<!-- test -->
 
 Credential storage gateway module. Discovers storage backend plugins via the types registry and routes secret operations through the selected plugin with hierarchical tenant resolution.
 

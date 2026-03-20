@@ -34,6 +34,9 @@ use static_authz_plugin as _;
 #[cfg(feature = "static-credstore")]
 use static_credstore_plugin as _;
 
+#[cfg(feature = "credentials-storage")]
+use credentials_storage_plugin as _;
+
 // === Optional Modules ===
 
 #[cfg(feature = "mini-chat")]
