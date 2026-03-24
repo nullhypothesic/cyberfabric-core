@@ -41,7 +41,9 @@ Current gaps: no native chat experience within the platform; no way to query upl
 |------|------------|
 | Chat | A persistent conversation between a user and the AI assistant |
 | Message | A single turn within a chat (user input or assistant response) |
-| Attachment | A document file uploaded to a chat for question answering |
+| Attachment | A file uploaded to a chat. Each attachment has zero or more *purpose flags* that determine how it is used in the LLM pipeline (e.g., file search indexing, code interpreter input). |
+| Attachment Purpose | Boolean flags stored per attachment (`for_file_search`, `for_code_interpreter`) that determine which LLM tool(s) it feeds into. A single attachment may serve multiple purposes (both flags `true`), and all flags may be `false` (e.g., image attachments handled as multimodal input). |
+| Code Interpreter | An LLM tool that executes code in a sandboxed environment; used for data analysis of spreadsheets and other structured files. |
 | Thread Summary | A compressed representation of older messages, used to keep long conversations within token limits |
 | Vector Store | A provider-hosted index of document embeddings (OpenAI or Azure OpenAI), scoped per chat, used for document search |
 | Vector Store Scope | In P1, one vector store is created per chat (on first document upload). Each chat with documents gets its own dedicated provider-hosted vector store. Physical and logical isolation are both per chat. |
@@ -108,6 +110,8 @@ This PRD uses **P1/P2** to describe phased scope. The `p1`/`p2` tags on requirem
 - Streaming cancellation when client disconnects
 - Image upload and image-aware chat (PNG/JPEG/WebP) via multimodal Responses API, stored via provider Files API
 - Images are supported as attachments; they are not searchable via file_search and not indexed in vector stores
+- Code interpreter tool support: XLSX spreadsheet uploads are routed to the `code_interpreter` tool for data analysis; the model can execute code in a sandboxed environment to process the file. Kill switch and per-model capability gating apply.
+- Multi-purpose attachment routing: each attachment carries boolean purpose flags (`for_file_search`, `for_code_interpreter`) derived from MIME type. A single attachment may serve multiple purposes (both flags `true`).
 - Cleanup of external resources (provider files, chat vector stores) on chat deletion
 
 ### 4.2 Out of Scope
@@ -206,7 +210,7 @@ When a stream is cancelled or disconnects before a terminal completion, the syst
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-fr-file-upload`
 
-The system MUST allow users to upload document files to a chat. Uploaded documents are extracted, chunked, and indexed into the chat's dedicated vector store with `attachment_id` metadata. The system does NOT include full extracted file text in prompts; only relevant retrieved excerpts (top-k chunks) are included during file search. Attachment access MUST be limited to the owning user within their tenant. The system MUST return an attachment identifier and processing status (`pending`).
+The system MUST allow users to upload document files to a chat. Uploaded documents are extracted, chunked, and indexed into the chat's dedicated vector store with `attachment_id` metadata. Exception: files routed exclusively to `code_interpreter` (currently XLSX) are NOT extracted, chunked, or indexed. The system does NOT include full extracted file text in prompts; only relevant retrieved excerpts (top-k chunks) are included during file search. Attachment access MUST be limited to the owning user within their tenant. The system MUST return an attachment identifier and processing status (`pending`).
 
 The UI polls `GET /v1/chats/{id}/attachments/{attachment_id}` until the attachment status transitions to `ready` or `failed`. `doc_summary` is server-generated asynchronously by a background task and is never provided by the client; it is null until processing completes. If status is `failed`, the response includes an `error_code` field (stable internal code, no provider identifiers).
 
@@ -249,6 +253,29 @@ When users upload files to a chat, those files become part of the chat's knowled
 In P1, the backend MUST NOT attempt filename or document-reference resolution from free-form user text. Fuzzy filename matching, multilingual entity resolution, and hidden helper LLM calls to infer intended files from message text are explicitly out of scope for P1.
 
 **Rationale**: The primary value of document upload is the ability to ask questions and get answers grounded in document content.
+**Actors**: `cpt-cf-mini-chat-actor-chat-user`
+
+#### Code Interpreter (Spreadsheet Support)
+
+- [ ] `p1` - **ID**: `cpt-cf-mini-chat-fr-code-interpreter`
+
+The system MUST support the `code_interpreter` LLM tool for data analysis of uploaded spreadsheet files. XLSX files (`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`) are uploaded with `for_code_interpreter = true` and are passed to the LLM as code interpreter file inputs rather than being indexed in the vector store.
+
+**Purpose routing**: Each attachment carries two boolean purpose flags (`for_file_search`, `for_code_interpreter`) derived from its MIME type at upload time. A single attachment may serve multiple purposes (both flags `true`). Current assignments:
+
+- XLSX → `for_code_interpreter = true` (file is available to the code interpreter tool; NOT extracted, chunked, or indexed in the vector store)
+- Other document types → `for_file_search = true` (file is indexed in the vector store for retrieval)
+- Images → both flags `false` (handled as multimodal input, not routed to any tool)
+
+**Kill switch**: The `disable_code_interpreter` kill switch MUST prevent code interpreter usage at runtime. When active, uploads where `for_code_interpreter` would be the only purpose (currently: XLSX) MUST be rejected with a validation error. If the attachment also has `for_file_search = true`, `for_code_interpreter` is set to `false` and the upload proceeds.
+
+**Model capability gating**: If the effective model does not support code interpreter (`tool_support.code_interpreter = false` in the model catalog), the same filtering logic applies: `for_code_interpreter` is set to `false`, and if no purposes remain, the upload is rejected.
+
+**Tool assembly**: When a chat contains ready `code_interpreter` attachments, the `disable_code_interpreter` kill switch is `false`, and the effective model supports code interpreter (`tool_support.code_interpreter = true`), the backend includes the `code_interpreter` tool in the Responses API request with the corresponding provider file IDs (via `tools[].container.file_ids`). The provider decides whether to invoke the tool.
+
+**Usage tracking and rate limits**: Code interpreter tool call counts are persisted in `quota_usage.code_interpreter_calls` and included in the `UsageEvent` outbox payload for downstream billing/analytics. The system MUST enforce a per-user daily rate limit via `code_interpreter_daily_quota` (default: 50 calls per day). When the daily code interpreter quota is exhausted, the system MUST reject with `quota_exceeded` and `quota_scope = "code_interpreter"` at preflight (before any provider call).
+
+**Rationale**: Users need to analyze spreadsheet data (pivot tables, charts, statistical analysis) through conversational interaction with the AI assistant.
 **Actors**: `cpt-cf-mini-chat-actor-chat-user`
 
 #### Web Search
@@ -385,7 +412,7 @@ Reactions are persisted in backend storage (`message_reactions` table) and acces
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-fr-quota-enforcement`
 
-The system MUST enforce per-user credit-based rate limits across multiple time periods (daily, monthly). Credits are computed from provider-reported token usage using the model credit multipliers from the active policy snapshot. Rate limits apply per user and track model usage in real-time per tier. Premium models have stricter limits; standard-tier models have separate, higher limits. Tracked metrics: input tokens, output tokens, credits, file search calls, web search calls, per-tier model calls (premium, standard), image inputs, image upload bytes.
+The system MUST enforce per-user credit-based rate limits across multiple time periods (daily, monthly). Credits are computed from provider-reported token usage using the model credit multipliers from the active policy snapshot. Rate limits apply per user and track model usage in real-time per tier. Premium models have stricter limits; standard-tier models have separate, higher limits. Tracked metrics: input tokens, output tokens, credits, file search calls, web search calls, code interpreter calls, per-tier model calls (premium, standard), image inputs, image upload bytes.
 
 **Tier availability rule**: a tier is considered available only if it has remaining quota in **all** configured periods (daily, monthly) for that tier. If any single period is exhausted, the entire tier is treated as exhausted and the system MUST auto-downgrade to the next tier in the cascade (premium → standard). When all tier quotas are exhausted across all periods, the system MUST reject with `quota_exceeded` (HTTP 429).
 
@@ -461,7 +488,7 @@ Audit payload retention and deletion semantics are owned by platform `audit_serv
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-fr-cost-metrics`
 
-The system MUST log the following metrics for every LLM request: model, input tokens, output tokens, file search call count, time to first token, total latency. Tenant and user attribution MUST be available via audit events and internal usage records; Prometheus labels MUST NOT include `tenant_id` or `user_id`.
+The system MUST log the following metrics for every LLM request: model, input tokens, output tokens, file search call count, web search call count, code interpreter call count, time to first token, total latency. Tenant and user attribution MUST be available via audit events and internal usage records; Prometheus labels MUST NOT include `tenant_id` or `user_id`.
 
 **Rationale**: Enables cost monitoring, budget alerts, and billing attribution per tenant/user.
 **Actors**: `cpt-cf-mini-chat-actor-chat-user`
@@ -656,8 +683,8 @@ Prometheus labels MUST NOT include high-cardinality identifiers such as `tenant_
 
 ##### Tools and retrieval
 
-- `mini_chat_tool_calls_total{tool,phase}` (`tool`: `file_search|web_search`)
-- `mini_chat_tool_call_limited_total{tool}` (`tool`: `file_search|web_search`)
+- `mini_chat_tool_calls_total{tool,phase}` (`tool`: `file_search|web_search|code_interpreter`)
+- `mini_chat_tool_call_limited_total{tool}` (`tool`: `file_search|web_search|code_interpreter`)
 - `mini_chat_file_search_latency_ms{provider,model}`
 - `mini_chat_web_search_latency_ms{provider,model}`
 - `mini_chat_web_search_disabled_total`

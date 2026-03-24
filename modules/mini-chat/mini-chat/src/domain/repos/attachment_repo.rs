@@ -7,6 +7,7 @@ use modkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::llm::AttachmentRef;
 use crate::infra::db::entity::attachment::Model as AttachmentModel;
 
 /// Parameters for inserting a new attachment row in `pending` status.
@@ -21,13 +22,19 @@ pub struct InsertAttachmentParams {
     pub size_bytes: i64,
     pub storage_backend: String,
     pub attachment_kind: String,
+    pub for_file_search: bool,
+    pub for_code_interpreter: bool,
 }
 
 /// Parameters for CAS transition `pending → uploaded`.
+///
+/// `size_bytes` is the exact byte count observed during streaming upload,
+/// set here because the size is unknown at INSERT time (streaming).
 #[domain_model]
 pub struct SetUploadedParams {
     pub id: Uuid,
     pub provider_file_id: String,
+    pub size_bytes: i64,
 }
 
 /// Parameters for CAS transition `uploaded → ready`.
@@ -114,5 +121,12 @@ pub trait AttachmentRepository: Send + Sync {
         runner: &C,
         scope: &AccessScope,
         chat_id: Uuid,
-    ) -> Result<HashMap<String, Uuid>, DomainError>;
+    ) -> Result<HashMap<String, AttachmentRef>, DomainError>;
+    /// Returns provider file IDs for all ready `code_interpreter` attachments in a chat.
+    async fn get_code_interpreter_file_ids<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        chat_id: Uuid,
+    ) -> Result<Vec<String>, DomainError>;
 }

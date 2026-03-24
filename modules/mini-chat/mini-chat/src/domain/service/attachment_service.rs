@@ -2,14 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use authz_resolver_sdk::PolicyEnforcer;
-use bytes::Bytes;
 use modkit_macros::domain_model;
 use modkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use crate::config::RagConfig;
 use crate::domain::error::DomainError;
-use crate::domain::mime_validation::AttachmentKind;
+use crate::domain::mime_validation::{AttachmentKind, AttachmentPurpose};
 use crate::domain::ports::MiniChatMetricsPort;
 use crate::domain::ports::metric_labels::{kind as kind_label, upload_result};
 use crate::domain::ports::{
@@ -57,6 +56,44 @@ impl Drop for PendingGuard {
             self.metrics.decrement_attachments_pending();
         }
     }
+}
+
+// ── Upload limits ────────────────────────────────────────────────────────
+
+/// Effective per-file size limits resolved from config + CCM per-model.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub struct UploadLimits {
+    pub max_file_bytes: u64,
+    pub max_image_bytes: u64,
+}
+
+/// Code interpreter availability for uploads.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeInterpreterStatus {
+    /// Model supports CI and kill switch is off.
+    Allowed,
+    /// Model does not support CI or kill switch is on.
+    Denied,
+    /// Model resolution failed transiently — cannot determine CI support.
+    Unknown,
+}
+
+/// Pre-resolved context returned by `get_upload_context` so that
+/// `upload_file` can skip the duplicate authz + model resolution.
+#[domain_model]
+pub struct UploadContext {
+    pub scope: AccessScope,
+    pub provider_id: String,
+    pub storage_backend: String,
+    pub limits: UploadLimits,
+    /// Whether `text/csv` uploads should be remapped to `text/plain`.
+    pub allow_csv_upload: bool,
+    /// Whether the resolved model supports `code_interpreter` and the kill
+    /// switch is not active. Pre-resolved to avoid duplicate model lookups.
+    /// `Unknown` when model resolution failed transiently.
+    pub code_interpreter_status: CodeInterpreterStatus,
 }
 
 // ── Error helpers for transaction boundary crossing ─────────────────────
@@ -154,6 +191,132 @@ impl<
             model_resolver,
             rag_config,
             metrics,
+        }
+    }
+
+    /// Resolve the effective upload size limits for a chat.
+    ///
+    /// Performs authz + chat ownership + model resolution, then computes
+    /// `min(ConfigMap, CCM per-model)` for each kind. Returns an
+    /// `UploadContext` that `upload_file` can reuse (no double-authz).
+    ///
+    /// Falls back to ConfigMap-only limits if model resolution fails
+    /// (e.g., CCM snapshot unavailable).
+    pub(crate) async fn get_upload_context(
+        &self,
+        ctx: &SecurityContext,
+        chat_id: Uuid,
+    ) -> Result<UploadContext, DomainError> {
+        let scope = self
+            .enforcer
+            .access_scope(
+                ctx,
+                &super::resources::CHAT,
+                super::actions::UPLOAD_ATTACHMENT,
+                Some(chat_id),
+            )
+            .await?;
+
+        let conn = self.db.conn().map_err(DomainError::from)?;
+        let chat_scope = scope.ensure_owner(ctx.subject_id());
+        let chat = self
+            .chat_repo
+            .get(&conn, &chat_scope, chat_id)
+            .await?
+            .ok_or_else(|| DomainError::not_found("Chat", chat_id))?;
+
+        // ConfigMap ceiling (always available).
+        let config_file_bytes = u64::from(self.rag_config.uploaded_file_max_size_kb) * 1024;
+        let config_image_bytes = u64::from(self.rag_config.uploaded_image_max_size_kb) * 1024;
+
+        // CCM per-model limit (best-effort — fall back to ConfigMap on failure).
+        let (provider_id, storage_backend, ccm_bytes, model_supports_ci) =
+            self.resolve_model_limits(ctx, chat_id, chat.model).await;
+
+        let code_interpreter_status = self
+            .resolve_ci_status(ctx, chat_id, model_supports_ci)
+            .await;
+
+        let limits = UploadLimits {
+            max_file_bytes: ccm_bytes.map_or(config_file_bytes, |ccm| config_file_bytes.min(ccm)),
+            max_image_bytes: ccm_bytes
+                .map_or(config_image_bytes, |ccm| config_image_bytes.min(ccm)),
+        };
+
+        Ok(UploadContext {
+            scope,
+            provider_id,
+            storage_backend,
+            limits,
+            allow_csv_upload: self.rag_config.allow_csv_upload,
+            code_interpreter_status,
+        })
+    }
+
+    /// Resolve provider, storage backend, per-model byte limit, and CI support
+    /// from the model catalog. Falls back to ConfigMap-only on transient failure.
+    async fn resolve_model_limits(
+        &self,
+        ctx: &SecurityContext,
+        chat_id: Uuid,
+        model: String,
+    ) -> (String, String, Option<u64>, Option<bool>) {
+        match self
+            .model_resolver
+            .resolve_model(ctx.subject_id(), Some(model))
+            .await
+        {
+            Ok(resolved) => {
+                let backend = self
+                    .provider_resolver
+                    .resolve_storage_backend(&resolved.provider_id);
+                let ccm = u64::from(resolved.max_file_size_mb) * 1_048_576;
+                let ci = Some(resolved.tool_support.code_interpreter);
+                (resolved.provider_id, backend, Some(ccm), ci)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    chat_id = %chat_id,
+                    error = %e,
+                    "model resolution failed for upload limits; using ConfigMap only"
+                );
+                let fallback_provider = "openai".to_owned();
+                let backend = self
+                    .provider_resolver
+                    .resolve_storage_backend(&fallback_provider);
+                (fallback_provider, backend, None, None)
+            }
+        }
+    }
+
+    /// Determine code interpreter status from model capability and kill switch.
+    /// Fail-closed: kill switch lookup failure → `Denied`.
+    async fn resolve_ci_status(
+        &self,
+        ctx: &SecurityContext,
+        chat_id: Uuid,
+        model_supports_ci: Option<bool>,
+    ) -> CodeInterpreterStatus {
+        let disable = match self
+            .model_resolver
+            .get_kill_switches(ctx.subject_id())
+            .await
+        {
+            Ok(ks) => ks.disable_code_interpreter,
+            Err(e) => {
+                tracing::warn!(
+                    chat_id = %chat_id,
+                    error = %e,
+                    "kill-switch lookup failed; disabling code interpreter uploads"
+                );
+                return CodeInterpreterStatus::Denied;
+            }
+        };
+
+        match model_supports_ci {
+            None => CodeInterpreterStatus::Unknown,
+            Some(true) if !disable => CodeInterpreterStatus::Allowed,
+            _ => CodeInterpreterStatus::Denied,
         }
     }
 
@@ -432,7 +595,46 @@ impl<
                 // Loser path: another upload already inserted the row.
                 self.poll_vector_store(scope, chat_id).await
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                self.handle_vector_store_insert_race(&conn, scope, chat_id, e)
+                    .await
+            }
+        }
+    }
+
+    /// Defensive fallback for vector-store insert failures that may be
+    /// unrecognised unique-constraint violations (race with a concurrent upload).
+    /// If a row now exists, treat as a loser path; otherwise propagate the error.
+    async fn handle_vector_store_insert_race(
+        &self,
+        conn: &modkit_db::DbConn<'_>,
+        scope: &AccessScope,
+        chat_id: Uuid,
+        original_err: DomainError,
+    ) -> Result<String, DomainError> {
+        match self
+            .vector_store_repo
+            .find_by_chat(conn, scope, chat_id)
+            .await
+        {
+            Ok(Some(row)) if row.vector_store_id.is_some() => {
+                tracing::warn!(
+                    chat_id = %chat_id,
+                    error = %original_err,
+                    "vector store insert failed but row exists (concurrent insert); using existing"
+                );
+                #[allow(clippy::unwrap_used)]
+                Ok(row.vector_store_id.unwrap())
+            }
+            Ok(Some(_)) => {
+                tracing::warn!(
+                    chat_id = %chat_id,
+                    error = %original_err,
+                    "vector store insert failed but placeholder exists (concurrent insert); polling"
+                );
+                self.poll_vector_store(scope, chat_id).await
+            }
+            _ => Err(original_err),
         }
     }
 
@@ -484,11 +686,16 @@ impl<
 
     /// Upload a file attachment to a chat.
     ///
-    /// Flow: resolve provider from chat model -> validate MIME ->
+    /// Flow: use pre-resolved `UploadContext` (from `get_upload_context`) ->
     ///   TX(lock chat, check limits, insert pending) -> COMMIT ->
-    ///   upload to provider via OAGW -> CAS `set_uploaded` -> branch on kind:
+    ///   upload stream to provider via OAGW -> CAS `set_uploaded` (with exact size) ->
+    ///   branch on kind:
     ///   - Document: vector store get-or-create + add file with attributes + CAS `set_ready`
     ///   - Image: CAS `set_ready` directly
+    ///
+    /// MIME validation and per-file size enforcement are handled by the
+    /// handler before calling this method. The handler passes the
+    /// pre-validated MIME, attachment kind, and a size-limited `FileStream`.
     ///
     /// Returns the created attachment row.
     #[allow(
@@ -501,70 +708,84 @@ impl<
         &self,
         ctx: &SecurityContext,
         chat_id: Uuid,
+        upload_ctx: UploadContext,
         filename: String,
-        content_type: &str,
-        file_bytes: Bytes,
+        validated_mime: &str,
+        attachment_kind: AttachmentKind,
+        file_stream: crate::domain::ports::FileStream,
+        size_hint: Option<u64>,
     ) -> Result<AttachmentModel, DomainError> {
-        use crate::domain::mime_validation::{structured_filename, validate_mime};
+        use crate::domain::mime_validation::structured_filename;
         use crate::domain::repos::InsertAttachmentParams;
 
         let tenant_id = ctx.subject_tenant_id();
         let user_id = ctx.subject_id();
+        let is_document = attachment_kind == AttachmentKind::Document;
 
-        // 1. MIME validate
-        let validated = validate_mime(content_type)?;
-        let is_document = validated.kind == AttachmentKind::Document;
+        let scope = upload_ctx.scope;
+        let provider_id = upload_ctx.provider_id;
+        let storage_backend = upload_ctx.storage_backend;
+
+        // Resolve purposes from the pre-validated MIME type.
+        let purposes = crate::domain::mime_validation::resolve_purposes(validated_mime);
 
         #[allow(clippy::cast_possible_wrap)]
-        let size_bytes = file_bytes.len() as i64;
-
-        // Per-file size check
-        Self::check_file_size(size_bytes, is_document, &self.rag_config)?;
+        let hint_bytes = size_hint.map_or(0i64, |h| h as i64);
 
         let attachment_id = Uuid::now_v7();
 
-        // 2. Authz scope + resolve provider from chat model
-        let scope = self
-            .enforcer
-            .access_scope(
-                ctx,
-                &super::resources::CHAT,
-                super::actions::UPLOAD_ATTACHMENT,
-                Some(chat_id),
-            )
-            .await?;
+        // Code interpreter gating (pre-resolved in UploadContext).
+        // When CI is blocked, remove it from purposes rather than rejecting
+        // outright — the attachment may still serve other purposes (e.g.
+        // FileSearch). Only reject if no purposes remain after filtering.
+        // When CI status is Unknown (transient resolution failure), return 503
+        // so the client can retry rather than hard-rejecting the upload.
+        let purposes = if purposes.contains(&AttachmentPurpose::CodeInterpreter)
+            && upload_ctx.code_interpreter_status != CodeInterpreterStatus::Allowed
+        {
+            if upload_ctx.code_interpreter_status == CodeInterpreterStatus::Unknown {
+                return Err(DomainError::service_unavailable(
+                    "Unable to determine code interpreter support; please retry",
+                ));
+            }
+            let filtered: Vec<_> = purposes
+                .into_iter()
+                .filter(|p| *p != AttachmentPurpose::CodeInterpreter)
+                .collect();
+            if filtered.is_empty() {
+                return Err(DomainError::validation(
+                    "Code interpreter is currently unavailable",
+                ));
+            }
+            tracing::debug!(
+                %filename,
+                "CodeInterpreter purpose stripped; continuing with remaining purposes"
+            );
+            filtered
+        } else {
+            purposes
+        };
 
-        let conn = self.db.conn().map_err(DomainError::from)?;
         let chat_scope = scope.ensure_owner(ctx.subject_id());
-        let chat = self
-            .chat_repo
-            .get(&conn, &chat_scope, chat_id)
-            .await?
-            .ok_or_else(|| DomainError::not_found("Chat", chat_id))?;
-        let resolved = self
-            .model_resolver
-            .resolve_model(user_id, Some(chat.model))
-            .await?;
-        let provider_id = resolved.provider_id;
-
-        let storage_backend = self.provider_resolver.resolve_storage_backend(&provider_id);
 
         let attachment_repo = Arc::clone(&self.attachment_repo);
         let chat_repo = Arc::clone(&self.chat_repo);
         let rag_config = self.rag_config.clone();
         let chat_scope_tx = chat_scope.clone();
         let scope_tx = scope.clone();
-        let kind_str = validated.kind.to_string();
+        let kind_str = attachment_kind.to_string();
         let insert_params = InsertAttachmentParams {
             id: attachment_id,
             tenant_id,
             chat_id,
             uploaded_by_user_id: user_id,
             filename: filename.clone(),
-            content_type: validated.mime.to_owned(),
-            size_bytes,
+            content_type: validated_mime.to_owned(),
+            size_bytes: hint_bytes,
             storage_backend: storage_backend.clone(),
             attachment_kind: kind_str,
+            for_file_search: purposes.contains(&AttachmentPurpose::FileSearch),
+            for_code_interpreter: purposes.contains(&AttachmentPurpose::CodeInterpreter),
         };
 
         let _row = self
@@ -598,20 +819,24 @@ impl<
                         }
                     }
 
-                    let current_bytes = attachment_repo
-                        .sum_size_bytes(tx, &scope_tx, chat_id)
-                        .await
-                        .map_err(|e| modkit_db::DbError::Other(anyhow::Error::new(e)))?;
-                    let max_bytes = i64::from(rag_config.max_total_upload_mb_per_chat) * 1_048_576;
-                    if current_bytes + size_bytes > max_bytes {
-                        return Err(mutation_to_db_err(
-                            AttachmentMutationError::StorageLimitExceeded {
-                                message: format!("Upload would exceed {max_bytes} byte limit"),
-                            },
-                        ));
+                    // Aggregate size check (best-effort with size_hint).
+                    if hint_bytes > 0 {
+                        let current_bytes = attachment_repo
+                            .sum_size_bytes(tx, &scope_tx, chat_id)
+                            .await
+                            .map_err(|e| modkit_db::DbError::Other(anyhow::Error::new(e)))?;
+                        let max_bytes =
+                            i64::from(rag_config.max_total_upload_mb_per_chat) * 1_048_576;
+                        if current_bytes + hint_bytes > max_bytes {
+                            return Err(mutation_to_db_err(
+                                AttachmentMutationError::StorageLimitExceeded {
+                                    message: format!("Upload would exceed {max_bytes} byte limit"),
+                                },
+                            ));
+                        }
                     }
 
-                    // Insert pending row
+                    // Insert pending row (size_bytes = hint or 0; exact set in set_uploaded)
                     let row = attachment_repo
                         .insert(tx, &scope_tx, insert_params)
                         .await
@@ -632,25 +857,40 @@ impl<
         };
         let pending_guard = PendingGuard::new(&self.metrics);
 
-        // 3. Upload to provider (outside TX — avoids holding pool)
-        let structured_name = structured_filename(chat_id, attachment_id, validated.mime);
+        // 3. Upload stream to provider (outside TX — avoids holding pool)
+        let structured_name = structured_filename(chat_id, attachment_id, validated_mime);
 
-        let provider_file_id = match self
+        let (provider_file_id, bytes_uploaded) = match self
             .file_storage
             .upload_file(
                 ctx.clone(),
                 &provider_id,
                 UploadFileParams {
                     filename: structured_name,
-                    content_type: validated.mime.to_owned(),
-                    file_bytes,
+                    content_type: validated_mime.to_owned(),
+                    file_stream,
                     purpose: "assistants".to_owned(),
                 },
             )
             .await
         {
-            Ok(id) => id,
+            Ok(result) => result,
             Err(e) => {
+                // Size-limit error from the streaming adapter → FileTooLarge (413).
+                if let crate::domain::ports::FileStorageError::Rejected {
+                    ref code,
+                    ref message,
+                } = e
+                    && code == "file_too_large"
+                {
+                    self.try_set_failed(&scope, attachment_id, "pending", "file_too_large")
+                        .await;
+                    self.metrics
+                        .record_attachment_upload(kind_metric, upload_result::FILE_TOO_LARGE);
+                    return Err(DomainError::FileTooLarge {
+                        message: message.clone(),
+                    });
+                }
                 // P1-13: upload failure → CAS set_failed from pending
                 self.try_set_failed(&scope, attachment_id, "pending", "upload_failed")
                     .await;
@@ -660,9 +900,11 @@ impl<
             }
         };
 
-        // 4. CAS: pending → uploaded
+        // 4. CAS: pending → uploaded (with exact size from provider)
         {
             use crate::domain::repos::SetUploadedParams;
+            #[allow(clippy::cast_possible_wrap)]
+            let exact_i64 = bytes_uploaded as i64;
             let conn = self.db.conn().map_err(DomainError::from)?;
             let affected = self
                 .attachment_repo
@@ -672,6 +914,7 @@ impl<
                     SetUploadedParams {
                         id: attachment_id,
                         provider_file_id: provider_file_id.clone(),
+                        size_bytes: exact_i64,
                     },
                 )
                 .await?;
@@ -683,8 +926,12 @@ impl<
             }
         }
 
-        // 5. Branch on kind
-        if is_document {
+        // 5. Execute purpose-specific paths (each fires independently).
+        // - FileSearch + document → vector store indexing
+        // - CodeInterpreter → (no extra step during upload; file is used at stream time)
+        // - Images → (no extra step; sent inline)
+        // When an attachment has multiple purposes, all matching paths execute.
+        if is_document && purposes.contains(&AttachmentPurpose::FileSearch) {
             // Get or create vector store
             let vs_id = match self
                 .get_or_create_vector_store(ctx.clone(), &scope, tenant_id, chat_id, &provider_id)
@@ -751,7 +998,7 @@ impl<
             .record_attachment_upload(kind_metric, upload_result::OK);
         #[allow(clippy::cast_precision_loss)]
         self.metrics
-            .record_attachment_upload_bytes(kind_metric, size_bytes as f64);
+            .record_attachment_upload_bytes(kind_metric, bytes_uploaded as f64);
         pending_guard.defuse();
 
         // Reload final state
@@ -760,28 +1007,6 @@ impl<
             .get(&conn, &scope, attachment_id)
             .await?
             .ok_or_else(|| DomainError::not_found("Attachment", attachment_id))
-    }
-
-    fn check_file_size(
-        size_bytes: i64,
-        is_document: bool,
-        rag_config: &RagConfig,
-    ) -> Result<(), DomainError> {
-        let max_kb = if is_document {
-            rag_config.max_document_size_kb
-        } else {
-            rag_config.max_image_size_kb
-        };
-        let max_bytes_per_file = i64::from(max_kb) * 1024;
-        if size_bytes > max_bytes_per_file {
-            let kind_label = if is_document { "Document" } else { "Image" };
-            return Err(DomainError::FileTooLarge {
-                message: format!(
-                    "{kind_label} size {size_bytes} bytes exceeds limit of {max_kb} KB"
-                ),
-            });
-        }
-        Ok(())
     }
 
     /// Best-effort CAS `set_failed` — log on failure, never propagate.

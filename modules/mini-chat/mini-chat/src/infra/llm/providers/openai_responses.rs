@@ -23,6 +23,9 @@ use crate::infra::llm::{
     TranslatedEvent, Usage,
 };
 
+/// Safety cap for code-interpreter log output forwarded to clients via SSE.
+const MAX_CODE_INTERPRETER_OUTPUT_CHARS: usize = 8_192;
+
 // ════════════════════════════════════════════════════════════════════════════
 // Provider event types (internal)
 // ════════════════════════════════════════════════════════════════════════════
@@ -43,6 +46,11 @@ enum ProviderEvent {
     },
     ResponseWebSearchCallSearching,
     ResponseWebSearchCallCompleted,
+    ResponseCodeInterpreterCallInProgress,
+    ResponseCodeInterpreterCallCompleted {
+        /// Concatenated text from all `logs` output items.
+        output: String,
+    },
     ResponseCompleted {
         response: ResponseObject,
     },
@@ -216,6 +224,22 @@ struct ResponseIncompleteData {
     reason: String,
 }
 
+/// A single output item from `response.code_interpreter_call.completed`.
+#[derive(Deserialize)]
+struct CodeInterpreterOutputItem {
+    #[serde(default, rename = "type")]
+    output_type: String,
+    /// Present when `output_type == "logs"`.
+    #[serde(default)]
+    logs: String,
+}
+
+#[derive(Deserialize)]
+struct CodeInterpreterCompletedData {
+    #[serde(default)]
+    outputs: Vec<CodeInterpreterOutputItem>,
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // FromServerEvent
 // ════════════════════════════════════════════════════════════════════════════
@@ -265,6 +289,39 @@ impl FromServerEvent for ProviderEvent {
 
             "response.web_search_call.completed" => {
                 Ok(ProviderEvent::ResponseWebSearchCallCompleted)
+            }
+
+            "response.code_interpreter_call.in_progress" => {
+                Ok(ProviderEvent::ResponseCodeInterpreterCallInProgress)
+            }
+
+            "response.code_interpreter_call.interpreting" => {
+                // Intermediate event — no client-visible update needed.
+                Ok(ProviderEvent::Unknown {
+                    event_name: event_name.to_owned(),
+                })
+            }
+
+            "response.code_interpreter_call.completed" => {
+                let data: CodeInterpreterCompletedData = serde_json::from_str(&event.data)
+                    .map_err(|e| StreamingError::ServerEventsParse {
+                        detail: format!("failed to parse code interpreter completed: {e}"),
+                    })?;
+                let mut output = data
+                    .outputs
+                    .into_iter()
+                    .filter(|o| o.output_type == "logs")
+                    .map(|o| o.logs)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if output.chars().count() > MAX_CODE_INTERPRETER_OUTPUT_CHARS {
+                    output = output
+                        .chars()
+                        .take(MAX_CODE_INTERPRETER_OUTPUT_CHARS)
+                        .collect::<String>();
+                    output.push_str("...[truncated]");
+                }
+                Ok(ProviderEvent::ResponseCodeInterpreterCallCompleted { output })
             }
 
             "response.completed" => {
@@ -381,6 +438,22 @@ fn translate_provider_event(event: &ProviderEvent, accumulated_text: &str) -> Tr
                 phase: ToolPhase::Done,
                 name: "web_search",
                 details: serde_json::json!({}),
+            })
+        }
+
+        ProviderEvent::ResponseCodeInterpreterCallInProgress => {
+            TranslatedEvent::Sse(ClientSseEvent::Tool {
+                phase: ToolPhase::Start,
+                name: "code_interpreter",
+                details: serde_json::json!({}),
+            })
+        }
+
+        ProviderEvent::ResponseCodeInterpreterCallCompleted { output } => {
+            TranslatedEvent::Sse(ClientSseEvent::Tool {
+                phase: ToolPhase::Done,
+                name: "code_interpreter",
+                details: serde_json::json!({ "output": output }),
             })
         }
 
@@ -549,6 +622,10 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
         body["max_output_tokens"] = serde_json::json!(max_tokens);
     }
 
+    if let Some(max_calls) = request.max_tool_calls {
+        body["max_tool_calls"] = serde_json::json!(max_calls);
+    }
+
     // User field: "{tenant_id}:{user_id}"
     if let Some(ref identity) = request.user_identity {
         body["user"] = serde_json::json!(format!("{}:{}", identity.tenant_id, identity.user_id));
@@ -558,7 +635,7 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
         body["metadata"] = serde_json::to_value(metadata).unwrap_or_default();
     }
 
-    // Map tools: FileSearch → file_search, WebSearch → web_search_preview, Function → drop
+    // Map tools: FileSearch → file_search, WebSearch → web_search, Function → drop
     let tools: Vec<serde_json::Value> = request
         .tools
         .iter()
@@ -566,6 +643,7 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
             LlmTool::FileSearch {
                 vector_store_ids,
                 filters,
+                max_num_results,
             } => {
                 // Responses API uses flat format (vector_store_ids at top level),
                 // NOT nested inside a "file_search" key.
@@ -576,11 +654,23 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
                 if let Some(f) = filters {
                     tool["filters"] = serialize_file_search_filter(f);
                 }
+                if let Some(n) = max_num_results {
+                    tool["max_num_results"] = serde_json::json!(n);
+                }
                 Some(tool)
             }
-            // TODO(P2): Update "web_search_preview" to "web_search" when adding provider parameter pass-through
-            LlmTool::WebSearch => Some(serde_json::json!({
-                "type": "web_search_preview"
+            LlmTool::WebSearch {
+                search_context_size,
+            } => Some(serde_json::json!({
+                "type": "web_search",
+                "search_context_size": search_context_size
+            })),
+            LlmTool::CodeInterpreter { file_ids } => Some(serde_json::json!({
+                "type": "code_interpreter",
+                "container": {
+                    "type": "auto",
+                    "file_ids": file_ids
+                }
             })),
             LlmTool::Function { name, .. } => {
                 debug!(tool_name = %name, "Function tool not supported by Responses API, dropping");
@@ -810,7 +900,8 @@ impl crate::infra::llm::LlmProvider for OpenAiResponsesProvider {
 #[allow(clippy::str_to_string)]
 mod tests {
     use super::*;
-    use crate::infra::llm::request::{Feature, RequestMetadata, RequestType};
+    use crate::domain::llm::WebSearchContextSize;
+    use crate::infra::llm::request::{FeatureFlag, RequestMetadata, RequestType};
     use crate::infra::llm::{LlmMessage, LlmProvider, LlmTool, llm_request};
 
     use std::sync::Mutex;
@@ -1031,7 +1122,7 @@ mod tests {
                 user_id: "def".into(),
                 chat_id: "ghi".into(),
                 request_type: RequestType::Chat,
-                feature: Feature::None,
+                features: vec![],
             })
             .build_streaming();
 
@@ -1057,6 +1148,7 @@ mod tests {
             .tool(LlmTool::FileSearch {
                 vector_store_ids: vec!["vs-123".into()],
                 filters: None,
+                max_num_results: None,
             })
             .build_streaming();
 
@@ -1077,6 +1169,7 @@ mod tests {
                     key: "attachment_id".into(),
                     value: "abc-123".into(),
                 }),
+                max_num_results: None,
             })
             .build_streaming();
 
@@ -1094,12 +1187,87 @@ mod tests {
     #[test]
     fn builder_web_search_tool() {
         let request = llm_request("gpt-4o")
-            .tool(LlmTool::WebSearch)
+            .tool(LlmTool::WebSearch {
+                search_context_size: WebSearchContextSize::Low,
+            })
             .build_streaming();
 
         let body = build_request_body(&request, true);
 
-        assert_eq!(body["tools"][0]["type"], "web_search_preview");
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        assert_eq!(body["tools"][0]["search_context_size"], "low");
+    }
+
+    #[test]
+    fn builder_code_interpreter_tool() {
+        let request = llm_request("gpt-4o")
+            .tool(LlmTool::CodeInterpreter {
+                file_ids: vec!["file-abc".into(), "file-def".into()],
+            })
+            .build_streaming();
+
+        let body = build_request_body(&request, true);
+
+        assert_eq!(body["tools"][0]["type"], "code_interpreter");
+        assert_eq!(body["tools"][0]["container"]["type"], "auto");
+        assert_eq!(body["tools"][0]["container"]["file_ids"][0], "file-abc");
+        assert_eq!(body["tools"][0]["container"]["file_ids"][1], "file-def");
+    }
+
+    #[test]
+    fn builder_max_tool_calls_and_max_num_results() {
+        let request = llm_request("gpt-4o")
+            .max_tool_calls(3)
+            .tools(vec![
+                LlmTool::FileSearch {
+                    vector_store_ids: vec!["vs-001".into()],
+                    filters: None,
+                    max_num_results: Some(10),
+                },
+                LlmTool::WebSearch {
+                    search_context_size: WebSearchContextSize::High,
+                },
+            ])
+            .message(LlmMessage::user("test"))
+            .build_streaming();
+
+        let body = build_request_body(&request, true);
+
+        // max_tool_calls at top level
+        assert_eq!(body["max_tool_calls"], 3);
+
+        // file_search tool has max_num_results
+        assert_eq!(body["tools"][0]["type"], "file_search");
+        assert_eq!(body["tools"][0]["max_num_results"], 10);
+
+        // web_search tool has search_context_size
+        assert_eq!(body["tools"][1]["type"], "web_search");
+        assert_eq!(body["tools"][1]["search_context_size"], "high");
+    }
+
+    #[test]
+    fn builder_max_tool_calls_absent_when_not_set() {
+        let request = llm_request("gpt-4o")
+            .message(LlmMessage::user("test"))
+            .build_streaming();
+
+        let body = build_request_body(&request, true);
+        assert!(body.get("max_tool_calls").is_none());
+    }
+
+    #[test]
+    fn builder_file_search_max_num_results_absent_when_none() {
+        let request = llm_request("gpt-4o")
+            .tool(LlmTool::FileSearch {
+                vector_store_ids: vec!["vs-001".into()],
+                filters: None,
+                max_num_results: None,
+            })
+            .build_streaming();
+
+        let body = build_request_body(&request, true);
+        assert_eq!(body["tools"][0]["type"], "file_search");
+        assert!(body["tools"][0].get("max_num_results").is_none());
     }
 
     #[test]
@@ -1109,15 +1277,18 @@ mod tests {
                 LlmTool::FileSearch {
                     vector_store_ids: vec!["vs-123".into()],
                     filters: None,
+                    max_num_results: None,
                 },
-                LlmTool::WebSearch,
+                LlmTool::WebSearch {
+                    search_context_size: WebSearchContextSize::Low,
+                },
             ])
             .metadata(RequestMetadata {
                 tenant_id: "t1".into(),
                 user_id: "u1".into(),
                 chat_id: "c1".into(),
                 request_type: RequestType::Chat,
-                feature: Feature::FileSearchAndWebSearch,
+                features: vec![FeatureFlag::FileSearch, FeatureFlag::WebSearch],
             })
             .build_streaming();
 
@@ -1125,8 +1296,54 @@ mod tests {
 
         assert_eq!(body["tools"].as_array().unwrap().len(), 2);
         assert_eq!(body["tools"][0]["type"], "file_search");
-        assert_eq!(body["tools"][1]["type"], "web_search_preview");
+        assert_eq!(body["tools"][1]["type"], "web_search");
         assert_eq!(body["metadata"]["feature"], "file_search+web_search");
+    }
+
+    #[test]
+    fn builder_code_interpreter_feature() {
+        let request = llm_request("gpt-4o")
+            .tools(vec![LlmTool::CodeInterpreter {
+                file_ids: vec!["file-1".into()],
+            }])
+            .metadata(RequestMetadata {
+                tenant_id: "t1".into(),
+                user_id: "u1".into(),
+                chat_id: "c1".into(),
+                request_type: RequestType::Chat,
+                features: vec![FeatureFlag::CodeInterpreter],
+            })
+            .build_streaming();
+
+        let body = build_request_body(&request, true);
+        assert_eq!(body["metadata"]["feature"], "code_interpreter");
+    }
+
+    #[test]
+    fn builder_file_search_and_code_interpreter_feature() {
+        let request = llm_request("gpt-4o")
+            .tools(vec![
+                LlmTool::FileSearch {
+                    vector_store_ids: vec!["vs-123".into()],
+                    filters: None,
+                    max_num_results: None,
+                },
+                LlmTool::CodeInterpreter {
+                    file_ids: vec!["file-1".into()],
+                },
+            ])
+            .metadata(RequestMetadata {
+                tenant_id: "t1".into(),
+                user_id: "u1".into(),
+                chat_id: "c1".into(),
+                request_type: RequestType::Chat,
+                features: vec![FeatureFlag::FileSearch, FeatureFlag::CodeInterpreter],
+            })
+            .build_streaming();
+
+        let body = build_request_body(&request, true);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(body["metadata"]["feature"], "file_search+code_interpreter");
     }
 
     #[test]
@@ -1281,6 +1498,74 @@ mod tests {
             result,
             ProviderEvent::ResponseWebSearchCallCompleted
         ));
+    }
+
+    #[test]
+    fn parse_code_interpreter_in_progress_event() {
+        let event = ServerEvent {
+            event: Some("response.code_interpreter_call.in_progress".to_string()),
+            data: "{}".to_string(),
+            id: None,
+            retry: None,
+        };
+        let result = ProviderEvent::from_server_event(event).unwrap();
+        assert!(matches!(
+            result,
+            ProviderEvent::ResponseCodeInterpreterCallInProgress
+        ));
+    }
+
+    #[test]
+    fn parse_code_interpreter_interpreting_event_is_ignored() {
+        let event = ServerEvent {
+            event: Some("response.code_interpreter_call.interpreting".to_string()),
+            data: "{}".to_string(),
+            id: None,
+            retry: None,
+        };
+        let result = ProviderEvent::from_server_event(event).unwrap();
+        assert!(matches!(result, ProviderEvent::Unknown { .. }));
+    }
+
+    #[test]
+    fn parse_code_interpreter_completed_event_extracts_logs() {
+        let event = ServerEvent {
+            event: Some("response.code_interpreter_call.completed".to_string()),
+            data: r#"{"outputs":[{"type":"logs","logs":"result text"}]}"#.to_string(),
+            id: None,
+            retry: None,
+        };
+        let result = ProviderEvent::from_server_event(event).unwrap();
+        match result {
+            ProviderEvent::ResponseCodeInterpreterCallCompleted { output } => {
+                assert_eq!(output, "result text");
+            }
+            _ => panic!("expected ResponseCodeInterpreterCallCompleted"),
+        }
+    }
+
+    #[test]
+    fn parse_code_interpreter_completed_event_ignores_file_outputs() {
+        let event = ServerEvent {
+            event: Some("response.code_interpreter_call.completed".to_string()),
+            data: r#"{
+                "outputs": [
+                    {"type":"files","file_id":"file-abc"},
+                    {"type":"logs","logs":"only this"},
+                    {"type":"files","file_id":"file-def"}
+                ]
+            }"#
+            .to_string(),
+            id: None,
+            retry: None,
+        };
+        let result = ProviderEvent::from_server_event(event).unwrap();
+        match result {
+            ProviderEvent::ResponseCodeInterpreterCallCompleted { output } => {
+                assert_eq!(output, "only this");
+            }
+            _ => panic!("expected ResponseCodeInterpreterCallCompleted"),
+        }
     }
 
     #[test]
@@ -1455,6 +1740,39 @@ mod tests {
             TranslatedEvent::Sse(ClientSseEvent::Tool { phase, name, .. }) => {
                 assert!(matches!(phase, ToolPhase::Done));
                 assert_eq!(name, "web_search");
+            }
+            _ => panic!("expected Sse(Tool)"),
+        }
+    }
+
+    #[test]
+    fn translate_code_interpreter_start() {
+        let event = ProviderEvent::ResponseCodeInterpreterCallInProgress;
+        let translated = translate_provider_event(&event, "");
+        match translated {
+            TranslatedEvent::Sse(ClientSseEvent::Tool { phase, name, .. }) => {
+                assert!(matches!(phase, ToolPhase::Start));
+                assert_eq!(name, "code_interpreter");
+            }
+            _ => panic!("expected Sse(Tool)"),
+        }
+    }
+
+    #[test]
+    fn translate_code_interpreter_done_with_output() {
+        let event = ProviderEvent::ResponseCodeInterpreterCallCompleted {
+            output: "42".into(),
+        };
+        let translated = translate_provider_event(&event, "");
+        match translated {
+            TranslatedEvent::Sse(ClientSseEvent::Tool {
+                phase,
+                name,
+                details,
+            }) => {
+                assert!(matches!(phase, ToolPhase::Done));
+                assert_eq!(name, "code_interpreter");
+                assert_eq!(details["output"], "42");
             }
             _ => panic!("expected Sse(Tool)"),
         }
@@ -1990,8 +2308,11 @@ mod tests {
                 LlmTool::FileSearch {
                     vector_store_ids: vec!["vs-123".into()],
                     filters: None,
+                    max_num_results: None,
                 },
-                LlmTool::WebSearch,
+                LlmTool::WebSearch {
+                    search_context_size: WebSearchContextSize::Low,
+                },
             ])
             .user_identity("t1", "u1")
             .metadata(RequestMetadata {
@@ -1999,7 +2320,7 @@ mod tests {
                 user_id: "u1".into(),
                 chat_id: "c1".into(),
                 request_type: RequestType::Chat,
-                feature: Feature::FileSearchAndWebSearch,
+                features: vec![FeatureFlag::FileSearch, FeatureFlag::WebSearch],
             })
             .build_streaming();
 
@@ -2025,7 +2346,7 @@ mod tests {
         assert_eq!(body["input"][0]["content"][0]["text"], "Hello");
         assert_eq!(body["tools"][0]["type"], "file_search");
         assert_eq!(body["tools"][0]["vector_store_ids"][0], "vs-123");
-        assert_eq!(body["tools"][1]["type"], "web_search_preview");
+        assert_eq!(body["tools"][1]["type"], "web_search");
         assert_eq!(body["metadata"]["tenant_id"], "t1");
         assert_eq!(body["metadata"]["feature"], "file_search+web_search");
     }
@@ -2039,6 +2360,7 @@ mod tests {
             .tools(vec![LlmTool::FileSearch {
                 vector_store_ids: vec!["vs-001".into(), "vs-002".into()],
                 filters: None,
+                max_num_results: None,
             }])
             .build_streaming();
 
@@ -2065,6 +2387,7 @@ mod tests {
             .tools(vec![LlmTool::FileSearch {
                 vector_store_ids: vec!["vs-001".into()],
                 filters: Some(filter),
+                max_num_results: None,
             }])
             .build_streaming();
 

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -6,18 +7,22 @@ use authz_resolver_sdk::{
     constraints::{Constraint, EqPredicate, Predicate},
     models::{DenyReason, EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
 };
+
 use modkit_db::{
     ConnectOpts, DBProvider, Db, connect_db, migration_runner::run_migrations_for_testing,
 };
 use modkit_security::{SecurityContext, pep_properties};
 use sea_orm_migration::MigratorTrait;
+
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::models::ResolvedModel;
 use crate::domain::repos::{
-    ModelResolver, PolicySnapshotProvider, ThreadSummaryRepository, UserLimitsProvider,
+    AttachmentCleanupEvent, ModelResolver, OutboxEnqueuer, PolicySnapshotProvider,
+    ThreadSummaryRepository, UserLimitsProvider,
 };
+use crate::domain::service::AuditEnvelope;
 
 // ── Mock AuthZ Resolver ──
 
@@ -186,7 +191,7 @@ impl ModelResolver for MockModelResolver {
             None => {
                 let default = catalog
                     .iter()
-                    .find(|m| m.preference.is_default && m.enabled)
+                    .find(|m| m.preference.as_ref().is_some_and(|p| p.is_default) && m.enabled)
                     .or_else(|| catalog.iter().find(|m| m.enabled));
                 match default {
                     Some(e) => Ok(ResolvedModel::from(e)),
@@ -224,6 +229,13 @@ impl ModelResolver for MockModelResolver {
             .find(|m| m.model_id == model_id && m.enabled)
             .map(ResolvedModel::from)
             .ok_or_else(|| DomainError::model_not_found(model_id))
+    }
+
+    async fn get_kill_switches(
+        &self,
+        _user_id: Uuid,
+    ) -> Result<mini_chat_sdk::KillSwitches, DomainError> {
+        Ok(mini_chat_sdk::KillSwitches::default())
     }
 }
 
@@ -374,6 +386,13 @@ pub fn mock_db_provider(db: Db) -> Arc<DBProvider<modkit_db::DbError>> {
     Arc::new(DBProvider::new(db))
 }
 
+// ── Stream helpers ──
+
+/// Convert `Bytes` into a `FileStream` for test use.
+pub fn bytes_to_stream(data: bytes::Bytes) -> crate::domain::ports::FileStream {
+    Box::pin(futures::stream::once(async { Ok(data) }))
+}
+
 // ── Mock Policy Snapshot Provider ──
 
 use mini_chat_sdk::{PolicySnapshot, UserLimits};
@@ -403,10 +422,6 @@ pub fn test_catalog_entry(params: TestCatalogEntryParams) -> ModelCatalogEntry {
     use mini_chat_sdk::models::*;
     use time::OffsetDateTime;
 
-    let tier_str = match params.tier {
-        mini_chat_sdk::ModelTier::Premium => "premium",
-        mini_chat_sdk::ModelTier::Standard => "standard",
-    };
     let input_mult = params.input_tokens_credit_multiplier_micro as f64 / 1_000_000.0;
     let output_mult = params.output_tokens_credit_multiplier_micro as f64 / 1_000_000.0;
     let has_vision = params
@@ -434,15 +449,16 @@ pub fn test_catalog_entry(params: TestCatalogEntryParams) -> ModelCatalogEntry {
         multiplier_display: params.multiplier_display.clone(),
         estimation_budgets: EstimationBudgets::default(),
         max_retrieved_chunks_per_turn: 5,
+        max_tool_calls: 2,
         general_config: ModelGeneralConfig {
             config_type: String::new(),
-            tier: tier_str.to_owned(),
             available_from: OffsetDateTime::UNIX_EPOCH,
             max_file_size_mb: 25,
             api_params: ModelApiParams {
                 temperature: 0.7,
                 top_p: 1.0,
                 frequency_penalty: 0.0,
+
                 presence_penalty: 0.0,
                 stop: vec![],
             },
@@ -495,10 +511,10 @@ pub fn test_catalog_entry(params: TestCatalogEntryParams) -> ModelCatalogEntry {
                 speed_tokens_per_second: 100,
             },
         },
-        preference: ModelPreference {
+        preference: Some(ModelPreference {
             is_default: params.is_default,
             sort_order: 0,
-        },
+        }),
         system_prompt: String::new(),
         thread_summary_prompt: String::new(),
     }
@@ -604,6 +620,8 @@ pub struct InsertTestAttachmentParams {
     pub doc_summary: Option<String>,
     pub error_code: Option<String>,
     pub deleted_at: Option<OffsetDateTime>,
+    pub for_file_search: bool,
+    pub for_code_interpreter: bool,
 }
 
 impl InsertTestAttachmentParams {
@@ -623,6 +641,8 @@ impl InsertTestAttachmentParams {
             doc_summary: None,
             error_code: None,
             deleted_at: None,
+            for_file_search: true,
+            for_code_interpreter: false,
         }
     }
 }
@@ -644,6 +664,8 @@ pub async fn insert_test_attachment(db: &TestDb, params: InsertTestAttachmentPar
         status: Set(params.status),
         error_code: Set(params.error_code),
         attachment_kind: Set(params.kind),
+        for_file_search: Set(params.for_file_search),
+        for_code_interpreter: Set(params.for_code_interpreter),
         doc_summary: Set(params.doc_summary),
         img_thumbnail: Set(None),
         img_thumbnail_width: Set(None),
@@ -756,8 +778,6 @@ pub async fn insert_test_message_attachment(
 
 // ── Noop & Recording OutboxEnqueuer ──
 
-use crate::domain::repos::{AttachmentCleanupEvent, OutboxEnqueuer};
-
 /// No-op outbox enqueuer for tests that don't need outbox assertions.
 #[allow(de0309_must_have_domain_model)]
 pub struct NoopOutboxEnqueuer;
@@ -778,6 +798,13 @@ impl OutboxEnqueuer for NoopOutboxEnqueuer {
     ) -> Result<(), crate::domain::error::DomainError> {
         Ok(())
     }
+    async fn enqueue_audit_event(
+        &self,
+        _runner: &(dyn modkit_db::secure::DBRunner + Sync),
+        _event: AuditEnvelope,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        Ok(())
+    }
     fn flush(&self) {}
 }
 
@@ -786,6 +813,8 @@ impl OutboxEnqueuer for NoopOutboxEnqueuer {
 pub struct RecordingOutboxEnqueuer {
     pub usage_events: Mutex<Vec<mini_chat_sdk::UsageEvent>>,
     pub cleanup_events: Mutex<Vec<AttachmentCleanupEvent>>,
+    recorded_audit_events: Mutex<Vec<AuditEnvelope>>,
+    recorded_flush_count: AtomicU32,
 }
 
 impl RecordingOutboxEnqueuer {
@@ -793,7 +822,21 @@ impl RecordingOutboxEnqueuer {
         Self {
             usage_events: Mutex::new(Vec::new()),
             cleanup_events: Mutex::new(Vec::new()),
+            recorded_audit_events: Mutex::new(Vec::new()),
+            recorded_flush_count: AtomicU32::new(0),
         }
+    }
+
+    pub fn audit_events(&self) -> Vec<AuditEnvelope> {
+        self.recorded_audit_events.lock().unwrap().clone()
+    }
+
+    pub fn clear_audit_events(&self) {
+        self.recorded_audit_events.lock().unwrap().clear();
+    }
+
+    pub fn flush_count(&self) -> u32 {
+        self.recorded_flush_count.load(Ordering::SeqCst)
     }
 }
 
@@ -815,7 +858,17 @@ impl OutboxEnqueuer for RecordingOutboxEnqueuer {
         self.cleanup_events.lock().unwrap().push(event);
         Ok(())
     }
-    fn flush(&self) {}
+    async fn enqueue_audit_event(
+        &self,
+        _runner: &(dyn modkit_db::secure::DBRunner + Sync),
+        event: AuditEnvelope,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        self.recorded_audit_events.lock().unwrap().push(event);
+        Ok(())
+    }
+    fn flush(&self) {
+        self.recorded_flush_count.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// Outbox enqueuer that fails on `enqueue_attachment_cleanup` for rollback testing.
@@ -839,6 +892,13 @@ impl OutboxEnqueuer for FailingOutboxEnqueuer {
         Err(crate::domain::error::DomainError::database(
             "simulated outbox enqueue failure".to_owned(),
         ))
+    }
+    async fn enqueue_audit_event(
+        &self,
+        _runner: &(dyn modkit_db::secure::DBRunner + Sync),
+        _event: AuditEnvelope,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        Ok(())
     }
     fn flush(&self) {}
 }
@@ -1013,7 +1073,7 @@ impl ServiceGatewayClientV1 for MockOagwGateway {
 
 // ── TestMetrics — recording implementation for metric assertions ─────
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64};
 
 /// Lightweight `MiniChatMetricsPort` that records counter increments
 /// and histogram observation counts via atomics. Used to verify that
@@ -1030,6 +1090,7 @@ pub struct TestMetrics {
     pub attachment_upload: AtomicU64,
     pub attachment_upload_bytes: AtomicU64,
     pub attachments_pending: AtomicI64,
+    pub code_interpreter_calls: AtomicU64,
 }
 
 impl TestMetrics {
@@ -1046,6 +1107,7 @@ impl TestMetrics {
             attachment_upload: AtomicU64::new(0),
             attachment_upload_bytes: AtomicU64::new(0),
             attachments_pending: AtomicI64::new(0),
+            code_interpreter_calls: AtomicU64::new(0),
         }
     }
 }
@@ -1103,6 +1165,10 @@ impl crate::domain::ports::MiniChatMetricsPort for TestMetrics {
     }
     fn decrement_attachments_pending(&self) {
         self.attachments_pending.fetch_add(-1, Ordering::Relaxed);
+    }
+    fn record_image_inputs_per_turn(&self, _count: u32) {}
+    fn record_code_interpreter_calls(&self, _: &str, _: u32) {
+        self.code_interpreter_calls.fetch_add(1, Ordering::Relaxed);
     }
 }
 

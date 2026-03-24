@@ -11,6 +11,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::llm::AttachmentRef;
 use crate::domain::repos::{
     InsertAttachmentParams, SetFailedParams, SetReadyParams, SetUploadedParams,
 };
@@ -56,6 +57,8 @@ impl crate::domain::repos::AttachmentRepository for AttachmentRepository {
             status: Set(AttachmentStatus::Pending),
             error_code: Set(None),
             attachment_kind: Set(kind),
+            for_file_search: Set(params.for_file_search),
+            for_code_interpreter: Set(params.for_code_interpreter),
             doc_summary: Set(None),
             img_thumbnail: Set(None),
             img_thumbnail_width: Set(None),
@@ -86,6 +89,7 @@ impl crate::domain::repos::AttachmentRepository for AttachmentRepository {
                 Column::ProviderFileId,
                 Expr::value(Some(params.provider_file_id)),
             )
+            .col_expr(Column::SizeBytes, Expr::value(params.size_bytes))
             .col_expr(Column::UpdatedAt, Expr::value(now))
             .filter(
                 Condition::all()
@@ -246,6 +250,7 @@ impl crate::domain::repos::AttachmentRepository for AttachmentRepository {
                     .add(Column::ChatId.eq(chat_id))
                     .add(Column::Status.eq(AttachmentStatus::Ready))
                     .add(Column::AttachmentKind.eq(AttachmentKind::Document))
+                    .add(Column::ForFileSearch.eq(true))
                     .add(Column::DeletedAt.is_null()),
             )
             .secure()
@@ -300,7 +305,12 @@ impl crate::domain::repos::AttachmentRepository for AttachmentRepository {
             .scope_with(scope)
             .project_all(runner, |q| {
                 q.select_only()
-                    .column_as(Column::SizeBytes.sum(), "total")
+                    .column_as(
+                        Column::SizeBytes
+                            .sum()
+                            .cast_as(sea_orm::sea_query::Alias::new("bigint")),
+                        "total",
+                    )
                     .into_model::<SumRow>()
             })
             .await
@@ -313,11 +323,12 @@ impl crate::domain::repos::AttachmentRepository for AttachmentRepository {
         runner: &C,
         scope: &AccessScope,
         chat_id: Uuid,
-    ) -> Result<HashMap<String, Uuid>, DomainError> {
+    ) -> Result<HashMap<String, AttachmentRef>, DomainError> {
         #[derive(Debug, FromQueryResult)]
         struct FileIdRow {
             id: Uuid,
             provider_file_id: String,
+            filename: String,
         }
 
         let rows: Vec<FileIdRow> = Entity::find()
@@ -334,13 +345,56 @@ impl crate::domain::repos::AttachmentRepository for AttachmentRepository {
                 q.select_only()
                     .column(Column::Id)
                     .column(Column::ProviderFileId)
+                    .column(Column::Filename)
                     .into_model::<FileIdRow>()
             })
             .await
             .map_err(db_err)?;
         Ok(rows
             .into_iter()
-            .map(|r| (r.provider_file_id, r.id))
+            .map(|r| {
+                (
+                    r.provider_file_id,
+                    AttachmentRef {
+                        id: r.id,
+                        filename: r.filename,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    async fn get_code_interpreter_file_ids<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        chat_id: Uuid,
+    ) -> Result<Vec<String>, DomainError> {
+        #[derive(Debug, FromQueryResult)]
+        struct ProviderFileIdRow {
+            provider_file_id: Option<String>,
+        }
+
+        let rows: Vec<ProviderFileIdRow> = Entity::find()
+            .filter(
+                Condition::all()
+                    .add(Column::ChatId.eq(chat_id))
+                    .add(Column::ForCodeInterpreter.eq(true))
+                    .add(Column::Status.eq(AttachmentStatus::Ready))
+                    .add(Column::DeletedAt.is_null()),
+            )
+            .secure()
+            .scope_with(scope)
+            .project_all(runner, |q| {
+                q.select_only()
+                    .column(Column::ProviderFileId)
+                    .into_model::<ProviderFileIdRow>()
+            })
+            .await
+            .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| r.provider_file_id)
             .collect())
     }
 }

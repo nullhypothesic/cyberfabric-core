@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use super::current_otel_trace_id;
 use authz_resolver_sdk::{EnforcerError, PolicyEnforcer};
 use modkit_macros::domain_model;
 use modkit_security::{AccessScope, SecurityContext};
@@ -8,10 +9,15 @@ use uuid::Uuid;
 
 use crate::domain::ports::MiniChatMetricsPort;
 use crate::domain::ports::metric_labels::{op, result as result_label};
+use mini_chat_sdk::{
+    RequesterType, TurnDeleteAuditEvent, TurnDeleteAuditEventType, TurnMutationAuditEvent,
+};
+
 use crate::domain::repos::{
     ChatRepository, CreateTurnParams, InsertUserMessageParams, MessageAttachmentRepository,
-    MessageRepository, TurnRepository,
+    MessageRepository, OutboxEnqueuer, TurnRepository,
 };
+use crate::domain::service::AuditEnvelope;
 use crate::infra::db::entity::chat_turn::{Model as TurnModel, TurnState};
 
 use super::{DbProvider, actions, resources};
@@ -102,6 +108,9 @@ pub struct MutationResult {
     /// Snapshot boundary computed before the new user message was persisted.
     /// Ensures deterministic context assembly (DESIGN `§ContextPlan` Determinism P1).
     pub snapshot_boundary: Option<crate::domain::repos::SnapshotBoundary>,
+    /// Chat model carried from the mutation transaction so the handler can
+    /// resolve the provider without a redundant DB round-trip.
+    pub chat_model: String,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -121,6 +130,7 @@ pub struct TurnService<
     chat_repo: Arc<CR>,
     message_attachment_repo: Arc<MAR>,
     enforcer: PolicyEnforcer,
+    outbox_enqueuer: Arc<dyn OutboxEnqueuer>,
     metrics: Arc<dyn MiniChatMetricsPort>,
 }
 
@@ -131,6 +141,7 @@ impl<
     MAR: MessageAttachmentRepository + 'static,
 > TurnService<TR, MR, CR, MAR>
 {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         db: Arc<DbProvider>,
         turn_repo: Arc<TR>,
@@ -138,6 +149,7 @@ impl<
         chat_repo: Arc<CR>,
         message_attachment_repo: Arc<MAR>,
         enforcer: PolicyEnforcer,
+        outbox_enqueuer: Arc<dyn OutboxEnqueuer>,
         metrics: Arc<dyn MiniChatMetricsPort>,
     ) -> Self {
         Self {
@@ -147,6 +159,7 @@ impl<
             chat_repo,
             message_attachment_repo,
             enforcer,
+            outbox_enqueuer,
             metrics,
         }
     }
@@ -209,9 +222,14 @@ impl<
             .ensure_owner(ctx.subject_id());
 
         let start = std::time::Instant::now();
+        // Capture trace_id before the transaction; the closure runs in a different
+        // async context and does not inherit the parent span.
+        let trace_id = current_otel_trace_id();
 
         let turn_repo = Arc::clone(&self.turn_repo);
+        let message_repo = Arc::clone(&self.message_repo);
         let chat_repo = Arc::clone(&self.chat_repo);
+        let outbox_enqueuer = Arc::clone(&self.outbox_enqueuer);
         let scope_tx = chat_scope.clone();
         let ctx_clone = ctx.clone();
 
@@ -219,7 +237,7 @@ impl<
             .db
             .transaction(|tx| {
                 Box::pin(async move {
-                    let (scope, target) = validate_mutation(
+                    let (scope, target, _chat_model) = validate_mutation(
                         &*chat_repo,
                         &*turn_repo,
                         &scope_tx,
@@ -235,6 +253,27 @@ impl<
                         .soft_delete(tx, &scope, target.id, None)
                         .await
                         .map_err(|e| modkit_db::DbError::Other(anyhow::Error::new(e)))?;
+                    message_repo
+                        .soft_delete_by_request_id(tx, &scope, chat_id, request_id)
+                        .await
+                        .map_err(|e| modkit_db::DbError::Other(anyhow::Error::new(e)))?;
+
+                    // Enqueue audit event atomically within the same transaction.
+                    let audit_event = AuditEnvelope::Delete(TurnDeleteAuditEvent {
+                        event_type: TurnDeleteAuditEventType::default(),
+                        timestamp: time::OffsetDateTime::now_utc(),
+                        tenant_id: ctx_clone.subject_tenant_id(),
+                        requester_type: requester_type_from_subject(&ctx_clone),
+                        trace_id,
+                        actor_user_id: ctx_clone.subject_id(),
+                        chat_id,
+                        turn_id: target.id,
+                        request_id,
+                    });
+                    outbox_enqueuer
+                        .enqueue_audit_event(tx, audit_event)
+                        .await
+                        .map_err(|e| modkit_db::DbError::Other(anyhow::Error::new(e)))?;
 
                     Ok(())
                 })
@@ -246,7 +285,12 @@ impl<
         self.metrics
             .record_turn_mutation(op::DELETE, mutation_result_label(&result));
         self.metrics.record_turn_mutation_latency_ms(op::DELETE, ms);
-        result
+        result?;
+
+        // Post-commit side effects (outside transaction).
+        self.outbox_enqueuer.flush();
+
+        Ok(())
     }
 
     // ── Retry ───────────────────────────────────────────────────────────
@@ -266,15 +310,22 @@ impl<
             .ensure_owner(ctx.subject_id());
 
         let start = std::time::Instant::now();
+        // Capture trace_id before the transaction closure.
+        let trace_id = current_otel_trace_id();
         let result = self
-            .mutate_for_stream(ctx, chat_scope, chat_id, request_id, None)
+            .mutate_for_stream(ctx, chat_scope, chat_id, request_id, None, trace_id)
             .await;
 
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         self.metrics
             .record_turn_mutation(op::RETRY, mutation_result_label(&result));
         self.metrics.record_turn_mutation_latency_ms(op::RETRY, ms);
-        result
+        let result = result?;
+
+        // Post-commit side effects (outside transaction).
+        self.outbox_enqueuer.flush();
+
+        Ok(result)
     }
 
     // ── Edit ────────────────────────────────────────────────────────────
@@ -295,15 +346,29 @@ impl<
             .ensure_owner(ctx.subject_id());
 
         let start = std::time::Instant::now();
+        // Capture trace_id before the transaction closure.
+        let trace_id = current_otel_trace_id();
         let result = self
-            .mutate_for_stream(ctx, chat_scope, chat_id, request_id, Some(new_content))
+            .mutate_for_stream(
+                ctx,
+                chat_scope,
+                chat_id,
+                request_id,
+                Some(new_content),
+                trace_id,
+            )
             .await;
 
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         self.metrics
             .record_turn_mutation(op::EDIT, mutation_result_label(&result));
         self.metrics.record_turn_mutation_latency_ms(op::EDIT, ms);
-        result
+        let result = result?;
+
+        // Post-commit side effects (outside transaction).
+        self.outbox_enqueuer.flush();
+
+        Ok(result)
     }
 
     // ── Shared retry/edit transaction ────────────────────────────────────
@@ -315,6 +380,7 @@ impl<
         chat_id: Uuid,
         request_id: Uuid,
         override_content: Option<String>,
+        trace_id: Option<String>,
     ) -> Result<MutationResult, MutationError> {
         let new_request_id = Uuid::new_v4();
         let new_turn_id = Uuid::new_v4();
@@ -323,14 +389,15 @@ impl<
         let message_repo = Arc::clone(&self.message_repo);
         let chat_repo = Arc::clone(&self.chat_repo);
         let message_attachment_repo = Arc::clone(&self.message_attachment_repo);
+        let outbox_enqueuer = Arc::clone(&self.outbox_enqueuer);
         let scope_tx = chat_scope.clone();
         let ctx_clone = ctx.clone();
 
-        let (user_content, snapshot_boundary) = self
+        let (user_content, snapshot_boundary, chat_model) = self
             .db
             .transaction(|tx| {
                 Box::pin(async move {
-                    let (scope, target) = validate_mutation(
+                    let (scope, target, chat_model) = validate_mutation(
                         &*chat_repo,
                         &*turn_repo,
                         &scope_tx,
@@ -353,11 +420,17 @@ impl<
                             ))
                         })?;
 
+                    // Determine event type before consuming override_content.
+                    let is_edit = override_content.is_some();
                     let user_content = override_content.unwrap_or(original_msg.content);
 
-                    // Soft-delete old turn with replacement link
+                    // Soft-delete old turn and its messages
                     turn_repo
                         .soft_delete(tx, &scope, target.id, Some(new_request_id))
+                        .await
+                        .map_err(|e| modkit_db::DbError::Other(anyhow::Error::new(e)))?;
+                    message_repo
+                        .soft_delete_by_request_id(tx, &scope, chat_id, request_id)
                         .await
                         .map_err(|e| modkit_db::DbError::Other(anyhow::Error::new(e)))?;
 
@@ -424,7 +497,39 @@ impl<
                         .await
                         .map_err(|e| modkit_db::DbError::Other(anyhow::Error::new(e)))?;
 
-                    Ok((user_content, boundary))
+                    // Enqueue audit event atomically within the same transaction.
+                    let requester_type = requester_type_from_subject(&ctx_clone);
+                    let audit_event = AuditEnvelope::Mutation(if is_edit {
+                        TurnMutationAuditEvent::new_edit(
+                            time::OffsetDateTime::now_utc(),
+                            tenant_id,
+                            requester_type,
+                            trace_id,
+                            ctx_clone.subject_id(),
+                            chat_id,
+                            target.id,
+                            request_id,
+                            new_request_id,
+                        )
+                    } else {
+                        TurnMutationAuditEvent::new_retry(
+                            time::OffsetDateTime::now_utc(),
+                            tenant_id,
+                            requester_type,
+                            trace_id,
+                            ctx_clone.subject_id(),
+                            chat_id,
+                            target.id,
+                            request_id,
+                            new_request_id,
+                        )
+                    });
+                    outbox_enqueuer
+                        .enqueue_audit_event(tx, audit_event)
+                        .await
+                        .map_err(|e| modkit_db::DbError::Other(anyhow::Error::new(e)))?;
+
+                    Ok((user_content, boundary, chat_model))
                 })
             })
             .await
@@ -435,6 +540,7 @@ impl<
             new_turn_id,
             user_content,
             snapshot_boundary,
+            chat_model,
         })
     }
 }
@@ -451,15 +557,16 @@ async fn validate_mutation<CR: ChatRepository, TR: TurnRepository>(
     tx: &impl modkit_db::secure::DBRunner,
     chat_id: Uuid,
     request_id: Uuid,
-) -> Result<(AccessScope, TurnModel), MutationError> {
+) -> Result<(AccessScope, TurnModel, String), MutationError> {
     // 1. Verify chat exists with pre-computed authorization scope
-    chat_repo
+    let chat = chat_repo
         .get(tx, chat_scope, chat_id)
         .await
         .map_err(|e| MutationError::Internal {
             message: e.to_string(),
         })?
         .ok_or(MutationError::ChatNotFound { chat_id })?;
+    let chat_model = chat.model;
 
     let scope = chat_scope.tenant_only();
 
@@ -500,7 +607,7 @@ async fn validate_mutation<CR: ChatRepository, TR: TurnRepository>(
         _ => return Err(MutationError::NotLatestTurn),
     }
 
-    Ok((scope, target))
+    Ok((scope, target, chat_model))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -516,6 +623,13 @@ fn mutation_result_label<T>(result: &Result<T, MutationError>) -> &'static str {
         Err(MutationError::Forbidden) => result_label::FORBIDDEN,
         Err(MutationError::GenerationInProgress) => result_label::GENERATION_IN_PROGRESS,
         Err(_) => result_label::ERROR,
+    }
+}
+
+fn requester_type_from_subject(ctx: &SecurityContext) -> RequesterType {
+    match ctx.subject_type() {
+        Some("system") => RequesterType::System,
+        _ => RequesterType::User,
     }
 }
 

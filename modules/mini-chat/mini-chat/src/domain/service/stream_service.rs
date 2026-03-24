@@ -9,6 +9,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
 
+use mini_chat_sdk::RequesterType;
+
 use crate::config::{ContextConfig, StreamingConfig};
 use crate::domain::error::DomainError;
 use crate::domain::llm::{ToolPhase, Usage};
@@ -20,11 +22,11 @@ use crate::domain::repos::{
     MessageAttachmentRepository, MessageRepository, QuotaUsageRepository, SnapshotBoundary,
     ThreadSummaryRepository, TurnRepository, VectorStoreRepository,
 };
-use crate::domain::stream_events::{DoneData, ErrorData, StreamEvent, TurnStartedData};
+use crate::domain::stream_events::{DoneData, ErrorData, StreamEvent, StreamStartedData};
 use crate::infra::db::entity::chat_turn::{Model as TurnModel, TurnState};
 use crate::infra::llm::{
-    ClientSseEvent, LlmMessage, LlmProvider, LlmProviderError, LlmRequestBuilder, LlmTool,
-    TerminalOutcome, provider_resolver::ProviderResolver,
+    ClientSseEvent, FeatureFlag, LlmMessage, LlmProvider, LlmProviderError, LlmRequestBuilder,
+    LlmTool, RequestMetadata, RequestType, TerminalOutcome, provider_resolver::ProviderResolver,
 };
 
 use super::{DbProvider, actions, resources};
@@ -55,6 +57,28 @@ fn attachment_err(message: impl Into<String>) -> modkit_db::DbError {
     modkit_db::DbError::Other(anyhow::Error::new(InvalidAttachmentError {
         message: message.into(),
     }))
+}
+
+/// Collects [`FeatureFlag`]s from the tools attached to a request, used to
+/// populate [`RequestMetadata`] for observability.
+fn determine_features(tools: &[LlmTool]) -> Vec<FeatureFlag> {
+    let mut flags = Vec::new();
+    if tools
+        .iter()
+        .any(|t| matches!(t, LlmTool::FileSearch { .. }))
+    {
+        flags.push(FeatureFlag::FileSearch);
+    }
+    if tools.iter().any(|t| matches!(t, LlmTool::WebSearch { .. })) {
+        flags.push(FeatureFlag::WebSearch);
+    }
+    if tools
+        .iter()
+        .any(|t| matches!(t, LlmTool::CodeInterpreter { .. }))
+    {
+        flags.push(FeatureFlag::CodeInterpreter);
+    }
+    flags
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -133,6 +157,12 @@ pub enum StreamError {
     },
     /// Web search is disabled via kill switch but was requested.
     WebSearchDisabled,
+    /// Images are disabled via kill switch but image attachments were included.
+    ImagesDisabled,
+    /// Too many image attachments in one message (`max_images_per_message` exceeded).
+    TooManyImages { count: u32, max: u32 },
+    /// Model does not support image input (missing `VISION_INPUT` capability).
+    UnsupportedMedia,
     /// One or more attachment IDs are invalid (not found, wrong status, wrong chat, etc.).
     InvalidAttachment { code: String, message: String },
     /// Context budget exceeded — mandatory items don't fit in the token budget.
@@ -175,7 +205,8 @@ struct FinalizationCtx<TR: TurnRepository + 'static, MR: MessageRepository + 'st
     chat_id: Uuid,
     request_id: Uuid,
     user_id: Uuid,
-    /// Pre-generated assistant message ID, also sent in `DoneData`.
+    requester_type: RequesterType,
+    /// Pre-generated assistant message ID, sent in `StreamStartedData` (`stream_started` event).
     message_id: Uuid,
     // ── Quota/preflight fields (from PreflightDecision) ──
     effective_model: String,
@@ -196,6 +227,8 @@ struct FinalizationCtx<TR: TurnRepository + 'static, MR: MessageRepository + 'st
     provider_id: String,
     /// Metrics port for recording stream metrics in the spawned task.
     metrics: Arc<dyn MiniChatMetricsPort>,
+    /// Quota warnings provider for computing `quota_warnings` in the `done` event.
+    quota_warnings_provider: Arc<dyn crate::domain::service::quota_settler::QuotaWarningsProvider>,
 }
 
 impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> FinalizationCtx<TR, MR> {
@@ -210,6 +243,9 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
         error_detail: Option<String>,
         provider_response_id: Option<String>,
         web_search_calls: u32,
+        code_interpreter_calls: u32,
+        ttft_ms: Option<u64>,
+        total_ms: Option<u64>,
     ) -> crate::domain::model::finalization::FinalizationInput {
         crate::domain::model::finalization::FinalizationInput {
             turn_id: self.turn_id,
@@ -217,6 +253,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
             chat_id: self.chat_id,
             request_id: self.request_id,
             user_id: self.user_id,
+            requester_type: self.requester_type,
             scope: self.scope.clone(),
             message_id: self.message_id,
             terminal_state,
@@ -237,6 +274,9 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
             downgrade_reason: self.downgrade_reason.clone(),
             period_starts: self.period_starts.clone(),
             web_search_calls,
+            code_interpreter_calls,
+            ttft_ms,
+            total_ms,
         }
     }
 }
@@ -244,6 +284,14 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
 // ════════════════════════════════════════════════════════════════════════════
 // Error normalization
 // ════════════════════════════════════════════════════════════════════════════
+
+/// Map an optional subject-type string from [`SecurityContext`] to [`RequesterType`].
+fn requester_type_from_str(s: Option<&str>) -> RequesterType {
+    match s {
+        Some("system") => RequesterType::System,
+        _ => RequesterType::User,
+    }
+}
 
 /// Normalize an [`LlmProviderError`] to a `(code, message)` pair for the SSE
 /// error event. Messages are already sanitized by the infra layer.
@@ -283,6 +331,7 @@ fn normalize_error(err: &LlmProviderError) -> (String, String) {
 #[domain_model]
 struct PreflightResult {
     effective_model: String,
+    effective_provider_model_id: String,
     reserve_tokens: i64,
     max_output_tokens_applied: i32,
     reserved_credits_micro: i64,
@@ -294,6 +343,9 @@ struct PreflightResult {
     system_prompt: String,
     context_window: u32,
     estimation_budgets: crate::config::EstimationBudgets,
+    max_retrieved_chunks_per_turn: u32,
+    max_tool_calls: u32,
+    tool_support: mini_chat_sdk::ModelToolSupport,
 }
 
 /// Convert a `PreflightDecision` into a flat `PreflightResult` or a `StreamError`.
@@ -304,6 +356,7 @@ fn flatten_preflight(
     match decision {
         PreflightDecision::Allow {
             effective_model,
+            effective_provider_model_id,
             reserve_tokens,
             max_output_tokens_applied,
             reserved_credits_micro,
@@ -312,9 +365,13 @@ fn flatten_preflight(
             system_prompt,
             context_window,
             estimation_budgets,
+            max_retrieved_chunks_per_turn,
+            max_tool_calls,
+            tool_support,
             ..
         } => Ok(PreflightResult {
             effective_model,
+            effective_provider_model_id,
             reserve_tokens,
             max_output_tokens_applied,
             reserved_credits_micro,
@@ -326,9 +383,13 @@ fn flatten_preflight(
             system_prompt,
             context_window,
             estimation_budgets,
+            max_retrieved_chunks_per_turn,
+            max_tool_calls,
+            tool_support,
         }),
         PreflightDecision::Downgrade {
             effective_model,
+            effective_provider_model_id,
             reserve_tokens,
             max_output_tokens_applied,
             reserved_credits_micro,
@@ -339,9 +400,13 @@ fn flatten_preflight(
             system_prompt,
             context_window,
             estimation_budgets,
+            max_retrieved_chunks_per_turn,
+            max_tool_calls,
+            tool_support,
             ..
         } => Ok(PreflightResult {
             effective_model,
+            effective_provider_model_id,
             reserve_tokens,
             max_output_tokens_applied,
             reserved_credits_micro,
@@ -353,6 +418,9 @@ fn flatten_preflight(
             system_prompt,
             context_window,
             estimation_budgets,
+            max_retrieved_chunks_per_turn,
+            max_tool_calls,
+            tool_support,
         }),
         PreflightDecision::Reject {
             error_code,
@@ -401,6 +469,7 @@ pub struct StreamService<
     vector_store_repo: Arc<VSR>,
     message_attachment_repo: Arc<MAR>,
     context_config: ContextConfig,
+    rag_config: crate::config::RagConfig,
     metrics: Arc<dyn MiniChatMetricsPort>,
 }
 
@@ -433,6 +502,7 @@ impl<
         vector_store_repo: Arc<VSR>,
         message_attachment_repo: Arc<MAR>,
         context_config: ContextConfig,
+        rag_config: crate::config::RagConfig,
         metrics: Arc<dyn MiniChatMetricsPort>,
     ) -> Self {
         Self {
@@ -450,6 +520,7 @@ impl<
             vector_store_repo,
             message_attachment_repo,
             context_config,
+            rag_config,
             metrics,
         }
     }
@@ -514,9 +585,12 @@ impl<
         cancel: CancellationToken,
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<tokio::task::JoinHandle<StreamOutcome>, StreamError> {
+        let has_vision_input = resolved_model
+            .multimodal_capabilities
+            .iter()
+            .any(|c| c == "VISION_INPUT");
         let ResolvedModel {
             model_id: model,
-            provider_model_id,
             provider_id,
             ..
         } = resolved_model;
@@ -590,6 +664,51 @@ impl<
             .await
             .map_err(|e| StreamError::TurnCreationFailed { source: e })?;
 
+        // ── Pre-preflight attachment queries (for surcharge estimation) ──
+        let pre_ready_doc_count = self
+            .attachment_repo
+            .count_ready_documents(&conn, &scope, chat_id)
+            .await
+            .map_err(|e| StreamError::TurnCreationFailed { source: e })?;
+        let pre_ci_file_ids = self
+            .attachment_repo
+            .get_code_interpreter_file_ids(&conn, &scope, chat_id)
+            .await
+            .map_err(|e| StreamError::TurnCreationFailed { source: e })?;
+
+        // ── Pre-fetch image attachment count for guards + token estimation ──
+        // Validates chat_id to prevent cross-chat attachment references.
+        let image_file_ids: Vec<String> = if attachment_ids.is_empty() {
+            Vec::new()
+        } else {
+            let rows = self
+                .attachment_repo
+                .get_batch(&conn, &scope, &attachment_ids)
+                .await
+                .map_err(|e| StreamError::TurnCreationFailed { source: e })?;
+            rows.iter()
+                .filter(|r| {
+                    r.chat_id == chat_id
+                        && r.attachment_kind
+                            == crate::infra::db::entity::attachment::AttachmentKind::Image
+                        && r.status == crate::infra::db::entity::attachment::AttachmentStatus::Ready
+                })
+                .filter_map(|r| r.provider_file_id.clone())
+                .collect()
+        };
+        let num_images = u32::try_from(image_file_ids.len()).unwrap_or(u32::MAX);
+
+        // ── Image count guard (before preflight, before TX) ──
+        if num_images > 0 {
+            let max = self.rag_config.max_images_per_message;
+            if num_images > max {
+                return Err(StreamError::TooManyImages {
+                    count: num_images,
+                    max,
+                });
+            }
+        }
+
         // ── Preflight quota evaluate (external I/O, no DB writes) ──
         let selected_model = model.clone();
         let computed = self
@@ -599,9 +718,10 @@ impl<
                 user_id,
                 selected_model: selected_model.clone(),
                 utf8_bytes: content.len() as u64,
-                num_images: 0,
-                tools_enabled: false,
+                num_images,
+                tools_enabled: pre_ready_doc_count > 0,
                 web_search_enabled,
+                code_interpreter_enabled: !pre_ci_file_ids.is_empty(),
                 max_output_tokens_cap: self.streaming_config.max_output_tokens,
             })
             .await
@@ -615,6 +735,22 @@ impl<
 
         let pf = flatten_preflight(computed.decision.clone())?;
 
+        // ── Post-preflight image guards (kill switches + vision capability) ──
+        if num_images > 0 {
+            if computed.kill_switches.disable_images {
+                return Err(StreamError::ImagesDisabled);
+            }
+            // DESIGN.md line 181: check VISION_INPUT on the effective_model.
+            // DESIGN.md line 3206: P1 catalog invariant — ALL enabled models
+            // MUST include VISION_INPUT (enforced at startup). Under a valid
+            // P1 config, quota downgrade cannot demote to a non-vision model,
+            // so checking the selected_model is sufficient. This guard is
+            // defensive for future non-vision models or catalog misconfiguration.
+            if !has_vision_input {
+                return Err(StreamError::UnsupportedMedia);
+            }
+        }
+
         // Metrics: estimated tokens (only on allow/downgrade)
         #[allow(clippy::cast_precision_loss)]
         self.metrics
@@ -626,11 +762,7 @@ impl<
         let has_reserve_buckets = !computed.buckets.is_empty();
 
         // ── Retrieval mode determination ──
-        let ready_doc_count = self
-            .attachment_repo
-            .count_ready_documents(&conn, &scope, chat_id)
-            .await
-            .map_err(|e| StreamError::TurnCreationFailed { source: e })?;
+        let ready_doc_count = pre_ready_doc_count;
 
         let retrieval_mode = crate::domain::retrieval::determine_retrieval_mode(
             file_search_disabled,
@@ -676,6 +808,16 @@ impl<
             std::collections::HashMap::new()
         };
 
+        // ── Code interpreter file IDs ──
+        let (ci_file_ids, code_interpreter_enabled) = if pf.tool_support.code_interpreter
+            && !computed.kill_switches.disable_code_interpreter
+        {
+            let enabled = !pre_ci_file_ids.is_empty();
+            (pre_ci_file_ids, enabled)
+        } else {
+            (Vec::new(), false)
+        };
+
         // ── Single transaction: reserve + user message + turn ──
         let requester_type = ctx.subject_type().unwrap_or("user").to_owned();
         let turn_id = self
@@ -704,7 +846,7 @@ impl<
             }
         }
 
-        // Pre-generate assistant message ID (sent in DoneData and used in CAS)
+        // Pre-generate assistant message ID (sent in StreamStartedData and used in CAS)
         let message_id = Uuid::new_v4();
 
         let finalization_ctx = FinalizationCtx {
@@ -715,6 +857,7 @@ impl<
             chat_id,
             request_id,
             user_id,
+            requester_type: requester_type_from_str(ctx.subject_type()),
             message_id,
             effective_model: pf.effective_model.clone(),
             selected_model: selected_model.clone(),
@@ -729,6 +872,8 @@ impl<
             period_starts,
             provider_id: provider_id.clone(),
             metrics: Arc::clone(&self.metrics),
+            quota_warnings_provider: Arc::clone(&self.quota)
+                as Arc<dyn crate::domain::service::quota_settler::QuotaWarningsProvider>,
         };
 
         // ── Context assembly ──
@@ -738,6 +883,7 @@ impl<
             budgets: pf.estimation_budgets,
             tools_enabled: file_search_enabled,
             web_search_enabled,
+            code_interpreter_enabled,
         });
         let assembled = self
             .gather_context(
@@ -750,10 +896,18 @@ impl<
                 file_search_enabled,
                 &vector_store_ids,
                 None, // file_search_filters: wired by P4-6
+                self.streaming_config.web_search_context_size,
+                pf.max_retrieved_chunks_per_turn,
+                ci_file_ids,
                 token_budget,
+                &image_file_ids,
             )
             .await?;
 
+        // Record image metrics
+        if num_images > 0 {
+            self.metrics.record_image_inputs_per_turn(num_images);
+        }
         let tenant_id_str = tenant_id.to_string();
         let resolved_provider = self
             .provider_resolver
@@ -762,20 +916,14 @@ impl<
                 source: DomainError::internal(format!("provider resolution: {e}")),
             })?;
         // Build the full OAGW proxy path: {alias}{api_path} with {model} substituted.
-        // Use provider_model_id (the actual provider-facing model name) for the LLM request.
+        // Use effective provider_model_id (may differ from requested on downgrade).
+        let effective_provider_model_id = pf.effective_provider_model_id.clone();
         let api_path = resolved_provider
             .api_path
-            .replace("{model}", &provider_model_id);
+            .replace("{model}", &effective_provider_model_id);
         let proxy_path = format!("{}{api_path}", resolved_provider.upstream_alias);
 
-        // Emit turn_started before handing tx to the provider task (D3).
-        if tx
-            .send(StreamEvent::TurnStarted(TurnStartedData { request_id }))
-            .await
-            .is_err()
-        {
-            warn!(%request_id, "turn_started send failed (client disconnected before first event)");
-        }
+        emit_stream_started(&tx, request_id, message_id).await;
 
         Ok(spawn_provider_task(
             resolved_provider.adapter,
@@ -785,9 +933,11 @@ impl<
             assembled.system_instructions,
             assembled.tools,
             model,
-            provider_model_id,
+            effective_provider_model_id,
             pf.max_output_tokens_applied.cast_unsigned(),
+            pf.max_tool_calls,
             self.quota.web_search_max_calls_per_message(),
+            self.quota.code_interpreter_max_calls_per_message(),
             cancel,
             tx,
             Some(finalization_ctx),
@@ -1024,7 +1174,11 @@ impl<
         file_search_enabled: bool,
         vector_store_ids: &[String],
         file_search_filters: Option<crate::domain::llm::FileSearchFilter>,
+        web_search_context_size: crate::domain::llm::WebSearchContextSize,
+        file_search_max_num_results: u32,
+        code_interpreter_file_ids: Vec<String>,
         token_budget: Option<super::context_assembly::TokenBudget>,
+        image_file_ids: &[String],
     ) -> Result<super::context_assembly::AssembledContext, StreamError> {
         let conn = self
             .db
@@ -1098,7 +1252,11 @@ impl<
             file_search_enabled,
             vector_store_ids,
             file_search_filters,
+            web_search_context_size,
+            file_search_max_num_results,
+            code_interpreter_file_ids,
             token_budget,
+            image_file_ids,
         })
         .map_err(|e| StreamError::ContextBudgetExceeded {
             required_tokens: match &e {
@@ -1142,11 +1300,28 @@ impl<
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<tokio::task::JoinHandle<StreamOutcome>, StreamError> {
         let model = resolved_model.model_id;
-        let provider_model_id = resolved_model.provider_model_id;
         let provider_id = resolved_model.provider_id;
         let tenant_id = ctx.subject_tenant_id();
         let user_id = ctx.subject_id();
         let scope = AccessScope::for_tenant(tenant_id);
+
+        // ── Pre-preflight attachment queries (for surcharge estimation) ──
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| StreamError::TurnCreationFailed {
+                source: DomainError::from(e),
+            })?;
+        let pre_ready_doc_count = self
+            .attachment_repo
+            .count_ready_documents(&conn, &scope, chat_id)
+            .await
+            .map_err(|e| StreamError::TurnCreationFailed { source: e })?;
+        let pre_ci_file_ids = self
+            .attachment_repo
+            .get_code_interpreter_file_ids(&conn, &scope, chat_id)
+            .await
+            .map_err(|e| StreamError::TurnCreationFailed { source: e })?;
 
         // ── Preflight quota evaluate ────────────────────────────────────
         let selected_model = model;
@@ -1158,8 +1333,9 @@ impl<
                 selected_model: selected_model.clone(),
                 utf8_bytes: content.len() as u64,
                 num_images: 0,
-                tools_enabled: false,
+                tools_enabled: pre_ready_doc_count > 0,
                 web_search_enabled,
+                code_interpreter_enabled: !pre_ci_file_ids.is_empty(),
                 max_output_tokens_cap: self.streaming_config.max_output_tokens,
             })
             .await
@@ -1180,6 +1356,7 @@ impl<
 
         let period_starts = computed.periods.clone();
         let file_search_disabled = computed.kill_switches.disable_file_search;
+        let disable_code_interpreter = computed.kill_switches.disable_code_interpreter;
 
         // ── Write quota reserves ────────────────────────────────────────
         let quota_repo = Arc::clone(&self.quota.repo);
@@ -1231,17 +1408,7 @@ impl<
         }
 
         // ── Retrieval mode determination ──
-        let conn = self
-            .db
-            .conn()
-            .map_err(|e| StreamError::TurnCreationFailed {
-                source: DomainError::from(e),
-            })?;
-        let ready_doc_count = self
-            .attachment_repo
-            .count_ready_documents(&conn, &scope, chat_id)
-            .await
-            .map_err(|e| StreamError::TurnCreationFailed { source: e })?;
+        let ready_doc_count = pre_ready_doc_count;
 
         let retrieval_mode = crate::domain::retrieval::determine_retrieval_mode(
             file_search_disabled,
@@ -1284,6 +1451,15 @@ impl<
             std::collections::HashMap::new()
         };
 
+        // ── Code interpreter file IDs ──
+        let (ci_file_ids, code_interpreter_enabled) =
+            if pf.tool_support.code_interpreter && !disable_code_interpreter {
+                let enabled = !pre_ci_file_ids.is_empty();
+                (pre_ci_file_ids, enabled)
+            } else {
+                (Vec::new(), false)
+            };
+
         // ── Build finalization context + resolve provider + spawn ────────
         let message_id = Uuid::new_v4();
 
@@ -1295,6 +1471,7 @@ impl<
             chat_id,
             request_id,
             user_id,
+            requester_type: requester_type_from_str(ctx.subject_type()),
             message_id,
             effective_model: pf.effective_model.clone(),
             selected_model: selected_model.clone(),
@@ -1309,6 +1486,8 @@ impl<
             period_starts,
             provider_id: provider_id.clone(),
             metrics: Arc::clone(&self.metrics),
+            quota_warnings_provider: Arc::clone(&self.quota)
+                as Arc<dyn crate::domain::service::quota_settler::QuotaWarningsProvider>,
         };
 
         // ── Context assembly ──
@@ -1318,6 +1497,7 @@ impl<
             budgets: pf.estimation_budgets,
             tools_enabled: file_search_enabled,
             web_search_enabled,
+            code_interpreter_enabled,
         });
         let assembled = self
             .gather_context(
@@ -1330,7 +1510,11 @@ impl<
                 file_search_enabled,
                 &vector_store_ids,
                 None, // file_search_filters: wired by P4-6
+                self.streaming_config.web_search_context_size,
+                pf.max_retrieved_chunks_per_turn,
+                ci_file_ids,
                 token_budget,
+                &[], // retry/edit: no new image attachments
             )
             .await?;
 
@@ -1341,19 +1525,13 @@ impl<
             .map_err(|e| StreamError::TurnCreationFailed {
                 source: DomainError::internal(format!("provider resolution: {e}")),
             })?;
+        let effective_provider_model_id = pf.effective_provider_model_id.clone();
         let api_path = resolved_provider
             .api_path
-            .replace("{model}", &provider_model_id);
+            .replace("{model}", &effective_provider_model_id);
         let proxy_path = format!("{}{api_path}", resolved_provider.upstream_alias);
 
-        // Emit turn_started before handing tx to the provider task (D3).
-        if tx
-            .send(StreamEvent::TurnStarted(TurnStartedData { request_id }))
-            .await
-            .is_err()
-        {
-            warn!(%request_id, "turn_started send failed (client disconnected before first event)");
-        }
+        emit_stream_started(&tx, request_id, message_id).await;
 
         Ok(spawn_provider_task(
             resolved_provider.adapter,
@@ -1363,9 +1541,11 @@ impl<
             assembled.system_instructions,
             assembled.tools,
             pf.effective_model,
-            provider_model_id,
+            effective_provider_model_id,
             pf.max_output_tokens_applied.cast_unsigned(),
+            pf.max_tool_calls,
             self.quota.web_search_max_calls_per_message(),
+            self.quota.code_interpreter_max_calls_per_message(),
             cancel,
             tx,
             Some(finalization_ctx),
@@ -1378,6 +1558,21 @@ impl<
 /// a [`StreamOutcome`]. After the stream ends, atomically finalizes the turn
 /// via `FinalizationService::finalize_turn_cas()` if a context is provided.
 ///
+/// Emit `stream_started` before handing `tx` to the provider task (D3).
+async fn emit_stream_started(tx: &mpsc::Sender<StreamEvent>, request_id: Uuid, message_id: Uuid) {
+    if tx
+        .send(StreamEvent::StreamStarted(StreamStartedData {
+            request_id,
+            message_id,
+            is_new_turn: true,
+        }))
+        .await
+        .is_err()
+    {
+        warn!(%request_id, "stream_started send failed (client disconnected before first event)");
+    }
+}
+
 /// All five terminal paths (provider done, incomplete, provider error,
 /// client disconnect, pre-stream error) route through `finalize_turn_cas()`.
 /// SSE terminal events (Done/Error) are emitted only after the CAS winner
@@ -1399,11 +1594,13 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
     model: String,
     provider_model_id: String,
     max_output_tokens: u32,
+    max_tool_calls: u32,
     web_search_max_calls: u32,
+    code_interpreter_max_calls: u32,
     cancel: CancellationToken,
     tx: mpsc::Sender<StreamEvent>,
     fin_ctx: Option<FinalizationCtx<TR, MR>>,
-    provider_file_id_map: std::collections::HashMap<String, Uuid>,
+    provider_file_id_map: std::collections::HashMap<String, crate::domain::llm::AttachmentRef>,
 ) -> tokio::task::JoinHandle<StreamOutcome> {
     let span = if let Some(ref fctx) = fin_ctx {
         tracing::info_span!(
@@ -1420,7 +1617,6 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
     tokio::spawn(async move {
         let stream_start = std::time::Instant::now();
         let mut first_token_time: Option<std::time::Duration> = None;
-        let msg_id_str = fin_ctx.as_ref().map(|p| p.message_id.to_string());
 
         // ── Metrics: stream started + active gauge ──
         // ActiveStreamGuard ensures decrement on every exit path (Drop-based).
@@ -1436,13 +1632,25 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
         // Build the LLM request using provider_model_id (the actual provider-facing name)
         let mut builder = LlmRequestBuilder::new(&provider_model_id)
             .messages(messages)
-            .max_output_tokens(u64::from(max_output_tokens));
+            .max_output_tokens(u64::from(max_output_tokens))
+            .max_tool_calls(max_tool_calls);
         if let Some(instructions) = system_instructions {
             builder = builder.system_instructions(instructions);
         }
+        let features = determine_features(&tools);
         for tool in tools {
             builder = builder.tool(tool);
         }
+        let metadata = RequestMetadata {
+            tenant_id: ctx.subject_tenant_id().to_string(),
+            user_id: ctx.subject_id().to_string(),
+            chat_id: fin_ctx
+                .as_ref()
+                .map_or_else(String::new, |f| f.chat_id.to_string()),
+            request_type: RequestType::Chat,
+            features,
+        };
+        builder = builder.metadata(metadata);
         let request = builder.build_streaming();
 
         // Call the provider to start streaming
@@ -1470,6 +1678,9 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                         None,
                         None,
                         0,
+                        0,
+                        None,
+                        None,
                     );
                     match fctx.finalization_svc.finalize_turn_cas(input).await {
                         Ok(outcome) if outcome.won_cas => {
@@ -1530,6 +1741,8 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
         // daily quota under-counts by one. Acceptable for P1 since OpenAI always
         // pairs searching→completed; revisit if we add providers that don't.
         let mut web_search_completed_count: u32 = 0;
+        let mut code_interpreter_call_count: u32 = 0;
+        let mut code_interpreter_completed_count: u32 = 0;
 
         loop {
             tokio::select! {
@@ -1599,6 +1812,9 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                                                     None,
                                                     None,
                                                     web_search_completed_count,
+                                                    code_interpreter_completed_count,
+                                                    None,
+                                                    None,
                                                 );
                                                 match fctx.finalization_svc.finalize_turn_cas(input).await {
                                                     Ok(outcome) if outcome.won_cas => {
@@ -1658,6 +1874,92 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                                 }
                             }
 
+                            // Track code interpreter tool calls
+                            if let ClientSseEvent::Tool { ref phase, name, .. } = client_event
+                                && name == "code_interpreter"
+                            {
+                                match phase {
+                                    ToolPhase::Start => {
+                                        code_interpreter_call_count += 1;
+                                        if code_interpreter_call_count > code_interpreter_max_calls {
+                                            warn!(
+                                                code_interpreter_call_count,
+                                                limit = code_interpreter_max_calls,
+                                                "code interpreter per-message limit exceeded"
+                                            );
+                                            let code = "code_interpreter_calls_exceeded".to_owned();
+                                            let message = "Code interpreter calls exceeded for this message".to_owned();
+
+                                            if let Some(ref fctx) = fin_ctx {
+                                                let input = fctx.to_finalization_input(
+                                                    TurnState::Failed,
+                                                    &accumulated_text,
+                                                    None,
+                                                    Some(code.clone()),
+                                                    None,
+                                                    None,
+                                                    web_search_completed_count,
+                                                    code_interpreter_completed_count,
+                                                    None,
+                                                    None,
+                                                );
+                                                match fctx.finalization_svc.finalize_turn_cas(input).await {
+                                                    Ok(outcome) if outcome.won_cas => {
+                                                        let _ = tx.send(StreamEvent::Error(ErrorData {
+                                                            code: code.clone(),
+                                                            message,
+                                                        })).await;
+                                                    }
+                                                    Ok(_) => {}
+                                                    Err(fe) => {
+                                                        warn!(error = %fe, "finalization failed on ci limit exceeded");
+                                                        let _ = tx.send(StreamEvent::Error(ErrorData {
+                                                            code: code.clone(),
+                                                            message,
+                                                        })).await;
+                                                    }
+                                                }
+                                            } else {
+                                                let _ = tx.send(StreamEvent::Error(ErrorData {
+                                                    code: code.clone(),
+                                                    message,
+                                                })).await;
+                                            }
+
+                                            provider_stream.cancel();
+
+                                            if let Some(ref fctx) = fin_ctx {
+                                                let ms = stream_start.elapsed().as_secs_f64() * 1000.0;
+                                                fctx.metrics.record_stream_failed(
+                                                    &fctx.provider_id,
+                                                    &fctx.effective_model,
+                                                    &code,
+                                                );
+                                                fctx.metrics.record_stream_total_latency_ms(
+                                                    &fctx.provider_id,
+                                                    &fctx.effective_model,
+                                                    ms,
+                                                );
+                                            }
+
+                                            let has_partial = !accumulated_text.is_empty();
+                                            return StreamOutcome {
+                                                terminal: StreamTerminal::Failed,
+                                                accumulated_text,
+                                                usage: None,
+                                                effective_model: model,
+                                                error_code: Some(code),
+                                                provider_response_id: None,
+                                                provider_partial_usage: has_partial,
+                                            };
+                                        }
+                                    }
+                                    ToolPhase::Done => {
+                                        code_interpreter_completed_count += 1;
+                                    }
+                                }
+                            }
+
                             let stream_event = StreamEvent::from(client_event);
                             if tx.send(stream_event).await.is_err() {
                                 // Receiver dropped (client disconnect handled by relay)
@@ -1686,6 +1988,7 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
 
                             // Finalize first, emit error only if CAS winner (D3)
                             if let Some(ref fctx) = fin_ctx {
+                                let mid_elapsed = stream_start.elapsed();
                                 let input = fctx.to_finalization_input(
                                     TurnState::Failed,
                                     &accumulated_text,
@@ -1694,6 +1997,9 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                                     None,
                                     None,
                                     web_search_completed_count,
+                                    code_interpreter_completed_count,
+                                    first_token_time.map(|d| d.as_millis() as u64),
+                                    Some(mid_elapsed.as_millis() as u64),
                                 );
                                 match fctx.finalization_svc.finalize_turn_cas(input).await {
                                     Ok(outcome) if outcome.won_cas => {
@@ -1770,6 +2076,9 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                     None,
                     None,
                     web_search_completed_count,
+                    code_interpreter_completed_count,
+                    first_token_time.map(|d| d.as_millis() as u64),
+                    Some(elapsed.as_millis() as u64),
                 );
                 if let Err(e) = fctx.finalization_svc.finalize_turn_cas(input).await {
                     warn!(error = %e, "finalization failed on cancelled stream");
@@ -1823,6 +2132,9 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                         None,
                         Some(response_id.clone()),
                         web_search_completed_count,
+                        code_interpreter_completed_count,
+                        first_token_time.map(|d| d.as_millis() as u64),
+                        Some(elapsed.as_millis() as u64),
                     );
                     match fctx.finalization_svc.finalize_turn_cas(input).await {
                         Ok(outcome) if outcome.won_cas => {
@@ -1840,15 +2152,27 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                                     ))
                                     .await;
                             }
+                            // Compute quota warnings post-commit (advisory, best-effort)
+                            let quota_warnings = match fctx
+                                .quota_warnings_provider
+                                .get_quota_warnings(&fctx.scope, fctx.tenant_id, fctx.user_id)
+                                .await
+                            {
+                                Ok(w) => Some(w),
+                                Err(e) => {
+                                    warn!(error = %e, "failed to compute quota_warnings");
+                                    None
+                                }
+                            };
                             let _ = tx
                                 .send(StreamEvent::Done(Box::new(DoneData {
-                                    message_id: msg_id_str.clone(),
                                     usage: Some(usage),
                                     effective_model: fctx.effective_model.clone(),
                                     selected_model: fctx.selected_model.clone(),
                                     quota_decision: fctx.quota_decision.clone(),
                                     downgrade_from: fctx.downgrade_from.clone(),
                                     downgrade_reason: fctx.downgrade_reason.clone(),
+                                    quota_warnings,
                                 })))
                                 .await;
                         }
@@ -1858,13 +2182,13 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                             // Emit Done anyway so client isn't left hanging
                             let _ = tx
                                 .send(StreamEvent::Done(Box::new(DoneData {
-                                    message_id: msg_id_str.clone(),
                                     usage: Some(usage),
                                     effective_model: fctx.effective_model.clone(),
                                     selected_model: fctx.selected_model.clone(),
                                     quota_decision: "allow".into(),
                                     downgrade_from: None,
                                     downgrade_reason: None,
+                                    quota_warnings: None,
                                 })))
                                 .await;
                         }
@@ -1884,13 +2208,13 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                     }
                     let _ = tx
                         .send(StreamEvent::Done(Box::new(DoneData {
-                            message_id: msg_id_str.clone(),
                             usage: Some(usage),
                             effective_model: model.clone(),
                             selected_model: model.clone(),
                             quota_decision: "allow".into(),
                             downgrade_from: None,
                             downgrade_reason: None,
+                            quota_warnings: None,
                         })))
                         .await;
                 }
@@ -1933,18 +2257,32 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                         None,
                         None,
                         web_search_completed_count,
+                        code_interpreter_completed_count,
+                        first_token_time.map(|d| d.as_millis() as u64),
+                        Some(elapsed.as_millis() as u64),
                     );
                     match fctx.finalization_svc.finalize_turn_cas(input).await {
                         Ok(outcome) if outcome.won_cas => {
+                            let quota_warnings = match fctx
+                                .quota_warnings_provider
+                                .get_quota_warnings(&fctx.scope, fctx.tenant_id, fctx.user_id)
+                                .await
+                            {
+                                Ok(w) => Some(w),
+                                Err(e) => {
+                                    warn!(error = %e, "failed to compute quota_warnings");
+                                    None
+                                }
+                            };
                             let _ = tx
                                 .send(StreamEvent::Done(Box::new(DoneData {
-                                    message_id: msg_id_str.clone(),
                                     usage: Some(usage),
                                     effective_model: fctx.effective_model.clone(),
                                     selected_model: fctx.selected_model.clone(),
                                     quota_decision: fctx.quota_decision.clone(),
                                     downgrade_from: fctx.downgrade_from.clone(),
                                     downgrade_reason: fctx.downgrade_reason.clone(),
+                                    quota_warnings,
                                 })))
                                 .await;
                         }
@@ -1953,13 +2291,13 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                             warn!(error = %fe, "finalization failed on incomplete stream");
                             let _ = tx
                                 .send(StreamEvent::Done(Box::new(DoneData {
-                                    message_id: msg_id_str.clone(),
                                     usage: Some(usage),
                                     effective_model: fctx.effective_model.clone(),
                                     selected_model: fctx.selected_model.clone(),
                                     quota_decision: "allow".into(),
                                     downgrade_from: None,
                                     downgrade_reason: None,
+                                    quota_warnings: None,
                                 })))
                                 .await;
                         }
@@ -1967,13 +2305,13 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                 } else {
                     let _ = tx
                         .send(StreamEvent::Done(Box::new(DoneData {
-                            message_id: msg_id_str.clone(),
                             usage: Some(usage),
                             effective_model: model.clone(),
                             selected_model: model.clone(),
                             quota_decision: "allow".into(),
                             downgrade_from: None,
                             downgrade_reason: None,
+                            quota_warnings: None,
                         })))
                         .await;
                 }
@@ -2018,6 +2356,9 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                         None,
                         None,
                         web_search_completed_count,
+                        code_interpreter_completed_count,
+                        first_token_time.map(|d| d.as_millis() as u64),
+                        Some(elapsed.as_millis() as u64),
                     );
                     match fctx.finalization_svc.finalize_turn_cas(input).await {
                         Ok(outcome) if outcome.won_cas => {
@@ -2090,6 +2431,23 @@ mod tests {
     // ── Noop OutboxEnqueuer ──
 
     #[allow(de0309_must_have_domain_model)]
+    struct NoopQuotaWarningsProvider;
+    #[async_trait::async_trait]
+    impl crate::domain::service::quota_settler::QuotaWarningsProvider for NoopQuotaWarningsProvider {
+        async fn get_quota_warnings(
+            &self,
+            _scope: &modkit_security::AccessScope,
+            _tenant_id: Uuid,
+            _user_id: Uuid,
+        ) -> Result<
+            Vec<crate::domain::stream_events::QuotaWarning>,
+            crate::domain::error::DomainError,
+        > {
+            Ok(Vec::new())
+        }
+    }
+
+    #[allow(de0309_must_have_domain_model)]
     struct NoopOutboxEnqueuer;
     #[async_trait::async_trait]
     impl crate::domain::repos::OutboxEnqueuer for NoopOutboxEnqueuer {
@@ -2105,6 +2463,14 @@ mod tests {
             &self,
             _runner: &(dyn modkit_db::secure::DBRunner + Sync),
             _event: crate::domain::repos::AttachmentCleanupEvent,
+        ) -> Result<(), crate::domain::error::DomainError> {
+            Ok(())
+        }
+
+        async fn enqueue_audit_event(
+            &self,
+            _runner: &(dyn modkit_db::secure::DBRunner + Sync),
+            _event: crate::domain::model::audit_envelope::AuditEnvelope,
         ) -> Result<(), crate::domain::error::DomainError> {
             Ok(())
         }
@@ -2298,6 +2664,11 @@ mod tests {
             }
         }
 
+        /// Provider that emits N `code_interpreter` start/done pairs, then completes.
+        fn with_code_interpreter_calls(count: usize) -> Self {
+            Self::with_tool_calls(&[("code_interpreter", count)])
+        }
+
         /// Provider that emits tool start/done pairs for arbitrary tool names, then completes.
         fn with_tool_calls(calls: &[(&'static str, usize)]) -> Self {
             let mut events: Vec<Result<TranslatedEvent, StreamingError>> = Vec::new();
@@ -2387,7 +2758,9 @@ mod tests {
             "test-model".into(),
             "test-model".into(),
             4096,
+            2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel,
             tx,
             None,
@@ -2437,7 +2810,9 @@ mod tests {
             "test-model".into(),
             "test-model".into(),
             4096,
+            2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel,
             tx,
             None,
@@ -2480,7 +2855,9 @@ mod tests {
             "test-model".into(),
             "test-model".into(),
             4096,
+            2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel,
             tx,
             None,
@@ -2572,7 +2949,9 @@ mod tests {
             "test-model".into(),
             "test-model".into(),
             4096,
+            2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel.clone(),
             tx,
             None,
@@ -2745,6 +3124,7 @@ mod tests {
             Arc::new(crate::infra::db::repo::vector_store_repo::VectorStoreRepository),
             Arc::new(crate::infra::db::repo::message_attachment_repo::MessageAttachmentRepository),
             crate::config::ContextConfig::default(),
+            crate::config::RagConfig::default(),
             metrics,
         )
     }
@@ -2785,7 +3165,16 @@ mod tests {
             description: None,
             multimodal_capabilities: vec![],
             context_window: 128_000,
+            max_file_size_mb: 25,
             system_prompt: String::new(),
+            tool_support: mini_chat_sdk::ModelToolSupport {
+                web_search: false,
+                file_search: false,
+                image_generation: false,
+                code_interpreter: false,
+                computer_use: false,
+                mcp: false,
+            },
         }
     }
 
@@ -3358,9 +3747,9 @@ mod tests {
             .await
             .expect("should start stream");
 
-        // Read the turn_started event, then the first delta
-        let started = rx.recv().await.expect("should get turn_started");
-        assert!(matches!(started, StreamEvent::TurnStarted(_)));
+        // Read the stream_started event, then the first delta
+        let started = rx.recv().await.expect("should get stream_started");
+        assert!(matches!(started, StreamEvent::StreamStarted(_)));
         let first = rx.recv().await.expect("should get delta");
         assert!(matches!(first, StreamEvent::Delta(_)));
 
@@ -3528,6 +3917,7 @@ mod tests {
             chat_id,
             request_id,
             user_id,
+            requester_type: RequesterType::User,
             message_id,
             effective_model: "gpt-4o-mini".to_owned(),
             selected_model: "gpt-4o".to_owned(),
@@ -3542,6 +3932,7 @@ mod tests {
             period_starts: Vec::new(),
             provider_id: "openai".to_owned(),
             metrics: Arc::new(crate::domain::ports::metrics::NoopMetrics),
+            quota_warnings_provider: Arc::new(NoopQuotaWarningsProvider),
         };
 
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["Hello"]));
@@ -3558,7 +3949,9 @@ mod tests {
             "gpt-4o-mini".into(), // effective_model passed as the model param
             "gpt-4o-mini".into(),
             4096,
+            2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel,
             tx,
             Some(fctx),
@@ -3716,6 +4109,7 @@ mod tests {
             Arc::new(crate::infra::db::repo::vector_store_repo::VectorStoreRepository),
             Arc::new(crate::infra::db::repo::message_attachment_repo::MessageAttachmentRepository),
             crate::config::ContextConfig::default(),
+            crate::config::RagConfig::default(),
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
         )
     }
@@ -3928,7 +4322,16 @@ mod tests {
                     description: None,
                     multimodal_capabilities: vec![],
                     context_window: 128_000,
+                    max_file_size_mb: 25,
                     system_prompt: String::new(),
+                    tool_support: mini_chat_sdk::ModelToolSupport {
+                        web_search: false,
+                        file_search: false,
+                        image_generation: false,
+                        code_interpreter: false,
+                        computer_use: false,
+                        mcp: false,
+                    },
                 },
                 false,
                 Vec::new(),
@@ -3969,6 +4372,277 @@ mod tests {
             "should be original selected model"
         );
         assert_eq!(done.downgrade_from.as_deref(), Some("gpt-5"));
+    }
+
+    /// 11.4: On downgrade the LLM provider receives the **downgraded** model's
+    /// `provider_model_id`, not the originally-requested premium model's.
+    ///
+    /// Regression: before `effective_provider_model_id` was added to
+    /// `PreflightDecision`, the provider always received the premium model's
+    /// provider ID even after a quota downgrade, so users got premium
+    /// responses billed at standard rates.
+    #[tokio::test]
+    async fn downgrade_sends_effective_provider_model_id_to_llm() {
+        // ── Capturing provider that records the model from LlmRequest ──
+        #[domain_model]
+        struct CapturingProvider {
+            captured_model: std::sync::Mutex<Option<String>>,
+            inner: MockProvider,
+        }
+
+        impl CapturingProvider {
+            fn new(inner: MockProvider) -> Self {
+                Self {
+                    captured_model: std::sync::Mutex::new(None),
+                    inner,
+                }
+            }
+
+            fn captured_model(&self) -> String {
+                self.captured_model
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("provider was never called")
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for CapturingProvider {
+            async fn stream(
+                &self,
+                ctx: SecurityContext,
+                request: LlmRequest<Streaming>,
+                upstream_alias: &str,
+                cancel: CancellationToken,
+            ) -> Result<ProviderStream, LlmProviderError> {
+                *self.captured_model.lock().unwrap() = Some(request.model().to_owned());
+                self.inner
+                    .stream(ctx, request, upstream_alias, cancel)
+                    .await
+            }
+
+            async fn complete(
+                &self,
+                _ctx: SecurityContext,
+                _request: LlmRequest<NonStreaming>,
+                _upstream_alias: &str,
+            ) -> Result<ResponseResult, LlmProviderError> {
+                unimplemented!("not needed for streaming tests")
+            }
+        }
+
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+
+        let capturing = Arc::new(CapturingProvider::new(MockProvider::completed(&["Hi"])));
+        let provider: Arc<dyn LlmProvider> = Arc::clone(&capturing) as _;
+
+        // Catalog: premium "gpt-5" (provider_model_id = "provider-gpt-5")
+        //          standard "gpt-5-mini" (provider_model_id = "provider-gpt-5-mini")
+        let catalog = vec![
+            make_catalog_entry("gpt-5", mini_chat_sdk::ModelTier::Premium),
+            make_catalog_entry("gpt-5-mini", mini_chat_sdk::ModelTier::Standard),
+        ];
+
+        // Premium limits = 0 → forces downgrade to standard
+        let limits = mini_chat_sdk::UserLimits {
+            user_id: Uuid::nil(),
+            policy_version: 1,
+            standard: mini_chat_sdk::TierLimits {
+                limit_daily_credits_micro: 100_000_000,
+                limit_monthly_credits_micro: 1_000_000_000,
+            },
+            premium: mini_chat_sdk::TierLimits {
+                limit_daily_credits_micro: 0,
+                limit_monthly_credits_micro: 0,
+            },
+        };
+        let svc = build_stream_service_with_catalog(db, provider, catalog, limits);
+
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let (tx, mut rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+
+        // Request premium "gpt-5" with its own provider_model_id.
+        // After downgrade the provider must NOT see this ID.
+        let handle = svc
+            .run_stream(
+                ctx,
+                chat_id,
+                Uuid::new_v4(),
+                "hello".into(),
+                ResolvedModel {
+                    model_id: "gpt-5".into(),
+                    provider_model_id: "gpt-5-2025-03-26".into(),
+                    provider_id: "openai".into(),
+                    display_name: "GPT 5".into(),
+                    tier: "premium".into(),
+                    multiplier_display: "2x".into(),
+                    description: None,
+                    multimodal_capabilities: vec![],
+                    context_window: 128_000,
+                    max_file_size_mb: 25,
+                    system_prompt: String::new(),
+                    tool_support: mini_chat_sdk::ModelToolSupport {
+                        web_search: false,
+                        file_search: false,
+                        image_generation: false,
+                        code_interpreter: false,
+                        computer_use: false,
+                        mcp: false,
+                    },
+                },
+                false,
+                Vec::new(),
+                cancel,
+                tx,
+            )
+            .await
+            .expect("should succeed (downgrade, not reject)");
+
+        // Drain events
+        while let Some(ev) = rx.recv().await {
+            if ev.is_terminal() {
+                break;
+            }
+        }
+        let _outcome = handle.await.expect("task should complete");
+
+        // The provider must have received the standard model's provider_model_id,
+        // NOT the premium "gpt-5-2025-03-26" from ResolvedModel.
+        assert_eq!(
+            capturing.captured_model(),
+            "provider-gpt-5-mini",
+            "provider should receive the downgraded model's provider_model_id, \
+             not the originally-requested premium model's"
+        );
+    }
+
+    /// 11.5: When a chat has ready file-search documents, preflight must
+    /// include `tool_surcharge_tokens` in the reservation estimate.
+    ///
+    /// Regression: `tools_enabled` was hardcoded to `false`, so
+    /// `tool_surcharge_tokens` was never added to the token estimate,
+    /// under-reserving quota for chats with attachments.
+    #[tokio::test]
+    async fn preflight_includes_tool_surcharge_when_documents_present() {
+        use crate::domain::service::test_helpers::{
+            InsertTestAttachmentParams, insert_test_attachment,
+        };
+
+        // ── Run 1: baseline — no documents ──
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id_no_docs = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id_no_docs).await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["Hi"]));
+        let catalog = vec![make_catalog_entry(
+            "gpt-5.2",
+            mini_chat_sdk::ModelTier::Standard,
+        )];
+        let svc =
+            build_stream_service_with_catalog(db.clone(), provider, catalog, permissive_limits());
+
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let (tx, mut rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+
+        let handle = svc
+            .run_stream(
+                ctx,
+                chat_id_no_docs,
+                Uuid::new_v4(),
+                "hello".into(),
+                test_resolved_model(),
+                false,
+                Vec::new(),
+                cancel,
+                tx,
+            )
+            .await
+            .expect("run_stream without docs should succeed");
+
+        while let Some(ev) = rx.recv().await {
+            if ev.is_terminal() {
+                break;
+            }
+        }
+        let _outcome = handle.await.expect("task should complete");
+
+        let scope = AccessScope::allow_all();
+        let conn = db.conn().unwrap();
+        let turn_repo = TurnRepo;
+        let turn_no_docs = turn_repo
+            .find_latest_turn(&conn, &scope, chat_id_no_docs)
+            .await
+            .expect("find turn")
+            .expect("turn should exist");
+        let tokens_no_docs = turn_no_docs.reserve_tokens.unwrap();
+
+        // ── Run 2: with a ready file-search document ──
+        let chat_id_with_docs = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id_with_docs).await;
+
+        insert_test_attachment(
+            &db,
+            InsertTestAttachmentParams::ready_document(tenant_id, chat_id_with_docs),
+        )
+        .await;
+
+        let provider2: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["Hi"]));
+        let catalog2 = vec![make_catalog_entry(
+            "gpt-5.2",
+            mini_chat_sdk::ModelTier::Standard,
+        )];
+        let svc2 =
+            build_stream_service_with_catalog(db.clone(), provider2, catalog2, permissive_limits());
+
+        let ctx2 = test_security_ctx_with_id(tenant_id, user_id);
+        let (tx2, mut rx2) = mpsc::channel(32);
+        let cancel2 = CancellationToken::new();
+
+        let handle2 = svc2
+            .run_stream(
+                ctx2,
+                chat_id_with_docs,
+                Uuid::new_v4(),
+                "hello".into(),
+                test_resolved_model(),
+                false,
+                Vec::new(),
+                cancel2,
+                tx2,
+            )
+            .await
+            .expect("run_stream with docs should succeed");
+
+        while let Some(ev) = rx2.recv().await {
+            if ev.is_terminal() {
+                break;
+            }
+        }
+        let _outcome2 = handle2.await.expect("task should complete");
+
+        let turn_with_docs = turn_repo
+            .find_latest_turn(&conn, &scope, chat_id_with_docs)
+            .await
+            .expect("find turn")
+            .expect("turn should exist");
+        let tokens_with_docs = turn_with_docs.reserve_tokens.unwrap();
+
+        // The default tool_surcharge_tokens is 500. With a document present,
+        // reserve_tokens must be strictly higher than without.
+        assert!(
+            tokens_with_docs > tokens_no_docs,
+            "reserve_tokens with documents ({tokens_with_docs}) should exceed \
+             reserve_tokens without documents ({tokens_no_docs}) by tool_surcharge_tokens"
+        );
     }
 
     /// Non-existent chat returns `ChatNotFound`.
@@ -4029,7 +4703,9 @@ mod tests {
             "test-model".into(),
             "test-model".into(),
             4096,
+            2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel,
             tx,
             None,
@@ -4073,7 +4749,9 @@ mod tests {
             "test-model".into(),
             "test-model".into(),
             4096,
+            2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel,
             tx,
             None,
@@ -4127,7 +4805,9 @@ mod tests {
             "test-model".into(),
             "test-model".into(),
             4096,
+            2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel,
             tx,
             None,
@@ -4146,6 +4826,149 @@ mod tests {
         let outcome = handle.await.expect("task should not panic");
         assert_eq!(outcome.terminal, StreamTerminal::Completed);
         // No error events
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::Error(_))));
+    }
+
+    // ── Per-message code interpreter call limit tests ──
+
+    /// 6.8: Code interpreter calls within limit — stream completes normally.
+    #[tokio::test]
+    async fn test_ci_per_message_limit_not_exceeded() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::with_code_interpreter_calls(2)); // 2 calls, limit is 2
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(32);
+        let cancel = CancellationToken::new();
+
+        let handle = spawn_provider_task::<TurnRepo, MsgRepo>(
+            provider,
+            "test-alias".to_owned(),
+            mock_ctx(),
+            vec![LlmMessage::user("hi")],
+            None,
+            vec![],
+            "test-model".into(),
+            "test-model".into(),
+            4096,
+            2, // max_tool_calls
+            2, // web_search_max_calls
+            2, // code_interpreter_max_calls
+            cancel,
+            tx,
+            None,
+            std::collections::HashMap::new(),
+        );
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            let is_term = ev.is_terminal();
+            events.push(ev);
+            if is_term {
+                break;
+            }
+        }
+
+        let outcome = handle.await.expect("task should not panic");
+        assert_eq!(outcome.terminal, StreamTerminal::Completed);
+
+        // Expect: 1 delta + 2*(start+done) tool events + 1 done = 6 events
+        assert_eq!(events.len(), 6);
+        assert!(matches!(events.last(), Some(StreamEvent::Done(_))));
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::Error(_))));
+    }
+
+    /// 6.9: Code interpreter calls exceed limit — stream terminates with error.
+    #[tokio::test]
+    async fn test_ci_per_message_limit_exceeded() {
+        // 3 code_interpreter calls but limit is 2 — the 3rd start should trigger error
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::with_code_interpreter_calls(3));
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(32);
+        let cancel = CancellationToken::new();
+
+        let handle = spawn_provider_task::<TurnRepo, MsgRepo>(
+            provider,
+            "test-alias".to_owned(),
+            mock_ctx(),
+            vec![LlmMessage::user("hi")],
+            None,
+            vec![],
+            "test-model".into(),
+            "test-model".into(),
+            4096,
+            2, // max_tool_calls
+            2, // web_search_max_calls
+            2, // code_interpreter_max_calls
+            cancel,
+            tx,
+            None,
+            std::collections::HashMap::new(),
+        );
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            let is_term = ev.is_terminal();
+            events.push(ev);
+            if is_term {
+                break;
+            }
+        }
+
+        let outcome = handle.await.expect("task should not panic");
+        assert_eq!(outcome.terminal, StreamTerminal::Failed);
+        assert_eq!(
+            outcome.error_code.as_deref(),
+            Some("code_interpreter_calls_exceeded")
+        );
+
+        // Last event should be an error
+        let last = events.last().expect("should have events");
+        match last {
+            StreamEvent::Error(data) => {
+                assert_eq!(data.code, "code_interpreter_calls_exceeded");
+            }
+            other => panic!("expected Error event, got: {other:?}"),
+        }
+    }
+
+    /// 6.10: Other tool calls don't count toward code interpreter limit.
+    #[tokio::test]
+    async fn test_ci_per_message_counter_ignores_other_tools() {
+        // 5 file_search calls + 1 code_interpreter call, limit is 2 — should complete
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::with_tool_calls(&[
+            ("file_search", 5),
+            ("code_interpreter", 1),
+        ]));
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(32);
+        let cancel = CancellationToken::new();
+
+        let handle = spawn_provider_task::<TurnRepo, MsgRepo>(
+            provider,
+            "test-alias".to_owned(),
+            mock_ctx(),
+            vec![LlmMessage::user("hi")],
+            None,
+            vec![],
+            "test-model".into(),
+            "test-model".into(),
+            4096,
+            2, // max_tool_calls
+            2, // web_search_max_calls
+            2, // code_interpreter_max_calls
+            cancel,
+            tx,
+            None,
+            std::collections::HashMap::new(),
+        );
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            let is_term = ev.is_terminal();
+            events.push(ev);
+            if is_term {
+                break;
+            }
+        }
+
+        let outcome = handle.await.expect("task should not panic");
+        assert_eq!(outcome.terminal, StreamTerminal::Completed);
         assert!(!events.iter().any(|e| matches!(e, StreamEvent::Error(_))));
     }
 
@@ -4861,6 +5684,7 @@ mod tests {
             Arc::new(crate::infra::db::repo::vector_store_repo::VectorStoreRepository),
             Arc::new(crate::infra::db::repo::message_attachment_repo::MessageAttachmentRepository),
             crate::config::ContextConfig::default(),
+            crate::config::RagConfig::default(),
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
         )
     }
@@ -5168,6 +5992,8 @@ mod tests {
         fn record_attachment_upload_bytes(&self, _: &str, _: f64) {}
         fn increment_attachments_pending(&self) {}
         fn decrement_attachments_pending(&self) {}
+        fn record_image_inputs_per_turn(&self, _: u32) {}
+        fn record_code_interpreter_calls(&self, _: &str, _: u32) {}
     }
 
     // ── Metric emission tests ────────────────────────────────────────────
@@ -5407,9 +6233,9 @@ mod tests {
             .await
             .expect("should succeed");
 
-        // Wait for turn_started and first delta to arrive, then cancel
-        let started = rx.recv().await.expect("should get turn_started");
-        assert!(matches!(started, StreamEvent::TurnStarted(_)));
+        // Wait for stream_started and first delta to arrive, then cancel
+        let started = rx.recv().await.expect("should get stream_started");
+        assert!(matches!(started, StreamEvent::StreamStarted(_)));
         let ev = rx.recv().await.expect("should receive delta");
         assert!(
             matches!(ev, StreamEvent::Delta(_)),

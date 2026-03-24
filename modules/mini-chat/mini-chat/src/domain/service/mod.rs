@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use opentelemetry::trace::TraceContextExt as _;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
 use authz_resolver_sdk::pep::ResourceType;
 use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
 use modkit_db::DBProvider;
@@ -33,6 +36,7 @@ pub(crate) mod test_helpers;
 pub(crate) mod token_estimator;
 mod turn_service;
 
+pub(crate) use crate::domain::model::audit_envelope::AuditEnvelope;
 pub(crate) use attachment_service::AttachmentService;
 pub(crate) use chat_service::ChatService;
 pub(crate) use finalization_service::FinalizationService;
@@ -42,6 +46,18 @@ pub(crate) use quota_service::QuotaService;
 pub(crate) use reaction_service::ReactionService;
 pub(crate) use stream_service::{StreamError, StreamService};
 pub(crate) use turn_service::{MutationError, MutationResult, TurnService};
+
+/// Extract the W3C trace ID from the current tracing span.
+///
+/// Returns `None` when there is no active `OTel` span (e.g. in tests or
+/// background tasks that were started outside a traced request).
+/// Must be called as a plain (non-async) function so it inherits the
+/// caller's span context without switching async task context.
+pub(super) fn current_otel_trace_id() -> Option<String> {
+    let ctx = tracing::Span::current().context();
+    let tid = ctx.span().span_context().trace_id();
+    (tid != opentelemetry::trace::TraceId::INVALID).then(|| tid.to_string())
+}
 
 pub(crate) type DbProvider = DBProvider<modkit_db::DbError>;
 
@@ -67,6 +83,11 @@ pub(crate) mod resources {
     pub const MODEL: ResourceType = ResourceType {
         name: "gts.cf.core.ai_chat.model.v1~cf.core.mini_chat.model.v1",
         supported_properties: &[pep_properties::OWNER_TENANT_ID],
+    };
+
+    pub const USER_QUOTA: ResourceType = ResourceType {
+        name: "gts.cf.core.ai_chat.user_quota.v1~cf.core.mini_chat.user_quota.v1",
+        supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::OWNER_ID],
     };
 }
 
@@ -208,6 +229,7 @@ impl<
             Arc::clone(&repos.chat),
             Arc::clone(&repos.message_attachment),
             enforcer.clone(),
+            Arc::clone(outbox_enqueuer),
             Arc::clone(&metrics),
         );
 
@@ -241,6 +263,7 @@ impl<
                 Arc::clone(&repos.vector_store),
                 Arc::clone(&repos.message_attachment),
                 context_config,
+                rag_config.clone(),
                 Arc::clone(&metrics),
             ),
             turns,

@@ -205,6 +205,36 @@ fn stream_error_response(err: &StreamError) -> Response {
             )
             .into_response()
         }
+        StreamError::ImagesDisabled => {
+            info!(
+                reason = "kill_switch",
+                "images disabled via kill switch, request rejected"
+            );
+            Problem::new(
+                StatusCode::BAD_REQUEST,
+                "images_disabled",
+                "Image inputs are currently disabled",
+            )
+            .into_response()
+        }
+        StreamError::TooManyImages { count, max } => {
+            info!(count, max, "too many image attachments in request");
+            Problem::new(
+                StatusCode::BAD_REQUEST,
+                "too_many_images",
+                format!("Request includes {count} images, maximum is {max}"),
+            )
+            .into_response()
+        }
+        StreamError::UnsupportedMedia => {
+            info!("model does not support image input, request rejected");
+            Problem::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media",
+                "The selected model does not support image input",
+            )
+            .into_response()
+        }
         StreamError::InvalidAttachment { code, message } => {
             info!(code = %code, message = %message, "invalid attachment in request");
             Problem::new(StatusCode::BAD_REQUEST, code, message).into_response()
@@ -265,6 +295,7 @@ async fn replay_response(
 
     let (tx, rx) = mpsc::channel::<StreamEvent>(4);
     tokio::spawn(async move {
+        drop(tx.send(events.stream_started).await);
         drop(tx.send(events.delta).await);
         drop(tx.send(events.done).await);
     });
@@ -405,7 +436,7 @@ impl Stream for SseRelay {
             Poll::Pending => {
                 // No event ready — check if ping timer fired
                 if this.ping_timer.poll_tick(cx).is_ready() {
-                    // Only emit pings in Idle or Pinging phase
+                    // Only emit pings in Started or Pinging phase
                     let kind = StreamEventKind::Ping;
                     match this.phase.try_advance(kind) {
                         Ok(new_phase) => {

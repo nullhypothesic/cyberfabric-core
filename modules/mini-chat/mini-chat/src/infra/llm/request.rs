@@ -35,7 +35,24 @@ pub struct RequestMetadata {
     pub user_id: String,
     pub chat_id: String,
     pub request_type: RequestType,
-    pub feature: Feature,
+    #[serde(rename = "feature", serialize_with = "serialize_feature")]
+    pub features: Vec<FeatureFlag>,
+}
+
+fn serialize_feature<S: serde::Serializer>(
+    features: &[FeatureFlag],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if features.is_empty() {
+        return serializer.serialize_str("none");
+    }
+    let s: String = features
+        .iter()
+        .copied()
+        .map(FeatureFlag::as_str)
+        .collect::<Vec<_>>()
+        .join("+");
+    serializer.serialize_str(&s)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -46,16 +63,22 @@ pub enum RequestType {
     DocSummary,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub enum Feature {
-    #[serde(rename = "file_search")]
+/// Individual feature flag for observability metadata sent to the provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeatureFlag {
     FileSearch,
-    #[serde(rename = "web_search")]
     WebSearch,
-    #[serde(rename = "file_search+web_search")]
-    FileSearchAndWebSearch,
-    #[serde(rename = "none")]
-    None,
+    CodeInterpreter,
+}
+
+impl FeatureFlag {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FileSearch => "file_search",
+            Self::WebSearch => "web_search",
+            Self::CodeInterpreter => "code_interpreter",
+        }
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -73,6 +96,7 @@ pub struct LlmRequest<Mode = Streaming> {
     pub(crate) tools: Vec<LlmTool>,
     pub(crate) user_identity: Option<UserIdentity>,
     pub(crate) metadata: Option<RequestMetadata>,
+    pub(crate) max_tool_calls: Option<u32>,
     pub(crate) additional_params: Option<serde_json::Value>,
     pub(crate) _mode: PhantomData<Mode>,
 }
@@ -106,6 +130,7 @@ pub struct LlmRequestBuilder {
     tools: Vec<LlmTool>,
     user_identity: Option<UserIdentity>,
     metadata: Option<RequestMetadata>,
+    max_tool_calls: Option<u32>,
     additional_params: Option<serde_json::Value>,
 }
 
@@ -121,6 +146,7 @@ impl LlmRequestBuilder {
             tools: Vec::new(),
             user_identity: None,
             metadata: None,
+            max_tool_calls: None,
             additional_params: None,
         }
     }
@@ -188,6 +214,13 @@ impl LlmRequestBuilder {
         self
     }
 
+    /// Set the maximum tool calls per request.
+    #[must_use]
+    pub fn max_tool_calls(mut self, max: u32) -> Self {
+        self.max_tool_calls = Some(max);
+        self
+    }
+
     /// Set additional provider-specific parameters (escape hatch).
     #[must_use]
     pub fn additional_params(mut self, params: serde_json::Value) -> Self {
@@ -204,6 +237,7 @@ impl LlmRequestBuilder {
             tools: self.tools,
             user_identity: self.user_identity,
             metadata: self.metadata,
+            max_tool_calls: self.max_tool_calls,
             additional_params: self.additional_params,
             _mode: PhantomData,
         }

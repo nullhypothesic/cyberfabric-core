@@ -103,7 +103,7 @@ impl ModelResolver for ModelPolicyGateway {
                 let default = snapshot
                     .model_catalog
                     .iter()
-                    .find(|m| m.preference.is_default && m.enabled)
+                    .find(|m| m.preference.as_ref().is_some_and(|p| p.is_default) && m.enabled)
                     .or_else(|| snapshot.model_catalog.iter().find(|m| m.enabled));
 
                 match default {
@@ -152,6 +152,14 @@ impl ModelResolver for ModelPolicyGateway {
             .find(|m| m.model_id == model_id && m.enabled)
             .map(ResolvedModel::from)
             .ok_or_else(|| DomainError::model_not_found(model_id))
+    }
+
+    async fn get_kill_switches(
+        &self,
+        user_id: Uuid,
+    ) -> Result<mini_chat_sdk::KillSwitches, DomainError> {
+        let snapshot = self.current_snapshot(user_id).await?;
+        Ok(snapshot.kill_switches)
     }
 }
 

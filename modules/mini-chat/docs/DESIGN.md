@@ -276,6 +276,7 @@ Global emergency flags / kill switches (P1): operators MUST have a way to immedi
 - `force_standard_tier` — if enabled, all requests MUST use the standard-tier model regardless of quota state or user selection.
 - `disable_file_search` — if enabled, `file_search` tool calls MUST be skipped; responses proceed without retrieval.
 - `disable_web_search` — if enabled, requests with `web_search.enabled=true` MUST be rejected with HTTP 400 and error code `web_search_disabled` before opening an SSE stream. The system MUST NOT silently ignore the parameter.
+- `disable_code_interpreter` — if enabled, two-phase enforcement applies: (1) **Upload phase**: attachments where `code_interpreter` would be the sole purpose (e.g. XLSX) are rejected with a validation error (422); attachments with additional purposes (e.g. file_search) have `for_code_interpreter` filtered out and proceed. (2) **Stream phase**: the `code_interpreter` tool is silently omitted from the Responses API request — the turn proceeds without code_interpreter capability. Unlike `disable_web_search`, the stream is NOT rejected with HTTP 400; the tool is simply excluded.
 - `disable_images` — if enabled, image uploads and image attachments MUST be rejected; requests containing image content MUST be rejected with HTTP 400 and error code `images_disabled` before opening an SSE stream.
 
 Ownership: these flags are owned and operated by platform configuration (P1: deployment config). Long-term, they are expected to be owned by Settings Service / License Manager with privileged operator access.
@@ -390,9 +391,19 @@ All period boundaries use UTC. Per-tenant timezone configuration (`quota_timezon
 
 **Quota period boundary invariant (normative)**: All settlement operations (reserve release and commit) MUST target the same `(period_type, period_start)` bucket rows as the original reserve. The `period_start` values are computed at preflight time and MUST NOT be recomputed at settlement time using the current clock. Implementations MUST persist the preflight `period_start` values alongside the reserve (e.g., in the `chat_turns` row or in context passed to the settlement path) and use those persisted values for all subsequent settlement operations. This ensures that in-flight reserves straddling period boundaries (e.g., a turn started at 23:59:59 UTC and completed at 00:00:01 UTC) are settled against the correct day-1 bucket rows rather than incorrectly targeting day-2 — which would cause `reserved_credits_micro` in day-1 to remain permanently inflated while day-2 is double-reserved.
 
-#### Quota Warning Thresholds (P2+)
+#### Quota Warning Thresholds (P1)
 
-Quota warning thresholds (`warning_threshold_pct`, `quota_warnings` array in the SSE `done` event) are deferred to P2+. P1 does not emit quota warning notifications in the SSE stream.
+The SSE `done` event carries a `quota_warnings` array with per-tier, per-period remaining percentage, warning flag, and exhausted flag. A REST endpoint `GET /v1/quota/status` provides the same data plus credit breakdowns and next-reset timestamps for at-rest queries.
+
+**Configuration:** `warning_threshold_pct` (integer, default 80, range 1-99). Warning fires when `remaining_percentage <= (100 - warning_threshold_pct)`. Exhausted fires when `remaining_percentage == 0`.
+
+#### Quota Status Endpoint (P1)
+
+`GET /v1/quota/status` returns per-tier, per-period quota breakdown for the authenticated user. No query parameters — returns all tiers and periods.
+
+Response includes: `tier` (premium/total), `period` (daily/monthly), `limit_credits_micro`, `used_credits_micro` (spent + reserved, conservative), `remaining_credits_micro`, `remaining_percentage` (0-100), `next_reset` (RFC 3339 — midnight UTC tomorrow for daily, midnight UTC 1st of next month for monthly), `warning` (boolean), `exhausted` (boolean), and `warning_threshold_pct` (config value).
+
+Authorization: authenticated + licensed. Scoped to tenant + user. Billing outcomes and settlement details are NOT exposed — only remaining quota data.
 
 Background tasks (thread summary update, document summary generation) MUST run with `requester_type=system` and MUST NOT be charged to an arbitrary end user. Usage for these tasks is charged to a tenant operational bucket (implementation-defined) and still emitted to `audit_service`.
 
@@ -785,7 +796,7 @@ If any of the above validations fail, the request MUST be rejected with an appro
 | State | Server behavior |
 |-------|----------------|
 | Active generation exists for key | Return `409 Conflict` (JSON error response; no SSE stream is opened). (P2+: attach to existing stream.) |
-| Completed generation exists for key | Return a fast replay SSE stream without triggering a new provider request: one `delta` event containing the full persisted assistant text, then `citations` if available, then `done`. |
+| Completed generation exists for key | Return a fast replay SSE stream without triggering a new provider request: `stream_started` (with `is_new_turn: false`), one `delta` event containing the full persisted assistant text, then `citations` if available, then `done`. |
 | No record for key | Start a new generation normally (subject to the Parallel Turn Policy below). |
 
 If `request_id` is omitted in the request body, the server MUST generate a UUID v4 and assign it as the turn's `request_id`. The generated key participates in normal idempotency semantics: if the client persists the server-assigned value (e.g. from the SSE `done` event or Turn Status response), it can resubmit it for replay or recovery. In the public DTO, `request_id` is always present and non-null on every Message. Within a normal turn, the user message and assistant response always share the same `request_id` (turn correlation key). System/background messages (e.g. `doc_summary`, `thread_summary`) carry an independently server-generated UUID v4 and do not correspond to `chat_turns` rows.
@@ -868,15 +879,19 @@ UI guidance: if the SSE stream disconnects before a terminal event, the UI SHOUL
 
 #### SSE Event Definitions
 
-Seven event types. The stream always begins with `turn_started` (carrying the server-generated `request_id`) and ends with exactly one terminal event: `done` or `error`. Image-bearing turns use the same event types; no new SSE events are required for image support. The `citations` event MAY include items from both `file_search` (`source="file"`) and `web_search` (`source="web"`). Image inputs do not produce citations by themselves.
+Seven event types. The stream always begins with `stream_started` (carrying the resolved `request_id`, pre-generated `message_id`, and `is_new_turn` flag) and ends with exactly one terminal event: `done` or `error`. Image-bearing turns use the same event types; no new SSE events are required for image support. The `citations` event MAY include items from both `file_search` (`source="file"`) and `web_search` (`source="web"`). Image inputs do not produce citations by themselves.
 
-##### `event: turn_started`
+##### `event: stream_started`
 
-Emitted once at stream start, before any content events. Carries the server-generated `request_id` for this turn. Present on `POST /messages:stream`, `POST /turns/{id}/retry`, and `PATCH /turns/{id}`.
+Emitted once at stream start, before any content events. Present on all SSE streams: new generations (`POST /messages:stream`, `POST /turns/{id}/retry`, `PATCH /turns/{id}`) and idempotent replays.
+
+Carries the resolved `request_id` (client-provided when supplied, otherwise server-generated) and the assistant `message_id`. For new generations, `message_id` is a **pre-allocated UUID** — the assistant `messages` row does not yet exist in the database at this point; it will be persisted during finalization (see Content durability invariant, §5.8). For replays, `message_id` is the persisted assistant message ID. The `is_new_turn` flag distinguishes the two cases.
+
+This allows clients to reference the assistant message before the stream completes (e.g., for optimistic rendering, scroll-to-message, or cancellation) in all scenarios, including recovery after network interruption.
 
 ```
-event: turn_started
-data: {"request_id": "550e8400-e29b-41d4-a716-446655440000"}
+event: stream_started
+data: {"request_id": "550e8400-e29b-41d4-a716-446655440000", "message_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890", "is_new_turn": true}
 ```
 
 ##### `event: delta`
@@ -911,7 +926,7 @@ data: {"phase": "done", "name": "file_search", "details": {"files_searched": 3}}
 | Field | Type | Description |
 |-------|------|-------------|
 | `phase` | `"start"` \| `"progress"` \| `"done"` | Lifecycle phase of the tool call. |
-| `name` | string | Tool identifier. P1: `"file_search"`, `"web_search"`. |
+| `name` | string | Tool identifier. P1: `"file_search"`, `"web_search"`, `"code_interpreter"`. |
 | `details` | object | Tool-specific metadata. MUST be non-sensitive and tenant-safe. Content is minimal and stable at P1. |
 
 ##### `event: citations`
@@ -926,7 +941,7 @@ data: {"items": [{"source": "file", "title": "Q3 Report.pdf", "attachment_id": "
 | Field | Type | Description |
 |-------|------|-------------|
 | `items[].source` | `"file"` \| `"web"` | Citation source type. |
-| `items[].title` | string | Document or page title. |
+| `items[].title` | string | Citation title. For file citations (`source="file"`), contains the original uploaded filename (e.g. `"Q3_Report.pdf"`). For web citations (`source="web"`), contains the page title. |
 | `items[].url` | string (optional) | URL for web sources. |
 | `items[].attachment_id` | UUID (optional) | Internal attachment identifier for file sources. This is the only file identifier exposed to clients. |
 | `items[].span` | object (optional) | Reserved for mapping citations to the final assistant text. If provided: `{ "start": number, "end": number }` character offsets into the full assistant output. |
@@ -943,7 +958,6 @@ Finalizes the stream. Provides usage and model selection metadata.
 
 ```json
 {
-  "message_id": "uuid",
   "usage": {
     "input_tokens": 500,
     "output_tokens": 120,
@@ -959,7 +973,6 @@ Finalizes the stream. Provides usage and model selection metadata.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `message_id` | UUID | Persisted assistant message ID. |
 | `usage.input_tokens` | number | Actual input tokens consumed. |
 | `usage.output_tokens` | number | Actual output tokens consumed. |
 | `usage.model` | string | Effective model used for generation (same value as top-level `effective_model`; kept for backward compatibility). |
@@ -968,7 +981,7 @@ Finalizes the stream. Provides usage and model selection metadata.
 | `quota_decision` | `"allow"` \| `"downgrade"` (required) | Always present. `"allow"` when the turn used the selected model without override; `"downgrade"` when a quota-driven downgrade occurred. |
 | `downgrade_from` | string (optional) | Always equals `selected_model` when present — the model from which the quota-driven downgrade occurred. Present only when `quota_decision="downgrade"`. |
 | `downgrade_reason` | string (optional) | Why downgrade occurred. Present only when `quota_decision="downgrade"`. Values: `"premium_quota_exhausted"` (user's premium quota exhausted — quota-driven downgrade); `"force_standard_tier"` (operator kill switch: premium tier forcibly disabled for this tenant via `force_standard_tier=true`); `"disable_premium_tier"` (operator kill switch: premium tier globally disabled via `disable_premium_tier=true`); `"model_disabled"` (operator kill switch: the selected model's `global_enabled=false`). |
-| `quota_warnings` | array of objects (optional) | Deferred to P2+. Not emitted in P1. |
+| `quota_warnings` | array of objects (optional) | Per-tier quota status. Each entry: `{ tier, period, remaining_percentage, warning, exhausted }`. Present on CAS-winning completed/incomplete turns. Absent on error, cancelled, replay, and CAS-loser paths. |
 
 ##### `event: error`
 
@@ -983,7 +996,7 @@ data: {"code": "quota_exceeded", "message": "Daily limit reached", "quota_scope"
 |-------|------|-------------|
 | `code` | string | Canonical error code (see table below). |
 | `message` | string | Human-readable description. |
-| `quota_scope` | `"tokens"` \| `"uploads"` \| `"web_search"` \| `"image_inputs"` | **Required** when `code = "quota_exceeded"`; MUST be absent otherwise. Clients MUST use this field, not `message` parsing, to determine quota scope. |
+| `quota_scope` | `"tokens"` \| `"uploads"` \| `"web_search"` \| `"code_interpreter"` \| `"image_inputs"` | **Required** when `code = "quota_exceeded"`; MUST be absent otherwise. Clients MUST use this field, not `message` parsing, to determine quota scope. |
 
 ##### `event: ping`
 
@@ -1017,7 +1030,7 @@ A well-formed stream follows this ordering:
 **P1 normative ordering**:
 
 ```text
-turn_started  ping*  (delta | tool)*  citations?  (done | error)
+stream_started  ping*  (delta | tool)*  citations?  (done | error)
 ```
 
 - Zero or more `ping` events may appear at any point before terminal.
@@ -1074,7 +1087,7 @@ The following table is the normative mapping from provider failure modes to the 
 
 For streaming endpoints, failures before any streaming begins MUST be returned as normal JSON HTTP error responses. Once the stream has started, failures MUST be reported via a terminal `event: error`.
 
-**HTTP status policy (P1)**: request validation errors use HTTP 400; payload size / byte-limit rejections use HTTP 413; unsupported file types or unsupported media use HTTP 415.
+**HTTP status policy (P1)**: request validation errors use HTTP 400; payload size / byte-limit rejections use HTTP 413; unsupported file types or unsupported media use HTTP 415. **Exception:** upload-phase content rejections triggered by kill-switch filtering (e.g. `disable_code_interpreter` rejecting XLSX-only attachments) use HTTP 422 (Unprocessable Entity) — see line 279.
 
 | Code | HTTP Status | Description |
 |------|-------------|-------------|
@@ -1084,10 +1097,10 @@ For streaming endpoints, failures before any streaming begins MUST be returned a
 | `chat_not_found` | 404 | Chat does not exist or not accessible under current authorization constraints |
 | `generation_in_progress` | 409 | A generation is already running for this chat (one running turn per chat policy). Always pre-stream JSON. |
 | `request_id_conflict` | 409 | The same `(chat_id, request_id)` is already in a non-replayable state (`running`, `failed`, or `cancelled`). Always pre-stream JSON. |
-| `quota_exceeded` | 429 | Quota exhaustion. Always accompanied by a `quota_scope` field: `"tokens"` (token rate limits across all tiers exhausted, emergency flags, or all models disabled), `"uploads"` (daily upload quota exceeded for the attachment endpoint), `"web_search"` (per-user daily web search call quota exhausted), or `"image_inputs"` (per-turn or per-day image input limit exceeded). |
+| `quota_exceeded` | 429 | Quota exhaustion. Always accompanied by a `quota_scope` field: `"tokens"` (token rate limits across all tiers exhausted, emergency flags, or all models disabled), `"uploads"` (daily upload quota exceeded for the attachment endpoint), `"web_search"` (per-user daily web search call quota exhausted), `"code_interpreter"` (per-user daily code interpreter call quota exhausted), or `"image_inputs"` (per-turn or per-day image input limit exceeded). |
 | `web_search_disabled` | 400 | Request includes `web_search.enabled=true` but the global `disable_web_search` kill switch is active |
 | `rate_limited` | 429 | Provider upstream throttling (provider 429 after OAGW retry exhaustion) |
-| `file_too_large` | 413 | Uploaded file exceeds size limit |
+| `file_too_large` | 413 | Uploaded file exceeds the effective per-file size limit (`min(ConfigMap, CCM per-model)`). Enforced mid-stream during multipart ingestion — the handler aborts after the byte counter crosses the limit without buffering the full body. |
 | `unsupported_file_type` | 415 | File type not supported for upload |
 | `too_many_images` | 400 | Request includes more than the configured maximum images for a single turn |
 | `image_bytes_exceeded` | 413 | Request includes images whose total configured per-turn byte limit is exceeded |
@@ -1102,7 +1115,7 @@ For streaming endpoints, failures before any streaming begins MUST be returned a
 | `message_not_found` | 404 | Target message does not exist or is not accessible. Used by reaction endpoints. Always pre-stream JSON. |
 | `invalid_reaction_target` | 400 | Reaction attempted on a message type that does not support reactions (e.g., system messages). Always pre-stream JSON. |
 
-**Quota error disambiguation invariant**: token quota exhaustion, upload quota exhaustion, web search quota exhaustion, and image input quota exhaustion MUST be distinguishable to clients via the stable, machine-readable `quota_scope` field on every `quota_exceeded` error response. Clients MUST NOT parse the `message` string to determine quota scope. The `quota_scope` field is REQUIRED when `code` is `quota_exceeded` and MUST be one of: `"tokens"` (token-based rate limit exhaustion), `"uploads"` (per-user daily upload limit exhaustion), `"web_search"` (per-user daily web search call limit exhaustion), or `"image_inputs"` (per-turn or per-day image input limit exhaustion).
+**Quota error disambiguation invariant**: token quota exhaustion, upload quota exhaustion, web search quota exhaustion, code interpreter quota exhaustion, and image input quota exhaustion MUST be distinguishable to clients via the stable, machine-readable `quota_scope` field on every `quota_exceeded` error response. Clients MUST NOT parse the `message` string to determine quota scope. The `quota_scope` field is REQUIRED when `code` is `quota_exceeded` and MUST be one of: `"tokens"` (token-based rate limit exhaustion), `"uploads"` (per-user daily upload limit exhaustion), `"web_search"` (per-user daily web search call limit exhaustion), `"code_interpreter"` (per-user daily code interpreter call limit exhaustion), or `"image_inputs"` (per-turn or per-day image input limit exhaustion).
 
 #### Models API — **ID**: `cpt-cf-mini-chat-interface-models-api`
 
@@ -1331,9 +1344,11 @@ sequenceDiagram
         AG-->>UI: 400
     end
 
+    Note over CS: If disable_code_interpreter kill switch active: XLSX-only uploads rejected at upload time (422); at stream time, code_interpreter tool silently omitted from provider request.
+
     Note over CS, DB: Preflight transaction (must commit before provider call): validate attachment_ids, persist `messages` (role='user'), persist `message_attachments` (from attachment_ids), insert `chat_turns` (state='running') + quota reserve.
 
-    Note over CS, OAI: Single provider call per user turn. file_search tool always included when chat has ready document attachments; retrieval scope = entire chat vector store. web_search included when web_search.enabled=true.
+    Note over CS, OAI: Single provider call per user turn. file_search tool always included when chat has ready document attachments; retrieval scope = entire chat vector store. web_search included when web_search.enabled=true. code_interpreter included when code_interpreter.enabled=true and chat has ready code_interpreter attachments (unless disable_code_interpreter kill switch active).
 
     CS->>DB: Preflight commit: Persist user msg + message_attachments (attachment_ids only) + chat_turns(running) + quota reserve
 
@@ -1370,15 +1385,21 @@ sequenceDiagram
     participant OG as outbound_gateway
     participant OAI as OpenAI / Azure OpenAI
 
-    UI->>AG: POST /v1/chats/{id}/attachments (multipart)
-    AG->>CS: UploadAttachment(chat_id, file, security_ctx)
-    CS->>DB: Insert attachment metadata (status: pending, attachment_kind derived from MIME)
-    CS->>OG: POST /outbound/llm/files (upload)
+    UI->>AG: POST /v1/chats/{id}/attachments (multipart, streaming)
+    AG->>CS: UploadAttachment(chat_id, multipart_stream, security_ctx)
+
+    Note over CS: Handler: resolve MIME from field headers (before body read)
+    Note over CS: Handler: authz + model resolve → UploadLimits (min(ConfigMap, CCM per-model))
+    Note over CS: Service: resolve purposes from MIME, apply kill switch / capability filtering
+    Note over CS: Handler: stream chunks with byte counter; abort 413 if limit exceeded
+
+    CS->>DB: Insert attachment metadata (status: pending, size_bytes=hint, for_file_search, for_code_interpreter)
+    CS->>OG: POST /outbound/llm/files (streaming multipart via OAGW SDK)
     OG->>OAI: Files API upload
     OAI-->>OG: provider_file_id
     OG-->>CS: provider_file_id
 
-    alt attachment_kind = document
+    alt purposes contain file_search AND attachment_kind = document
         CS->>OG: POST /outbound/llm/vector_stores/{chat_store}/files (add file)
         OG->>OAI: Add file to vector store
         OAI-->>OG: OK
@@ -1387,6 +1408,9 @@ sequenceDiagram
         opt Generate doc summary (background)
             CS->>CS: Enqueue doc summary task (requester_type=system)
         end
+    else purposes contain code_interpreter only
+        Note over CS: NOT added to vector store; available via<br/>code_interpreter tool_resources at stream time
+        CS->>DB: Update attachment (status: ready, provider_file_id)
     else attachment_kind = image
         Note over CS: NOT added to vector store; NOT summarized
         CS->>CS: Generate thumbnail (sync, best-effort)
@@ -1398,9 +1422,11 @@ sequenceDiagram
     AG-->>UI: 201 Created
 ```
 
-**Description**: File upload flow - the file is uploaded to the LLM provider (OpenAI or Azure OpenAI) via OAGW. The subsequent steps depend on attachment kind:
+**Description**: File upload flow - the file is uploaded to the LLM provider (OpenAI or Azure OpenAI) via OAGW. The subsequent steps depend on the attachment's resolved purposes (derived from MIME type, filtered by kill switches and model capabilities):
 
-- **Document** (`attachment_kind=document`): file is added to the chat's vector store (created on first upload), optionally summarized, and metadata is persisted locally. Status transitions: `pending` -> `ready` or `pending` -> `failed`.
+- **Document with `file_search` purpose** (most document types): file is added to the chat's vector store (created on first upload), optionally summarized, and metadata is persisted locally. Status transitions: `pending` -> `ready` or `pending` -> `failed`.
+- **Document with `code_interpreter` purpose only** (XLSX): file is uploaded to the provider via Files API but is NOT added to the vector store. It is available to the `code_interpreter` tool at stream time via `tools[].container.file_ids` in the provider request. Status transitions: `pending` -> `ready` or `pending` -> `failed`.
+- **Document with multiple purposes** (future): both the vector store indexing path and other purpose-specific paths execute independently. All matching purpose paths must succeed for the attachment to reach `ready`.
 - **Image** (`attachment_kind=image`): file is uploaded to the provider via Files API but is NOT added to the vector store and NOT summarized. After a successful provider upload, the server generates a preview thumbnail using the Rust `image` crate ([https://docs.rs/image/latest/image/](https://docs.rs/image/latest/image/)). Thumbnail generation is a synchronous step during image attachment processing (before transitioning to `ready`). The resulting thumbnail raw bytes are stored in the Mini Chat database (`attachments.img_thumbnail` BYTEA column). Status transitions: `pending` -> `ready` or `pending` -> `failed`. The image is available for multimodal input in subsequent Responses API calls via the internally stored `provider_file_id` (never exposed to clients). **Invariant**: `status=ready` implies `provider_file_id` is present AND the provider upload succeeded. If the provider file is deleted or becomes inaccessible (e.g., via cleanup), the attachment status MUST transition away from `ready` (to `failed` or be removed).
 
   **Thumbnail storage invariant**: thumbnails are stored only in Mini Chat database (`img_thumbnail` BYTEA). Thumbnails are never uploaded to or stored in provider Files API or external object storage in P1. Only the original image is uploaded to the provider.
@@ -1422,7 +1448,7 @@ sequenceDiagram
   | `thumbnail_max_pixels` | integer | 100000000 | Maximum source image pixel count (`width * height`) before skipping thumbnail generation (pre-screening heuristic) |
   | `thumbnail_max_decode_bytes` | integer | 33554432 | Maximum bytes the image decoder may consume before aborting (32 MiB). Security boundary against pixel-bomb attacks where malformed images advertise small header dimensions but expand to gigabytes on decode. |
 
-Attachment kind is derived from `content_type`: MIME types matching `image/png`, `image/jpeg`, or `image/webp` are classified as `image`; all other supported types are classified as `document`.
+Attachment kind is derived from `content_type`: MIME types matching `image/png`, `image/jpeg`, `image/webp`, or `image/gif` are classified as `image`; all other supported types are classified as `document`. Attachment purpose is derived from the validated MIME type: XLSX → `for_code_interpreter=true`; other document types → `for_file_search=true`; images have both flags `false` (handled as multimodal input). A single attachment may serve multiple purposes (both boolean columns can be `true`).
 
 **Attachment status polling**: After upload returns 201 with `status: pending`, the UI polls `GET /v1/chats/{id}/attachments/{attachment_id}` until the status transitions to `ready` or `failed`. `doc_summary` is server-generated asynchronously (background task, `requester_type=system`) and is null until processing completes; it is never provided by the client. `img_thumbnail` is server-generated during image upload processing; it appears only when `status=ready` and `kind=image` (null otherwise). If status is `failed`, the response includes an `error_code` field with a stable internal error code (no provider identifiers).
 
@@ -1980,7 +2006,9 @@ Soft-delete rules:
 | storage_backend | VARCHAR(32) | Internal storage routing: `azure` (default). Not exposed in public API. Does NOT store URLs. |
 | provider_file_id | VARCHAR(128) | LLM provider file ID - OpenAI `file-*` or Azure OpenAI `assistant-*` (nullable until upload completes). Internal-only; MUST NOT be exposed via any API response. |
 | status | VARCHAR(16) | `pending`, `ready`, `failed` |
-| attachment_kind | VARCHAR(16) | `document` or `image`. Derived from `content_type` on INSERT: MIME types `image/png`, `image/jpeg`, `image/webp` -> `image`; all others -> `document`. Stored explicitly for efficient query filtering. |
+| attachment_kind | VARCHAR(16) | `document` or `image`. Derived from `content_type` on INSERT: MIME types `image/png`, `image/jpeg`, `image/webp`, `image/gif` -> `image`; all others -> `document`. Stored explicitly for efficient query filtering. |
+| for_file_search | BOOLEAN | `true` when the attachment is routed for `file_search` processing. Derived from MIME type on INSERT. Actual indexing state is tracked by `status` and the vector-store linkage. Default `false`. |
+| for_code_interpreter | BOOLEAN | `true` when the attachment is routed for `code_interpreter` usage. Derived from MIME type on INSERT. Default `false`. |
 | doc_summary | TEXT | LLM-generated document summary (nullable; always NULL for `attachment_kind=image`) |
 | img_thumbnail | BYTEA | Server-generated preview thumbnail raw bytes (nullable; always NULL for `attachment_kind=document`). Stored as WebP. Maximum decoded size: `thumbnail_max_bytes` (default 131072 / 128 KiB). Stored only in this database; never uploaded to provider. |
 | img_thumbnail_width | INTEGER | Thumbnail width in pixels (nullable) |
@@ -2213,6 +2241,7 @@ If the chat is soft-deleted before vector store creation completes, the creation
 | output_tokens | BIGINT | Total output tokens consumed (default 0). Updated only in bucket `total`. Telemetry only — NOT used for enforcement. |
 | file_search_calls | INTEGER | Number of file search tool calls (default 0). Updated only in bucket `total`. |
 | web_search_calls | INTEGER | Number of web search tool calls (P1) (default 0). Updated only in bucket `total`. |
+| code_interpreter_calls | INTEGER | Number of code interpreter tool calls (default 0). Updated only in bucket `total`. |
 | rag_retrieval_calls | INTEGER | Number of internal RAG retrieval calls (P2+) (default 0). Updated only in bucket `total`. |
 | image_inputs | INTEGER | Number of image attachments included in Responses API calls (default 0). Updated only in bucket `total`. |
 | image_upload_bytes | BIGINT | Total bytes of uploaded images (default 0). Updated only in bucket `total`. |
@@ -2220,7 +2249,7 @@ If the chat is soft-deleted before vector store creation completes, the creation
 
 **Bucket model**: each `(tenant_id, user_id, period_type, period_start)` combination has **one row per bucket**. The `total` bucket is the overall cap (all tiers). The `tier:premium` bucket tracks premium-only spend. Enforcement reads at most two rows per period; see section 5.4.2 for the availability algorithm.
 
-**Credit vs. token/call columns**: `spent_credits_micro` and `reserved_credits_micro` are the enforcement counters used by `quota_service` for tier availability checks and period limit enforcement (section 5.4.2). All other counters (`input_tokens`, `output_tokens`, `calls`, `file_search_calls`, `web_search_calls`, `image_inputs`, `image_upload_bytes`) are aggregate telemetry; they are NOT used for quota enforcement decisions.
+**Credit vs. token/call columns**: `spent_credits_micro` and `reserved_credits_micro` are the enforcement counters used by `quota_service` for tier availability checks and period limit enforcement (section 5.4.2). All other counters (`input_tokens`, `output_tokens`, `calls`, `file_search_calls`, `web_search_calls`, `code_interpreter_calls`, `image_inputs`, `image_upload_bytes`) are aggregate telemetry; they are NOT used for quota enforcement decisions.
 
 **Commit semantics**: quota updates MUST be atomic per bucket row. Implementations SHOULD use a transaction with row locking or a single UPDATE statement to avoid race conditions under parallel streams.
 
@@ -2230,7 +2259,7 @@ If the chat is soft-deleted before vector store creation completes, the creation
   - Standard-tier turns do NOT require a `tier:premium` row update.
 
 - **At settlement (commit)**:
-  - Always (bucket `total`): `reserved_credits_micro -= turn_reserved_credits_micro; spent_credits_micro += turn_actual_credits_micro; calls += 1; input_tokens += actual_input_tokens; output_tokens += actual_output_tokens`.
+  - Always (bucket `total`): `reserved_credits_micro -= turn_reserved_credits_micro; spent_credits_micro += turn_actual_credits_micro; calls += 1; input_tokens += actual_input_tokens; output_tokens += actual_output_tokens; file_search_calls += turn_file_search_calls; web_search_calls += turn_web_search_calls; code_interpreter_calls += turn_code_interpreter_calls`.
   - If the turn ran on premium tier (bucket `tier:premium`): `reserved_credits_micro -= turn_reserved_credits_micro; spent_credits_micro += turn_actual_credits_micro; calls += 1`.
   - Token telemetry counters (`input_tokens`, `output_tokens`) are updated only in bucket `total`.
 
@@ -2633,7 +2662,7 @@ A turn is a user-message + assistant-response pair identified by `request_id` in
 3. Retry, edit, and delete are allowed only if the target turn is in a terminal state (`completed`, `failed`, or `cancelled`). If the turn is `running`, reject with `400 Bad Request` — the client must wait for completion or cancel by disconnecting the SSE stream (see `cpt-cf-mini-chat-seq-cancellation`).
 4. Retry and edit soft-delete the previous turn (set `deleted_at`) and set `replaced_by_request_id` on the old turn pointing to the new turn's `request_id`. Delete sets `deleted_at` only (no replacement turn). Mutation eligibility considers only non-deleted turns, so delete cannot target an already replaced (soft-deleted) turn.
 5. Soft-deleted turns (`deleted_at IS NOT NULL`) are excluded from active conversation history and context assembly but retained in storage for audit traceability.
-6. **New request_id invariant (normative)**: Both retry and edit create a new turn with a **new `request_id`** generated by the **server** (`Uuid::new_v4()`). The client does not provide the new `request_id` — the retry endpoint has no request body, and the edit endpoint body contains only `content`. The server-generated `request_id` is returned to the client via the SSE `event: turn_started` event (same contract as `sendMessage`). The old turn's `replaced_by_request_id` is set to the new `request_id` for audit traceability. The old `request_id` is no longer valid for idempotent replay — the soft-deleted turn is excluded from the replay path (replay requires `deleted_at IS NULL`). Audit events include both `original_request_id` and `new_request_id` (see audit event payloads for `turn_retry` and `turn_edit`).
+6. **New request_id invariant (normative)**: Both retry and edit create a new turn with a **new `request_id`** generated by the **server** (`Uuid::new_v4()`). The client does not provide the new `request_id` — the retry endpoint has no request body, and the edit endpoint body contains only `content`. The server-generated `request_id` is returned to the client via the SSE `event: stream_started` event (same contract as `sendMessage`). The old turn's `replaced_by_request_id` is set to the new `request_id` for audit traceability. The old `request_id` is no longer valid for idempotent replay — the soft-deleted turn is excluded from the replay path (replay requires `deleted_at IS NULL`). Audit events include both `original_request_id` and `new_request_id` (see audit event payloads for `turn_retry` and `turn_edit`).
 7. **Atomicity invariant (normative)**: The "latest turn" identity check (rule 1), the terminal state check (rule 3), the soft-delete of the old turn, and the INSERT of the new `running` turn MUST all execute within a single DB transaction using `SELECT FOR UPDATE` or equivalent serializable isolation. Without this, two concurrent retry/edit requests for the same turn can both pass the validation checks simultaneously, both soft-delete the old turn (the second soft-delete is a no-op since `deleted_at` is already set), and both attempt to INSERT a new running turn — which violates the `UNIQUE(chat_id) WHERE state = 'running' AND deleted_at IS NULL` index. If the new running turn INSERT fails due to this unique constraint (concurrent race condition), the mutation MUST return `409 Conflict` with `code = "generation_in_progress"` (not HTTP 500).
 
 #### Turn Mutation API Contracts
@@ -2714,6 +2743,7 @@ These events are emitted to platform `audit_service` following the same emission
 - Quota enforcement: daily + monthly per user; credit-based rate limits per tier tracked in real-time; credits are computed from provider-reported token usage using model credit multipliers; premium models have stricter limits, standard models have separate, higher limits; when all tiers are exhausted, reject with `quota_exceeded`; image counters enforced separately
 - File Search per-turn call limit is configurable per deployment (default: 2 tool calls per turn)
 - Web search via provider tooling (Azure Foundry), explicitly enabled per request via `web_search.enabled` parameter; per-turn call limit (default: 2) and per-user daily quota (default: 75); global `disable_web_search` kill switch
+- Code interpreter via provider tooling, explicitly enabled per request via `code_interpreter.enabled` parameter; per-turn call limit (default: 10) and per-user daily quota (default: 50); global `disable_code_interpreter` kill switch (rejects XLSX-only uploads at upload time; silently omits tool at stream time)
 - Public Models API (`GET /v1/models`, `GET /v1/models/{model_id}`): read-only; returns only globally enabled models from the policy catalog. Catalog sourced from `mini-chat-model-policy-plugin`.
 
 **Deferred to P2+**:
@@ -2869,6 +2899,30 @@ Once document attachments exist, the backend includes the `file_search` tool on 
 
 Limits: per-turn file_search tool call limit is configurable per deployment (default: 2); max calls per day/user tracked in `quota_usage`.
 
+### Code Interpreter Tool Availability
+
+- [ ] `p1` - **ID**: `cpt-cf-mini-chat-design-code-interpreter`
+
+The `code_interpreter` tool is included in the Responses API request when the chat contains at least one ready attachment with `for_code_interpreter = true`. The backend queries for code interpreter file IDs via `attachments WHERE chat_id = :chat_id AND for_code_interpreter = true AND status = 'ready' AND deleted_at IS NULL` (under normal tenant access scope) and passes them as `tools[].container.file_ids` in the provider request.
+
+**Purpose routing and multi-purpose model**: Each attachment's purpose is derived from its MIME type by the domain-layer `resolve_purposes()` function and persisted as two boolean columns (`for_file_search`, `for_code_interpreter`) on the `attachments` row. Current assignments:
+
+| MIME type | `for_file_search` | `for_code_interpreter` | Vector store | Code interpreter |
+|-----------|-------------------|------------------------|--------------|------------------|
+| `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` (XLSX) | `false` | `true` | No | Yes |
+| Other document types | `true` | `false` | Yes | No |
+| Image types | `false` | `false` | No | No |
+
+A single attachment may serve multiple purposes (both flags `true`). The upload flow executes all purpose-specific paths independently: vector store indexing for `for_file_search`, no additional upload step for `for_code_interpreter` (the file is already available to the tool via its `provider_file_id`).
+
+**Kill switch**: `disable_code_interpreter` (see B.2.3 Kill switches). When active:
+
+- Attachments where `for_code_interpreter` would be the only purpose are rejected at upload with a validation error.
+- Attachments with additional purposes have `for_code_interpreter` set to `false`; the upload proceeds with remaining purposes.
+- The `code_interpreter` tool is excluded from Responses API requests regardless of existing ready attachments.
+
+**Model capability gating**: If the effective model's `tool_support.code_interpreter` is `false`, the same filtering applies at upload time. At stream time, the tool is not included in the request.
+
 ### Web Search Configuration
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-design-web-search`
@@ -2939,6 +2993,58 @@ Web search quota enforcement follows deterministic preflight checks with no retr
 - `quota_exceeded` with quota_scope=`"web_search"` → HTTP 429 (daily quota exhausted)
 - `web_search_calls_exceeded` → HTTP 200 + SSE `event: error` (per-turn tool call limit breached mid-turn; not HTTP 429; turn finalized as `failed`)
 
+### Code Interpreter Configuration
+
+- [ ] `p1` - **ID**: `cpt-cf-mini-chat-design-code-interpreter-config`
+
+Code interpreter is an explicitly-enabled tool available when `code_interpreter.enabled=true` on the send-message request. The backend includes the `code_interpreter` tool in the Responses API request; the provider decides whether to invoke it.
+
+**Code interpreter provider configuration** (deployment config):
+
+```yaml
+code_interpreter:
+  max_calls_per_turn: 10            # hard limit on code_interpreter tool calls per user turn
+  daily_quota: 50                    # per-user daily code interpreter call limit
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_calls_per_turn` | integer | `10` | Hard limit on code_interpreter tool calls the provider may make per user turn. Enforced mid-turn in `stream_service`. |
+| `daily_quota` | integer | `50` | Per-user daily code interpreter call limit. Tracked in `quota_usage.code_interpreter_calls`. |
+
+#### Code Interpreter Quota Enforcement (P1 Determinism Rules)
+
+Code interpreter quota enforcement follows deterministic preflight checks with no retroactive refunds:
+
+**Preflight Checks** (executed BEFORE opening SSE stream):
+
+1. **Kill Switch Check**: If `disable_code_interpreter=true`:
+   - **Upload phase** (attachment_service): XLSX-only uploads are rejected with 422 validation error; multi-purpose attachments have `for_code_interpreter` filtered out
+   - **Stream phase** (stream_service): silently omit the `code_interpreter` tool from the Responses API request; proceed without code_interpreter capability
+   - Skip the daily quota check below (tool is not included)
+
+2. **Daily Quota Check**: If `request.code_interpreter.enabled=true` (and kill switch is not active):
+   - Load user's daily code_interpreter_calls usage from `quota_usage`
+   - If `daily_usage >= daily_quota`:
+     - Reject with HTTP 429
+     - Error code: `"quota_exceeded"`
+     - Error message: "Daily code interpreter quota exceeded"
+     - quota_scope: `"code_interpreter"` (distinguishes from token quota)
+
+**Mid-Turn Hard Limit Enforcement**:
+
+3. **Per-Turn Tool Call Limit**: During turn execution, track code_interpreter tool calls made by the provider.
+   - Hard limit: `max_calls_per_turn` (configurable, default: 10)
+   - If exceeded mid-turn:
+     - Finalize turn as `failed` with `error_code = "code_interpreter_calls_exceeded"` (not `quota_exceeded`)
+     - Settle tokens based on actual/estimated usage at that point
+     - **NO REFUNDS**: Do NOT attempt to refund surcharge tokens
+     - Emit outbox event with `outcome="failed"`, `settlement_method="actual"` (if provider reported partial usage) OR `"estimated"` (if no usage available)
+
+**Error Codes Summary**:
+- `quota_exceeded` with quota_scope=`"code_interpreter"` → HTTP 429 (daily quota exhausted)
+- `code_interpreter_calls_exceeded` → HTTP 200 + SSE `event: error` (per-turn tool call limit breached mid-turn; not HTTP 429; turn finalized as `failed`)
+
 ### File Search Retrieval Scope
 
 **Physical store**: one dedicated vector store per chat (see `chat_vector_stores` table). Created on first document upload to the chat. All document attachments in a chat are indexed in the same physical vector store. The backend MUST resolve the provider vector store from `(tenant_id, chat_id)` internally. The client MUST NOT send provider `vector_store_id` values; the public API accepts only internal `attachment_id` UUIDs.
@@ -2992,21 +3098,21 @@ Retrieved file search excerpts are integrated into the prompt as follows:
 5. Retrieved chunks are subject to the token budget truncation rules in Context Plan Assembly: thread summary and system prompt always have higher priority; retrieval excerpts are truncated first when the budget is exceeded.
 6. Maximum retrieved chunks per turn and maximum retrieved tokens per turn are configurable (see RAG defaults below).
 
-#### Citation File ID Resolution
+#### Citation File ID and Title Resolution
 
-File citations returned by the provider include a provider-specific file identifier (`provider_file_id`) in the annotation payload. Before constructing the client-visible citation object, the backend MUST resolve this provider identifier to the internal `attachment_id` used by the Mini Chat system.
+File citations returned by the provider include a provider-specific file identifier (`provider_file_id`) in the annotation payload. Before constructing the client-visible citation object, the backend MUST resolve this provider identifier to the internal `attachment_id` and populate the `title` field with the original uploaded `filename` from the `attachments` table.
 
 Resolution is performed by a lookup in the `attachments` table:
 
 ```
-(chat_id, provider_file_id) → attachment_id
+(chat_id, provider_file_id) → (attachment_id, filename)
 ```
 
-The lookup MUST be restricted to the current `chat_id` to preserve tenant and chat isolation. Raw `provider_file_id` values MUST NOT be exposed in API responses. The citation payload returned to the client MUST contain the internal `attachment_id` only.
+The lookup MUST be restricted to the current `chat_id` to preserve tenant and chat isolation. Raw `provider_file_id` values MUST NOT be exposed in API responses. The citation payload returned to the client MUST contain the internal `attachment_id` and the human-readable `filename` as the citation `title`.
 
 **Citation resolution rules**:
 
-1. If a matching attachment row is found and the attachment is not soft-deleted (`deleted_at IS NULL`), the citation MUST include the corresponding `attachment_id`.
+1. If a matching attachment row is found and the attachment is not soft-deleted (`deleted_at IS NULL`), the citation MUST include the corresponding `attachment_id` and set `title` to the attachment's `filename`.
 2. If no matching attachment is found (e.g., provider returns an unknown file ID), the citation MUST be omitted from the `citations` event. The backend MUST NOT expose the raw `provider_file_id` to the client.
 3. If the attachment exists but is soft-deleted (`deleted_at IS NOT NULL`), the citation MUST be omitted. The raw provider identifier MUST NOT be returned.
 4. The `attachments` table MUST maintain an index on `(chat_id, provider_file_id)` to ensure deterministic and efficient lookup.
@@ -3389,7 +3495,7 @@ Every request sent to the LLM provider via `llm_provider` MUST include two ident
     "user_id": "{user_id}",
     "chat_id": "{chat_id}",
     "request_type": "chat|summary|doc_summary",
-    "feature": "file_search|web_search|file_search+web_search|none"
+    "feature": "none|file_search|web_search|code_interpreter|file_search+web_search|file_search+code_interpreter|…"
   }
 }
 ```
@@ -3496,11 +3602,12 @@ The following metric series MUST be exposed (types and label sets shown). These 
 
 ##### Tools and retrieval
 
-- `mini_chat_tool_calls_total{tool,phase}` (counter; `tool`: `file_search|web_search`; `phase`: `start|done|error`)
-- `mini_chat_tool_call_limited_total{tool}` (counter; `tool`: `file_search|web_search`)
+- `mini_chat_tool_calls_total{tool,phase}` (counter; `tool`: `file_search|web_search|code_interpreter`; `phase`: `start|done|error`)
+- `mini_chat_tool_call_limited_total{tool}` (counter; `tool`: `file_search|web_search|code_interpreter`)
 - `mini_chat_file_search_latency_ms{provider,model}` (histogram)
 - `mini_chat_web_search_latency_ms{provider,model}` (histogram)
 - `mini_chat_web_search_disabled_total` (counter; requests rejected due to `disable_web_search` kill switch)
+- `mini_chat_code_interpreter_disabled_total` (counter; events where `disable_code_interpreter` kill switch was active — includes both upload rejections and stream-time tool omissions)
 - `mini_chat_citations_count` (histogram; number of items in `event: citations`)
 - `mini_chat_citations_by_source_total{source}` (counter; `source`: `file|web`)
 
@@ -4134,7 +4241,7 @@ A PolicySnapshot is a versioned, immutable configuration object published by CCM
 - `policy_version` (monotonic identifier)
 - `model_catalog` (model entries with credit multipliers, capabilities, tier, display metadata)
 - `estimation_budgets` (fixed surcharge token budgets for preflight reserve estimation). **Source split (normative)**: the fields `bytes_per_token_conservative`, `fixed_overhead_tokens`, `safety_margin_pct`, `image_token_budget`, `tool_surcharge_tokens`, and `web_search_surcharge_tokens` are part of this PolicySnapshot and versioned by `policy_version`. The field `minimal_generation_floor` is sourced from the MiniChat ConfigMap (NOT from this PolicySnapshot) and is captured per-turn into `chat_turns.minimal_generation_floor_applied` at preflight. PolicySnapshot-sourced values take effect when CCM publishes a new `policy_version`. ConfigMap-sourced values take effect on the next preflight after the ConfigMap is reloaded.
-- global kill switches (`disable_premium_tier`, `force_standard_tier`, `disable_web_search`, `disable_file_search`, `disable_images`)
+- global kill switches (`disable_premium_tier`, `force_standard_tier`, `disable_web_search`, `disable_code_interpreter`, `disable_file_search`, `disable_images`)
 
 PolicySnapshot rules:
 
@@ -4713,6 +4820,7 @@ Then mini-chat performs atomically, in a single transaction (CAS on `chat_turn.s
   - effective_model
   - policy_version_applied
   - actual_input_tokens, actual_output_tokens
+  - file_search_calls, web_search_calls, code_interpreter_calls
   - reserved_credits_micro, actual_credits_micro
   - timestamps
 
@@ -6258,7 +6366,7 @@ A monotonic, strictly increasing integer that identifies a specific immutable po
 **Bump Triggers**:
 - Changes to model catalog
 - Changes to credit multipliers (`input_tokens_credit_multiplier`, `output_tokens_credit_multiplier`)
-- Changes to kill switches (`disable_premium_tier`, `force_standard_tier`, `disable_web_search`, `disable_file_search`, `disable_images`)
+- Changes to kill switches (`disable_premium_tier`, `force_standard_tier`, `disable_web_search`, `disable_code_interpreter`, `disable_file_search`, `disable_images`)
 - User allocation logic changes affecting `GetUserLimits` output
 - User entitlements/plan changes
 
@@ -6334,7 +6442,8 @@ A monotonic, strictly increasing integer that identifies a specific immutable po
     "kill_switches": {
       "disable_web_search": false,
       "disable_file_search": false,
-      "disable_images": false
+      "disable_images": false,
+      "disable_code_interpreter": false
     }
   }
 }
@@ -6558,7 +6667,6 @@ All fields below are per-model entries inside the catalog.
 | `input_type.*` | object | **CCM API**: `GET /policies/{v}` | `snapshot.model_catalog[].general_config.input_type` |
 | `tool_support.*` | object | **CCM API**: `GET /policies/{v}` | `snapshot.model_catalog[].general_config.tool_support` |
 | `supported_endpoints.*` | object | **CCM API**: `GET /policies/{v}` | `snapshot.model_catalog[].general_config.supported_endpoints` |
-| `model_credential_id` | `string` | **CCM API**: `GET /policies/{v}` | `snapshot.model_catalog[].general_config.model_credential_id` |
 | `sort_order` | `integer` | **CCM API**: `GET /policies/{v}` | `snapshot.model_catalog[].preference.sort_order` |
 
 ### B.2.3 Kill switches / emergency flags
@@ -6568,6 +6676,7 @@ All fields below are per-model entries inside the catalog.
 | `disable_web_search` | `bool` | — | **CCM API**: `GET /policies/{v}` | `snapshot.kill_switches.disable_web_search` |
 | `disable_file_search` | `bool` | — | **CCM API**: `GET /policies/{v}` | `snapshot.kill_switches.disable_file_search` |
 | `disable_images` | `bool` | — | **CCM API**: `GET /policies/{v}` | `snapshot.kill_switches.disable_images` |
+| `disable_code_interpreter` | `bool` | — | **CCM API**: `GET /policies/{v}` | `snapshot.kill_switches.disable_code_interpreter` |
 | `disable_premium_tier` | `bool` | — | **n/a** | Not present in current CCM API; design-only |
 | `force_standard_tier` | `bool` | — | **n/a** | Not present in current CCM API; design-only |
 
@@ -6630,6 +6739,7 @@ Estimation budgets are embedded **per-model** in the policy snapshot catalog. Ea
 | Parameter | Type | Default | Valid range | Source |
 |-----------|------|---------|-------------|--------|
 | `quota.overshoot_tolerance_factor` | `float` | `1.10` | `1.00..=1.50` | **ConfigMap** |
+| `quota.warning_threshold_pct` | `integer` | `80` | `1..=99` | **ConfigMap** |
 
 ### B.5.4 Quota downgrade negative threshold
 
@@ -6645,6 +6755,14 @@ Estimation budgets are embedded **per-model** in the policy snapshot catalog. Ea
 | `web_search.max_calls_per_turn` | `integer` | `2` | **ConfigMap** | n/a in CCM API |
 | `web_search.daily_quota` | `integer` | `75` | **ConfigMap** | n/a in CCM API |
 | `disable_web_search` (kill switch) | `bool` | — | **CCM API**: `GET /policies/{v}` | `snapshot.kill_switches.disable_web_search` |
+
+## B.6.1 Code interpreter configuration
+
+| Parameter | Type | Default | Source | Notes |
+|-----------|------|---------|--------|-------|
+| `code_interpreter.enabled` | `bool` | `false` | **Request** | Per-request body field |
+| `code_interpreter.max_calls_per_turn` | `integer` | `10` | **ConfigMap** | n/a in CCM API |
+| `code_interpreter.daily_quota` | `integer` | `50` | **ConfigMap** | n/a in CCM API |
 
 ## B.7 File search / RAG configuration
 
@@ -6675,7 +6793,18 @@ Estimation budgets are embedded **per-model** in the policy snapshot catalog. Ea
 | `thumbnail_max_pixels` | `integer` | `100000000` | **ConfigMap** |
 | `thumbnail_max_decode_bytes` | `integer` | `33554432` | **ConfigMap** |
 
-Note: per-model `max_file_size_mb` is available from **CCM API**: `GET /policies/{v}` → `snapshot.model_catalog[].general_config.max_file_size_mb`.
+**Two-layer per-file size limit resolution**: The effective per-file upload limit is `min(ConfigMap, CCM per-model)`:
+
+- **ConfigMap** (kind-specific): `uploaded_file_max_size_kb` for documents, `uploaded_image_max_size_kb` for images. Deployment-wide operational ceiling.
+- **CCM** (kind-agnostic): `max_file_size_mb` from `snapshot.model_catalog[].general_config.max_file_size_mb`. Per-model provider constraint, runtime-updatable via policy snapshot. Applies to both documents and images.
+
+The handler resolves the effective limit before streaming body bytes. If the CCM snapshot is unavailable, the system falls back to ConfigMap-only limits (safe — ConfigMap is always ≥ CCM).
+
+**Streaming upload**: The upload endpoint uses streaming multipart ingestion (`field.chunk()` loop) with incremental byte counting. Oversize files are rejected mid-stream with HTTP 413 (`file_too_large`) without buffering the full body. An Axum `DefaultBodyLimit` layer (25 MiB + 64 KiB overhead) acts as a coarse outer guard on the upload route, overriding the API gateway's default 16 MiB limit.
+
+| `disable_code_interpreter` (kill switch) | `bool` | — | **CCM API**: `GET /policies/{v}` | `snapshot.kill_switches.disable_code_interpreter` |
+
+Note: per-model `max_file_size_mb` is available from **CCM API**: `GET /policies/{v}` → `snapshot.model_catalog[].general_config.max_file_size_mb`. Per-model `tool_support.code_interpreter` is available from `snapshot.model_catalog[].general_config.tool_support.code_interpreter`.
 
 ## B.9 Background workers
 
@@ -6889,7 +7018,7 @@ Concrete deployment keys for these parameters are integration-specific, but thei
 | CCM API Endpoint | Parameters sourced |
 |------------------|--------------------|
 | `GET /policies/latest` | `policy_version`, cache invalidation trigger |
-| `GET /policies/{v}` | Full model catalog, kill switches (`disable_web_search`, `disable_file_search`), user_limits, model `max_output_tokens`, `context_window`, `max_file_size_mb`, credit multipliers |
+| `GET /policies/{v}` | Full model catalog, kill switches (`disable_web_search`, `disable_code_interpreter`, `disable_file_search`, `disable_images`), user_limits, model `max_output_tokens`, `context_window`, `max_file_size_mb`, credit multipliers |
 | `GET /users/{userId}/limits` | Per-user credit limits (alternative to reading from snapshot) |
 | `GET /tiers` | Tier definitions (`id`, `name`, `downgrade_to`) |
 | `GET /stats` | Tenant quota info (`soft_quota`, `hard_quota`) — not directly consumed by Mini Chat runtime |

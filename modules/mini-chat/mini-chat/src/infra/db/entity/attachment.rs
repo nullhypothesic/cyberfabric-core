@@ -20,12 +20,15 @@ pub struct Model {
     pub status: AttachmentStatus,
     pub error_code: Option<String>,
     pub attachment_kind: AttachmentKind,
+    pub for_file_search: bool,
+    pub for_code_interpreter: bool,
     #[sea_orm(column_type = "Text")]
     pub doc_summary: Option<String>,
     pub img_thumbnail: Option<Vec<u8>>,
     pub img_thumbnail_width: Option<i32>,
     pub img_thumbnail_height: Option<i32>,
     #[allow(clippy::struct_field_names)]
+    #[sea_orm(column_type = "String(StringLen::N(1024))", nullable)]
     pub summary_model: Option<String>,
     pub summary_updated_at: Option<OffsetDateTime>,
     pub cleanup_status: Option<String>,
