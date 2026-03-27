@@ -65,6 +65,13 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Both `ring` and `aws-lc-rs` feature flags are active (pulled transitively
+    // by pingora, aliri, etc.), so rustls cannot auto-detect the provider.
+    // Explicitly select aws-lc-rs before any TLS usage.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install default CryptoProvider");
+
     let cli = Cli::parse();
 
     // Layered config:
