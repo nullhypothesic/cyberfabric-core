@@ -46,6 +46,7 @@ members = [
     "modules/credstore/credstore-sdk",
     "modules/credstore/credstore",
     "modules/credstore/plugins/static-credstore-plugin",
+    "modules/credstore/plugins/credentials-storage-plugin",
     "modules/file-parser",
     "modules/system/api-gateway",
     "modules/system/grpc-hub",
