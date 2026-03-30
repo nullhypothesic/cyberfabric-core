@@ -39,6 +39,11 @@ validation, a service layer encapsulates business logic and orchestrates encrypt
 access, and a domain layer defines core entities free of infrastructure dependencies. This layering enables independent
 testing and evolution of each concern.
 
+Tenant encryption key management is abstracted behind a `KeyProvider` port, allowing keys to be stored either locally
+(in-database, for development and simple deployments) or in a separate, hardened key management service (for production
+environments where cryptographic isolation is required). This separation ensures that compromising the credentials
+database does not expose encryption keys, and vice versa.
+
 Key architectural decisions are documented in dedicated ADRs: `cpt-pc-cs-adr-aes-encryption` (encryption strategy),
 `cpt-pc-cs-adr-rust-microservice` (technology choice and service extraction), and
 `cpt-pc-cs-adr-credential-propagation` (multi-tenant inheritance model).
@@ -53,7 +58,7 @@ Requirements that significantly influence architecture decisions.
 
 | Requirement                                                         | Design Response                                                                                      |
 |---------------------------------------------------------------------|------------------------------------------------------------------------------------------------------|
-| `cpt-pc-cs-fr-credential-encrypt` — Encrypt all values at rest      | Dedicated cryptography service with AES-256-GCM; per-tenant key management via TenantKeys repository |
+| `cpt-pc-cs-fr-credential-encrypt` — Encrypt all values at rest      | Dedicated cryptography service with AES-256-GCM; per-tenant key management via pluggable KeyProvider  |
 | `cpt-pc-cs-fr-credential-propagate` — Hierarchical propagation      | Credential merge logic in service layer resolves tenant → parent → default chain                     |
 | `cpt-pc-cs-fr-credential-mask` — Field-level masking                | Schema-driven masking applied at service layer before response construction                          |
 | `cpt-pc-cs-fr-credential-decrypt-app` — Decrypted values for apps   | Separate app/user response paths in endpoint layer with identity-based routing                       |
@@ -65,8 +70,8 @@ Requirements that significantly influence architecture decisions.
 
 | NFR ID                           | NFR Summary                        | Allocated To                                 | Design Response                                                                                        | Verification Approach                                                                    |
 |----------------------------------|------------------------------------|----------------------------------------------|--------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------|
-| `cpt-pc-cs-nfr-encryption`       | 100% encryption at rest            | Cryptography Service + Repository Layer      | All credential values pass through encrypt() before persistence; no direct DB writes bypass encryption | Integration tests verify no plaintext in DB                                              |
-| `cpt-pc-cs-nfr-tenant-isolation` | Per-tenant cryptographic isolation | TenantKeys Repository + Cryptography Service | Each tenant has a unique AES-256 key; keys never shared across tenants                                 | Unit tests verify key uniqueness; integration tests verify cross-tenant decryption fails |
+| `cpt-pc-cs-nfr-encryption`       | 100% encryption at rest            | Cryptography Service + KeyProvider           | All credential values pass through encrypt() before persistence; no direct DB writes bypass encryption | Integration tests verify no plaintext in DB                                              |
+| `cpt-pc-cs-nfr-tenant-isolation` | Per-tenant cryptographic isolation | KeyProvider + Cryptography Service           | Each tenant has a unique AES-256 key; keys never shared across tenants; keys can be isolated in external KMS | Unit tests verify key uniqueness; integration tests verify cross-tenant decryption fails |
 | `cpt-pc-cs-nfr-response-time`    | p95 ≤ 100ms at 100 concurrent      | All layers                                   | Async I/O via Tokio; connection pooling; in-memory JWKS cache                                          | Load testing with k6 or similar                                                          |
 | `cpt-pc-cs-nfr-availability`     | 99.9% monthly uptime               | Infrastructure + Service Layer               | Kubernetes HPA; readiness/liveness probes; graceful shutdown                                           | Monitoring via OpenTelemetry metrics                                                     |
 
@@ -83,17 +88,22 @@ graph TB
         SVC["Service Layer<br/>Business Logic + Crypto"]
         REPO["Repository Layer<br/>SQLx + Sea-Query"]
         DOM["Domain Layer<br/>Entities + Value Objects"]
+        KP["KeyProvider Port"]
     end
 
     PG["PostgreSQL"]
     IDP["JWT Issuer (IDP)"]
     PERM["Permission Service"]
+    EXT_KMS["External Key Service<br/>(Vault / KMS)"]
 
     Client -->|"REST/JSON"| HTTP
     HTTP -->|"Identity Context"| SVC
     SVC -->|"Queries"| REPO
+    SVC -->|"get/create key"| KP
     SVC -.->|"Uses"| DOM
     REPO -->|"SQL"| PG
+    KP -->|"Local mode"| PG
+    KP -->|"External mode"| EXT_KMS
     HTTP -->|"JWKS"| IDP
     HTTP -->|"Permission Check"| PERM
 ```
@@ -103,6 +113,7 @@ graph TB
 | HTTP           | Request routing, JWT validation, permission middleware, error mapping, OpenAPI docs | Axum 0.8, Tower-HTTP, Utoipa   |
 | Service        | Business logic, credential merge, encryption/decryption, masking, schema validation | Core Rust, AES-GCM, Serde JSON |
 | Repository     | Data access, query construction, connection management                              | SQLx 0.8, Sea-Query 0.32       |
+| KeyProvider    | Tenant key retrieval and creation; abstracts local DB vs external key service       | Trait-based port (see §3.2)    |
 | Domain         | Core entities (Schema, CredentialDefinition, Credential), value objects, enums      | Pure Rust structs              |
 | Infrastructure | Configuration, telemetry, server lifecycle, connection pooling                      | Tokio, OpenTelemetry, Clap     |
 
@@ -126,6 +137,18 @@ protected.
 
 Each tenant's credentials are encrypted with a unique per-tenant key. No shared encryption keys exist between tenants.
 This provides cryptographic isolation — compromising one tenant's key does not expose another tenant's data.
+
+**ADRs**: `cpt-pc-cs-adr-aes-encryption`
+
+#### Key–Data Separation
+
+- [ ] `p1` - **ID**: `cpt-pc-cs-principle-key-data-separation`
+
+Encryption keys and encrypted data MUST be separable into distinct security domains. The service abstracts key
+management behind a `KeyProvider` port so that tenant keys can reside in a separate, hardened service (e.g., HashiCorp
+Vault, AWS KMS, or a dedicated internal key management service) rather than in the same database as encrypted
+credentials. This ensures that a single breach (database compromise, SQL injection, backup leak) does not expose both
+ciphertext and the keys needed to decrypt it.
 
 **ADRs**: `cpt-pc-cs-adr-aes-encryption`
 
@@ -214,13 +237,13 @@ resolution must traverse the tenant tree from child to parent.
 | Schema               | Defines the JSON structure of credential values and which fields to mask. Bound to an application.           |
 | CredentialDefinition | Template binding a schema to an application with default values and access control list.                     |
 | Credential           | An encrypted tenant-specific credential value for a given definition, with masking and propagation metadata. |
-| TenantKey            | A per-tenant AES-256-GCM encryption key used for credential encryption and decryption.                       |
+| TenantKey            | A per-tenant AES-256-GCM encryption key used for credential encryption and decryption. Managed by the `KeyProvider` port — may reside in local DB or an external key management service. |
 
 **Relationships**:
 
 - Schema 1→N CredentialDefinition: each definition references one schema for validation
 - CredentialDefinition 1→N Credential: each credential belongs to one definition
-- TenantKey 1→N Credential: each tenant key encrypts all credentials for that tenant
+- TenantKey 1→N Credential: each tenant key encrypts all credentials for that tenant (key resolution via `KeyProvider`)
 - Schema → fields_to_mask: schema defines which fields are masked in credential responses
 
 ### 3.2 Component Model
@@ -262,8 +285,8 @@ validation, and credential merge/propagation resolution.
 ##### Responsibility scope
 
 Orchestrate credential lifecycle: validate input against schema, encrypt values, generate masked values, persist via
-repository. Resolve credential merge from three sources (own → inherited → default). Manage tenant encryption keys (
-auto-generate on first use). Perform cryptographic operations (AES-256-GCM encrypt/decrypt).
+repository. Resolve credential merge from three sources (own → inherited → default). Obtain tenant encryption keys via
+`KeyProvider` (auto-generate on first use). Perform cryptographic operations (AES-256-GCM encrypt/decrypt).
 
 ##### Responsibility boundaries
 
@@ -274,7 +297,44 @@ NOT manage database connections.
 
 - `cpt-pc-cs-component-http-endpoints` — called by HTTP layer
 - `cpt-pc-cs-component-repositories` — delegates data persistence
+- `cpt-pc-cs-component-key-provider` — obtains tenant encryption keys for crypto operations
 - `cpt-pc-cs-component-domain` — uses domain entities for business operations
+
+#### KeyProvider
+
+- [ ] `p1` - **ID**: `cpt-pc-cs-component-key-provider`
+
+##### Why this component exists
+
+Decouples tenant key management from the credential storage service, enabling encryption keys to be stored in a
+separate security domain from the encrypted data. This is a critical cybersecurity boundary: if the credentials database
+is compromised, the attacker gains only ciphertext without the keys to decrypt it.
+
+##### Responsibility scope
+
+Provide a `KeyProvider` trait (async port) with two operations: `get_or_create_key(tenant_id) → TenantKey` and
+`get_key(tenant_id) → Option<TenantKey>`. Two implementations:
+
+1. **`DatabaseKeyProvider`** (default) — stores keys in the local `tenant_keys` table. Suitable for development,
+   testing, and single-tenant deployments where operational simplicity is prioritized over key isolation.
+
+2. **`ExternalKeyProvider`** — delegates key storage and retrieval to an external key management service
+   (e.g., HashiCorp Vault Transit secrets engine, AWS KMS, Azure Key Vault, or a dedicated internal KMS).
+   Suitable for production multi-tenant deployments where regulatory or security requirements demand that
+   encryption keys are never co-located with encrypted data.
+
+The active implementation is selected by configuration (`key_provider` field). The `ExternalKeyProvider` communicates
+with the external service over mTLS and authenticates via service-specific credentials (Vault token, IAM role, etc.).
+
+##### Responsibility boundaries
+
+Does NOT perform encryption/decryption — only manages key lifecycle (create, retrieve, future: rotate).
+Does NOT contain business logic. Does NOT access credential data.
+
+##### Related components (by ID)
+
+- `cpt-pc-cs-component-services` — service layer calls KeyProvider to obtain keys for encrypt/decrypt operations
+- `cpt-pc-cs-component-domain` — uses TenantKey domain entity
 
 #### Repositories
 
@@ -287,13 +347,13 @@ or database-specific concerns.
 
 ##### Responsibility scope
 
-CRUD operations for schemas, credential definitions, credentials, and tenant keys. Construct type-safe SQL queries via
+CRUD operations for schemas, credential definitions, and credentials. Construct type-safe SQL queries via
 Sea-Query. Map database rows to domain entities. Manage transactions where required.
 
 ##### Responsibility boundaries
 
 Does NOT contain business logic. Does NOT perform encryption — receives already-encrypted data. Does NOT validate
-against JSON schemas.
+against JSON schemas. Does NOT manage tenant keys (delegated to `KeyProvider`).
 
 ##### Related components (by ID)
 
@@ -395,10 +455,19 @@ shared infrastructure.
 
 | Aspect                | Details                                                                          |
 |-----------------------|----------------------------------------------------------------------------------|
-| Purpose               | Persistent storage for all data (schemas, definitions, credentials, tenant keys) |
+| Purpose               | Persistent storage for schemas, definitions, and credentials. Tenant keys stored here only when `DatabaseKeyProvider` is active. |
 | Protocol              | TCP/SQL via SQLx async driver                                                    |
 | Authentication        | Username/password from environment configuration                                 |
 | Connection Management | Connection pool via `db-utils`; configurable pool size                           |
+
+#### External Key Management Service (optional)
+
+| Aspect         | Details                                                                       |
+|----------------|-------------------------------------------------------------------------------|
+| Purpose        | Tenant encryption key storage and lifecycle when `ExternalKeyProvider` is active. Provides key–data separation for production security posture. |
+| Protocol       | HTTPS/mTLS (Vault HTTP API, AWS KMS API, or custom REST/gRPC)                |
+| Authentication | Service-specific: Vault token, Kubernetes ServiceAccount, IAM role            |
+| Error Handling | Key Service unavailable blocks all encrypt/decrypt operations; readiness probe reflects KMS connectivity |
 
 #### JWT Issuer (Constructor IDP)
 
@@ -434,10 +503,11 @@ sequenceDiagram
     participant API as HTTP Endpoints
     participant Perm as Permission Service
     participant Svc as Credentials Service
+    participant KP as KeyProvider
     participant Crypto as Cryptography Service
     participant Repo as Credentials Repository
-    participant Keys as TenantKeys Repository
     participant DB as PostgreSQL
+    participant EXT as External KMS (optional)
 
     Admin->>API: POST /v1/credentials (JWT + body)
     API->>API: Validate JWT, extract tenant_id
@@ -448,9 +518,15 @@ sequenceDiagram
     Repo->>DB: SELECT credential_definition
     DB-->>Repo: definition + schema
     Svc->>Svc: Validate value against JSON Schema
-    Svc->>Keys: get_or_create_key(tenant_id)
-    Keys->>DB: SELECT/INSERT tenant_key
-    DB-->>Keys: tenant_key
+    Svc->>KP: get_or_create_key(tenant_id)
+    alt DatabaseKeyProvider (local mode)
+        KP->>DB: SELECT/INSERT tenant_key
+        DB-->>KP: tenant_key
+    else ExternalKeyProvider (external mode)
+        KP->>EXT: GET/CREATE key for tenant_id
+        EXT-->>KP: tenant_key
+    end
+    KP-->>Svc: tenant_key
     Svc->>Crypto: encrypt(value, tenant_key)
     Crypto-->>Svc: encrypted_value
     Svc->>Svc: Generate masked_value from fields_to_mask
@@ -462,8 +538,8 @@ sequenceDiagram
 ```
 
 **Description**: Administrator creates a credential. The system validates the JWT, checks permissions, validates the
-value against the schema, encrypts it with the tenant's key, generates a masked version, and persists both encrypted and
-masked values.
+value against the schema, obtains the tenant's encryption key via the `KeyProvider` port (either from local DB or an
+external key management service), encrypts it, generates a masked version, and persists both encrypted and masked values.
 
 #### Retrieve Credential with Merge Resolution
 
@@ -478,9 +554,9 @@ sequenceDiagram
     actor App as Constructor App
     participant API as HTTP Endpoints
     participant Svc as Credentials Service
+    participant KP as KeyProvider
     participant Crypto as Cryptography Service
     participant Repo as Credentials Repository
-    participant Keys as TenantKeys Repository
     participant DB as PostgreSQL
 
     App->>API: GET /v1/credentials/{name} (JWT + tenant_id)
@@ -504,7 +580,8 @@ sequenceDiagram
     end
 
     Svc->>Svc: Verify app_id authorized (owner or in allowed_app_ids)
-    Svc->>Keys: get_key(credential.tenant_id)
+    Svc->>KP: get_key(credential.tenant_id)
+    KP-->>Svc: tenant_key
     Svc->>Crypto: decrypt(encrypted_value, tenant_key)
     Crypto-->>Svc: decrypted_value
     Svc-->>API: CredentialView(decrypted, origin)
@@ -586,8 +663,13 @@ tenant_keys.id), NOT NULL(definition_id, encrypted_value, tenant_id, key_id)
 **PK**: `id`
 **Constraints**: UNIQUE(tenant_id), NOT NULL(tenant_id, key)
 
-**Additional info**: Tenant keys are auto-generated when the first credential is created for a tenant. Future migration
-planned to move keys to HashiCorp Vault.
+**Additional info**: This table is used only by the `DatabaseKeyProvider` implementation. When the `ExternalKeyProvider`
+is active, this table is not used — keys are stored and managed by the external key management service. Tenant keys are
+auto-generated when the first credential is created for a tenant.
+
+**Security note**: In production multi-tenant deployments, the `ExternalKeyProvider` is strongly recommended. Storing
+encryption keys in the same database as encrypted credentials means a single database compromise exposes both ciphertext
+and keys. See `cpt-pc-cs-principle-key-data-separation`.
 
 ### 3.8 Deployment Topology
 
@@ -603,13 +685,39 @@ The service is deployed on Kubernetes as a single Deployment managed by a Helm c
 - **Networking**: ClusterIP Service, internal Kubernetes DNS for service discovery
 - **Graceful shutdown**: 30-second termination grace period with connection draining
 
+**Deployment Variant: External Key Service**
+
+In production deployments with cybersecurity requirements for key–data separation, the `ExternalKeyProvider` is
+configured to delegate tenant key management to a separate service:
+
+```mermaid
+graph LR
+    CS["Credentials Storage<br/>Service"]
+    PG["PostgreSQL<br/>(credentials only)"]
+    KMS["External Key Service<br/>(Vault / KMS)"]
+
+    CS -->|"encrypted credentials"| PG
+    CS -->|"mTLS"| KMS
+```
+
+- **Key Service** runs in a separate security domain (dedicated namespace, network policy, separate access controls)
+- **Network**: mTLS between Credentials Storage and Key Service; network policy restricts Key Service access to
+  Credentials Storage pods only
+- **Authentication**: Service-to-service authentication (Vault token, Kubernetes SA, IAM role) — credentials for the
+  Key Service are injected via Kubernetes Secret and never stored in the application database
+- **Blast radius**: Compromising the PostgreSQL database yields only ciphertext (useless without keys).
+  Compromising the Key Service yields only keys (useless without ciphertext). Both services must be compromised
+  simultaneously to extract plaintext credentials.
+
 ## 4. Additional context
 
 - This service was extracted from the monolith Tenant Settings module (Epic APS-1044). The monolith credential
   management code should be deprecated once migration is complete.
 - User secrets (personal secrets per user, similar to Google Colab secrets) are a planned capability not yet
   implemented. The current data model may need extensions to support user-scoped credentials.
-- Encryption key storage in the application database is a known temporary solution. Migration to HashiCorp Vault for key
-  management is planned to improve security posture.
-- Key rotation is not yet implemented. A future enhancement should support re-encrypting all credentials for a tenant
-  when the key is rotated.
+- Encryption key storage in the application database (`DatabaseKeyProvider`) is suitable for development and
+  single-tenant deployments. For production multi-tenant environments, the `ExternalKeyProvider` delegates key
+  management to a separate service (HashiCorp Vault, AWS KMS, etc.) to achieve key–data separation.
+  See `cpt-pc-cs-principle-key-data-separation` and `cpt-pc-cs-component-key-provider`.
+- Key rotation is not yet implemented. The `KeyProvider` abstraction is designed to accommodate future key rotation
+  support — the external KMS can manage key versions while the service re-encrypts credentials on rotation events.
