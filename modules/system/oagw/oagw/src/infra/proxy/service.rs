@@ -17,7 +17,9 @@ use tokio::sync::watch;
 
 use crate::config::TokenCacheConfig;
 use crate::domain::error::DomainError;
-use crate::domain::model::{PassthroughMode, PathSuffixMode, Scheme, Upstream};
+use crate::domain::model::{
+    PassthroughMode, PathSuffixMode, ResponseHeaderRules, Scheme, Upstream,
+};
 use crate::domain::plugin::{
     AuthContext, GuardContext, GuardDecision, TransformErrorContext, TransformRequestContext,
     TransformResponseContext,
@@ -147,6 +149,30 @@ impl DataPlaneServiceImpl {
             pipeline.ctx,
         )
         .await;
+
+        // Inject CORS headers for actual (non-preflight) cross-origin requests.
+        if let Some(cors_config) = pipeline.cors_config
+            && cors_config.enabled
+            && let Some(ref origin) = pipeline.origin
+        {
+            let cors_headers = crate::domain::cors::apply_cors_headers(cors_config, origin);
+            for (name, value) in cors_headers {
+                if let Ok(v) = HeaderValue::from_str(&value)
+                    && let Ok(n) = http::header::HeaderName::from_bytes(name.as_bytes())
+                {
+                    if n == http::header::VARY {
+                        resp_headers.append(n, v);
+                    } else {
+                        resp_headers.insert(n, v);
+                    }
+                }
+            }
+        }
+
+        // Apply response header rules (set/add/remove) from upstream config.
+        if let Some(rules) = pipeline.response_header_rules {
+            headers::apply_response_header_rules(&mut resp_headers, rules);
+        }
 
         build_proxy_response(status, resp_headers, resp_body_stream, instance_uri)
     }
@@ -302,6 +328,22 @@ impl DataPlaneService for DataPlaneServiceImpl {
             });
         }
 
+        // Validate Content-Type format if present.
+        if !headers::is_valid_content_type(&req_headers) {
+            return Err(DomainError::Validation {
+                detail: "Content-Type header is not a recognized MIME type".into(),
+                instance: instance_uri,
+            });
+        }
+
+        // Validate Transfer-Encoding — only chunked is supported.
+        if !headers::is_valid_transfer_encoding(&req_headers) {
+            return Err(DomainError::Validation {
+                detail: "unsupported Transfer-Encoding; only chunked is accepted".into(),
+                instance: instance_uri,
+            });
+        }
+
         // Conditional body conversion — keep streams for streaming request bodies.
         let max_body = self.max_body_size;
         let (body_bytes, body_stream): (Bytes, Option<BodyStream>) = match body {
@@ -321,11 +363,76 @@ impl DataPlaneService for DataPlaneServiceImpl {
             Body::Stream(s) => (Bytes::new(), Some(s)),
         };
 
+        // For CORS preflight, resolve the route using the intended method
+        // (from Access-Control-Request-Method) instead of OPTIONS, which has
+        // no matching HttpMethod variant and would fail route resolution.
+        let resolve_method = if method.as_ref().eq_ignore_ascii_case("OPTIONS") {
+            req_headers
+                .get("access-control-request-method")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(method.as_ref())
+        } else {
+            method.as_ref()
+        };
+
         // 1+2. Resolve upstream + route in one pass (single hierarchy walk).
         let (upstream, route) = self
             .cp
-            .resolve_proxy_target(&ctx, &alias, method.as_ref(), &path_suffix)
+            .resolve_proxy_target(&ctx, &alias, resolve_method, &path_suffix)
             .await?;
+
+        // 1c. CORS: use effective config (already merged by compute_effective_config)
+        // and handle preflight short-circuit.
+        let effective_cors = upstream.cors.clone();
+        let request_origin = req_headers
+            .get(http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        if let Some(ref cors_config) = effective_cors
+            && cors_config.enabled
+        {
+            let header_vec: Vec<(String, String)> = headers::header_map_to_vec(&req_headers);
+            if crate::domain::cors::is_cors_preflight(method.as_ref(), &header_vec) {
+                let origin = request_origin.as_deref().unwrap_or("");
+                let request_method = req_headers
+                    .get("access-control-request-method")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let request_headers_list: Vec<String> = req_headers
+                    .get("access-control-request-headers")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.split(',').map(|h| h.trim().to_string()).collect())
+                    .unwrap_or_default();
+
+                let cors_headers = crate::domain::cors::handle_cors_preflight(
+                    cors_config,
+                    origin,
+                    request_method,
+                    &request_headers_list,
+                    &instance_uri,
+                )?;
+
+                let mut response = http::Response::builder()
+                    .status(http::StatusCode::NO_CONTENT)
+                    .body(Body::Empty)
+                    .map_err(|e| DomainError::Internal {
+                        message: format!("failed to build CORS preflight response: {e}"),
+                    })?;
+                for (name, value) in cors_headers {
+                    if let Ok(v) = HeaderValue::from_str(&value)
+                        && let Ok(n) = http::header::HeaderName::from_bytes(name.as_bytes())
+                    {
+                        if n == http::header::VARY {
+                            response.headers_mut().append(n, v);
+                        } else {
+                            response.headers_mut().insert(n, v);
+                        }
+                    }
+                }
+                return Ok(response);
+            }
+        }
 
         // 2b. Validate query parameters against route's allowlist.
         if let Some(ref http_match) = route.match_rules.http
@@ -479,7 +586,7 @@ impl DataPlaneService for DataPlaneServiceImpl {
         if let Some(ref hc) = upstream.headers
             && let Some(ref rules) = hc.request
         {
-            headers::apply_header_rules(&mut outbound_headers, rules);
+            headers::apply_request_header_rules(&mut outbound_headers, rules);
         }
 
         // 5-transform. Execute transform plugins (on_request phase).
@@ -602,12 +709,20 @@ impl DataPlaneService for DataPlaneServiceImpl {
             outbound_headers.insert(H_RESOLVED_ADDR, v);
         }
 
+        let response_header_rules = upstream
+            .headers
+            .as_ref()
+            .and_then(|hc| hc.response.as_ref());
+
         let pipeline = ResponsePipelineCtx {
             guard_bindings,
             transform_bindings,
             method: method.as_str(),
             path_suffix: &path_suffix,
             ctx: &ctx,
+            cors_config: effective_cors.as_ref(),
+            origin: request_origin,
+            response_header_rules,
         };
 
         // 8. Bridge request into Pingora via in-memory DuplexStream.
@@ -693,6 +808,9 @@ impl DataPlaneService for DataPlaneServiceImpl {
                     }
                 }
                 if exceeded {
+                    // Shutdown sends EOF to Pingora's read side before we
+                    // signal the limit breach (drop alone won't close the pipe).
+                    let _ = client_write.shutdown().await;
                     let _ = limit_tx.send(total_bytes);
                 } else {
                     // Chunked terminator: signals end-of-body to Pingora.
@@ -711,11 +829,6 @@ impl DataPlaneService for DataPlaneServiceImpl {
 
             // 9. Parse response from the read half, but short-circuit to 413
             //    if the body-forwarding task signals a limit breach.
-            //
-            // TODO(hardening): a fast upstream can respond before the body-forwarder
-            // detects the limit breach, causing the client to see 200 instead of 413.
-            // Fix: wrap the write half in a LimitedAsyncWrite that returns io::Error
-            // at the byte limit, so Pingora aborts the exchange before responding.
             let resp_future =
                 tokio::time::timeout(timeout, session_bridge::parse_response_stream(client_read));
             tokio::select! {
@@ -958,6 +1071,9 @@ struct ResponsePipelineCtx<'a> {
     method: &'a str,
     path_suffix: &'a str,
     ctx: &'a SecurityContext,
+    cors_config: Option<&'a crate::domain::model::CorsConfig>,
+    origin: Option<String>,
+    response_header_rules: Option<&'a ResponseHeaderRules>,
 }
 
 /// Execute `on_error` for all transform bindings, logging errors without aborting.
@@ -1025,9 +1141,19 @@ fn domain_error_status(err: &DomainError) -> u16 {
         DomainError::RateLimitExceeded { .. } => 429,
         DomainError::SecretNotFound { .. } | DomainError::Internal { .. } => 500,
         DomainError::DownstreamError { .. } | DomainError::ProtocolError { .. } => 502,
-        DomainError::UpstreamDisabled { .. } => 503,
-        DomainError::ConnectionTimeout { .. } | DomainError::RequestTimeout { .. } => 504,
+        DomainError::UpstreamDisabled { .. }
+        | DomainError::LinkUnavailable { .. }
+        | DomainError::CircuitBreakerOpen { .. } => 503,
+        DomainError::ConnectionTimeout { .. }
+        | DomainError::RequestTimeout { .. }
+        | DomainError::IdleTimeout { .. } => 504,
+        DomainError::StreamAborted { .. } => 502,
+        DomainError::PluginNotFound { .. } => 404,
+        DomainError::PluginInUse { .. } => 409,
         DomainError::GuardRejected { status, .. } => *status,
+        DomainError::CorsOriginNotAllowed { .. }
+        | DomainError::CorsMethodNotAllowed { .. }
+        | DomainError::CorsHeaderNotAllowed { .. } => 403,
     }
 }
 
@@ -1051,6 +1177,15 @@ fn domain_error_type_name(err: &DomainError) -> &'static str {
         DomainError::RequestTimeout { .. } => "RequestTimeout",
         DomainError::Internal { .. } => "Internal",
         DomainError::GuardRejected { .. } => "GuardRejected",
+        DomainError::CorsOriginNotAllowed { .. } => "CorsOriginNotAllowed",
+        DomainError::CorsMethodNotAllowed { .. } => "CorsMethodNotAllowed",
+        DomainError::CorsHeaderNotAllowed { .. } => "CorsHeaderNotAllowed",
+        DomainError::StreamAborted { .. } => "StreamAborted",
+        DomainError::LinkUnavailable { .. } => "LinkUnavailable",
+        DomainError::CircuitBreakerOpen { .. } => "CircuitBreakerOpen",
+        DomainError::IdleTimeout { .. } => "IdleTimeout",
+        DomainError::PluginNotFound { .. } => "PluginNotFound",
+        DomainError::PluginInUse { .. } => "PluginInUse",
         DomainError::Forbidden { .. } => "Forbidden",
     }
 }
@@ -1156,6 +1291,7 @@ mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            cors: None,
             tags: vec![],
         }
     }
@@ -1292,7 +1428,7 @@ mod tests {
             async fn list_routes(
                 &self,
                 _: &SecurityContext,
-                _: Uuid,
+                _: Option<Uuid>,
                 _: &ListQuery,
             ) -> Result<Vec<Route>, DomainError> {
                 unimplemented!()

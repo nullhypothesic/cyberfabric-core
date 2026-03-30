@@ -143,6 +143,32 @@ pub trait MiniChatMetricsPort: Send + Sync {
 
     /// `{prefix}_image_inputs_per_turn` — histogram
     fn record_image_inputs_per_turn(&self, count: u32);
+
+    // ── P1: Cleanup (5 metrics) ─────────────────────────────────────────
+
+    /// `{prefix}_cleanup_completed` — counter
+    /// `resource_type`: `file`, `vector_store`
+    fn record_cleanup_completed(&self, resource_type: &str);
+
+    /// `{prefix}_cleanup_failed` — counter
+    /// `resource_type`: `file`
+    fn record_cleanup_failed(&self, resource_type: &str);
+
+    /// `{prefix}_cleanup_retry` — counter
+    /// `resource_type`: `file`, `vector_store`; `reason`: free-form
+    fn record_cleanup_retry(&self, resource_type: &str, reason: &str);
+
+    /// `{prefix}_cleanup_backlog` — gauge
+    /// `state`: `pending`, `failed`; `resource_type`: `file`
+    fn record_cleanup_backlog(&self, state: &str, resource_type: &str, count: i64);
+
+    /// `{prefix}_cleanup_vector_store_with_failed_attachments` — counter
+    fn record_cleanup_vs_with_failed_attachments(&self);
+
+    // ── P2: Tool Call Counters (1 metric) ────────────────────────────
+
+    /// `{prefix}_code_interpreter_calls` — counter
+    fn record_code_interpreter_calls(&self, model: &str, count: u32);
 }
 
 /// No-op implementation for use in tests or when metrics are disabled.
@@ -180,4 +206,10 @@ impl MiniChatMetricsPort for NoopMetrics {
     fn increment_attachments_pending(&self) {}
     fn decrement_attachments_pending(&self) {}
     fn record_image_inputs_per_turn(&self, _: u32) {}
+    fn record_code_interpreter_calls(&self, _: &str, _: u32) {}
+    fn record_cleanup_completed(&self, _: &str) {}
+    fn record_cleanup_failed(&self, _: &str) {}
+    fn record_cleanup_retry(&self, _: &str, _: &str) {}
+    fn record_cleanup_backlog(&self, _: &str, _: &str, _: i64) {}
+    fn record_cleanup_vs_with_failed_attachments(&self) {}
 }

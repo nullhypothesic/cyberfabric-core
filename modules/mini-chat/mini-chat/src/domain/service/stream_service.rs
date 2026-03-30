@@ -18,15 +18,15 @@ use crate::domain::models::ResolvedModel;
 use crate::domain::ports::MiniChatMetricsPort;
 use crate::domain::ports::metric_labels::{decision, period, stage, trigger};
 use crate::domain::repos::{
-    AttachmentRepository, ChatRepository, CreateTurnParams, InsertUserMessageParams,
-    MessageAttachmentRepository, MessageRepository, QuotaUsageRepository, SnapshotBoundary,
-    ThreadSummaryRepository, TurnRepository, VectorStoreRepository,
+    AttachmentRepository, CasTerminalParams, ChatRepository, CreateTurnParams,
+    InsertUserMessageParams, MessageAttachmentRepository, MessageRepository, QuotaUsageRepository,
+    SnapshotBoundary, ThreadSummaryRepository, TurnRepository, VectorStoreRepository,
 };
 use crate::domain::stream_events::{DoneData, ErrorData, StreamEvent, StreamStartedData};
 use crate::infra::db::entity::chat_turn::{Model as TurnModel, TurnState};
 use crate::infra::llm::{
-    ClientSseEvent, Feature, LlmMessage, LlmProvider, LlmProviderError, LlmRequestBuilder, LlmTool,
-    RequestMetadata, RequestType, TerminalOutcome, provider_resolver::ProviderResolver,
+    ClientSseEvent, FeatureFlag, LlmMessage, LlmProvider, LlmProviderError, LlmRequestBuilder,
+    LlmTool, RequestMetadata, RequestType, TerminalOutcome, provider_resolver::ProviderResolver,
 };
 
 use super::{DbProvider, actions, resources};
@@ -59,23 +59,26 @@ fn attachment_err(message: impl Into<String>) -> modkit_db::DbError {
     }))
 }
 
-/// Determines the [`Feature`] variant from the set of tools attached to a
-/// request, used to populate [`RequestMetadata`] for observability.
-fn determine_feature(tools: &[LlmTool]) -> Feature {
-    let has_file_search = tools
+/// Collects [`FeatureFlag`]s from the tools attached to a request, used to
+/// populate [`RequestMetadata`] for observability.
+fn determine_features(tools: &[LlmTool]) -> Vec<FeatureFlag> {
+    let mut flags = Vec::new();
+    if tools
         .iter()
-        .any(|t| matches!(t, LlmTool::FileSearch { .. }));
-    let has_web_search = tools.iter().any(|t| matches!(t, LlmTool::WebSearch { .. }));
-    let has_ci = tools
-        .iter()
-        .any(|t| matches!(t, LlmTool::CodeInterpreter { .. }));
-    match (has_file_search, has_web_search, has_ci) {
-        (true, true, _) => Feature::FileSearchAndWebSearch,
-        (true, false, _) => Feature::FileSearch,
-        (false, true, _) => Feature::WebSearch,
-        (false, false, true) => Feature::CodeInterpreter,
-        _ => Feature::None,
+        .any(|t| matches!(t, LlmTool::FileSearch { .. }))
+    {
+        flags.push(FeatureFlag::FileSearch);
     }
+    if tools.iter().any(|t| matches!(t, LlmTool::WebSearch { .. })) {
+        flags.push(FeatureFlag::WebSearch);
+    }
+    if tools
+        .iter()
+        .any(|t| matches!(t, LlmTool::CodeInterpreter { .. }))
+    {
+        flags.push(FeatureFlag::CodeInterpreter);
+    }
+    flags
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -167,6 +170,11 @@ pub enum StreamError {
         required_tokens: u64,
         available_tokens: u64,
     },
+    /// User message content exceeds the model's maximum input token limit.
+    InputTooLong {
+        estimated_tokens: u64,
+        max_input_tokens: u32,
+    },
 }
 
 impl From<authz_resolver_sdk::EnforcerError> for StreamError {
@@ -240,6 +248,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
         error_detail: Option<String>,
         provider_response_id: Option<String>,
         web_search_calls: u32,
+        code_interpreter_calls: u32,
         ttft_ms: Option<u64>,
         total_ms: Option<u64>,
     ) -> crate::domain::model::finalization::FinalizationInput {
@@ -270,10 +279,41 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
             downgrade_reason: self.downgrade_reason.clone(),
             period_starts: self.period_starts.clone(),
             web_search_calls,
+            code_interpreter_calls,
             ttft_ms,
             total_ms,
         }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Input token validation
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Estimate text-only tokens for `content` and return `Err(InputTooLong)` if
+/// the estimate exceeds the model's `max_input_tokens`.
+///
+/// Surcharges (images, tools, web search, code interpreter) are intentionally
+/// excluded: this is a fast pre-flight guard on the raw message text, not a
+/// full context budget check.
+fn check_input_token_limit(content: &str, pf: &PreflightResult) -> Result<(), StreamError> {
+    let estimate = super::token_estimator::estimate_tokens(
+        &super::token_estimator::EstimationInput {
+            utf8_bytes: content.len() as u64,
+            num_images: 0,
+            tools_enabled: false,
+            web_search_enabled: false,
+            code_interpreter_enabled: false,
+        },
+        &pf.estimation_budgets,
+    );
+    if estimate.estimated_input_tokens > u64::from(pf.max_input_tokens) {
+        return Err(StreamError::InputTooLong {
+            estimated_tokens: estimate.estimated_input_tokens,
+            max_input_tokens: pf.max_input_tokens,
+        });
+    }
+    Ok(())
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -337,6 +377,7 @@ struct PreflightResult {
     downgrade_reason: Option<String>,
     system_prompt: String,
     context_window: u32,
+    max_input_tokens: u32,
     estimation_budgets: crate::config::EstimationBudgets,
     max_retrieved_chunks_per_turn: u32,
     max_tool_calls: u32,
@@ -359,6 +400,7 @@ fn flatten_preflight(
             minimal_generation_floor_applied,
             system_prompt,
             context_window,
+            max_input_tokens,
             estimation_budgets,
             max_retrieved_chunks_per_turn,
             max_tool_calls,
@@ -377,6 +419,7 @@ fn flatten_preflight(
             downgrade_reason: None,
             system_prompt,
             context_window,
+            max_input_tokens,
             estimation_budgets,
             max_retrieved_chunks_per_turn,
             max_tool_calls,
@@ -394,6 +437,7 @@ fn flatten_preflight(
             downgrade_reason,
             system_prompt,
             context_window,
+            max_input_tokens,
             estimation_budgets,
             max_retrieved_chunks_per_turn,
             max_tool_calls,
@@ -412,6 +456,7 @@ fn flatten_preflight(
             downgrade_reason: Some(downgrade_reason.as_str().to_owned()),
             system_prompt,
             context_window,
+            max_input_tokens,
             estimation_budgets,
             max_retrieved_chunks_per_turn,
             max_tool_calls,
@@ -730,6 +775,9 @@ impl<
 
         let pf = flatten_preflight(computed.decision.clone())?;
 
+        // ── Input token limit check ──
+        check_input_token_limit(&content, &pf)?;
+
         // ── Post-preflight image guards (kill switches + vision capability) ──
         if num_images > 0 {
             if computed.kill_switches.disable_images {
@@ -932,6 +980,7 @@ impl<
             pf.max_output_tokens_applied.cast_unsigned(),
             pf.max_tool_calls,
             self.quota.web_search_max_calls_per_message(),
+            self.quota.code_interpreter_max_calls_per_message(),
             cancel,
             tx,
             Some(finalization_ctx),
@@ -1343,6 +1392,45 @@ impl<
 
         let pf = flatten_preflight(computed.decision.clone())?;
 
+        // ── Input token limit check ──
+        // The turn is already committed (created by mutate_for_stream). If the
+        // message exceeds max_input_tokens we mark it Failed before returning so
+        // the turn does not stay stuck in Running state.
+        if let Err(too_long) = check_input_token_limit(&content, &pf) {
+            let detail = match &too_long {
+                StreamError::InputTooLong {
+                    estimated_tokens,
+                    max_input_tokens,
+                } => Some(format!(
+                    "estimated {estimated_tokens} tokens, limit {max_input_tokens}"
+                )),
+                _ => None,
+            };
+            if let Err(e) = self
+                .turn_repo
+                .cas_update_state(
+                    &conn,
+                    &scope,
+                    CasTerminalParams {
+                        turn_id,
+                        state: TurnState::Failed,
+                        error_code: Some("input_too_long".to_owned()),
+                        error_detail: detail,
+                        assistant_message_id: None,
+                        provider_response_id: None,
+                    },
+                )
+                .await
+            {
+                warn!(
+                    %turn_id,
+                    error = %e,
+                    "failed to mark turn as Failed after InputTooLong check"
+                );
+            }
+            return Err(too_long);
+        }
+
         // Metrics: estimated tokens (only on allow/downgrade)
         #[allow(clippy::cast_precision_loss)]
         self.metrics
@@ -1539,6 +1627,7 @@ impl<
             pf.max_output_tokens_applied.cast_unsigned(),
             pf.max_tool_calls,
             self.quota.web_search_max_calls_per_message(),
+            self.quota.code_interpreter_max_calls_per_message(),
             cancel,
             tx,
             Some(finalization_ctx),
@@ -1589,6 +1678,7 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
     max_output_tokens: u32,
     max_tool_calls: u32,
     web_search_max_calls: u32,
+    code_interpreter_max_calls: u32,
     cancel: CancellationToken,
     tx: mpsc::Sender<StreamEvent>,
     fin_ctx: Option<FinalizationCtx<TR, MR>>,
@@ -1629,7 +1719,7 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
         if let Some(instructions) = system_instructions {
             builder = builder.system_instructions(instructions);
         }
-        let feature = determine_feature(&tools);
+        let features = determine_features(&tools);
         for tool in tools {
             builder = builder.tool(tool);
         }
@@ -1640,7 +1730,7 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                 .as_ref()
                 .map_or_else(String::new, |f| f.chat_id.to_string()),
             request_type: RequestType::Chat,
-            feature,
+            features,
         };
         builder = builder.metadata(metadata);
         let request = builder.build_streaming();
@@ -1669,6 +1759,7 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                         Some(code.clone()),
                         None,
                         None,
+                        0,
                         0,
                         None,
                         None,
@@ -1732,6 +1823,8 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
         // daily quota under-counts by one. Acceptable for P1 since OpenAI always
         // pairs searching→completed; revisit if we add providers that don't.
         let mut web_search_completed_count: u32 = 0;
+        let mut code_interpreter_call_count: u32 = 0;
+        let mut code_interpreter_completed_count: u32 = 0;
 
         loop {
             tokio::select! {
@@ -1801,6 +1894,7 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                                                     None,
                                                     None,
                                                     web_search_completed_count,
+                                                    code_interpreter_completed_count,
                                                     None,
                                                     None,
                                                 );
@@ -1862,6 +1956,92 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                                 }
                             }
 
+                            // Track code interpreter tool calls
+                            if let ClientSseEvent::Tool { ref phase, name, .. } = client_event
+                                && name == "code_interpreter"
+                            {
+                                match phase {
+                                    ToolPhase::Start => {
+                                        code_interpreter_call_count += 1;
+                                        if code_interpreter_call_count > code_interpreter_max_calls {
+                                            warn!(
+                                                code_interpreter_call_count,
+                                                limit = code_interpreter_max_calls,
+                                                "code interpreter per-message limit exceeded"
+                                            );
+                                            let code = "code_interpreter_calls_exceeded".to_owned();
+                                            let message = "Code interpreter calls exceeded for this message".to_owned();
+
+                                            if let Some(ref fctx) = fin_ctx {
+                                                let input = fctx.to_finalization_input(
+                                                    TurnState::Failed,
+                                                    &accumulated_text,
+                                                    None,
+                                                    Some(code.clone()),
+                                                    None,
+                                                    None,
+                                                    web_search_completed_count,
+                                                    code_interpreter_completed_count,
+                                                    None,
+                                                    None,
+                                                );
+                                                match fctx.finalization_svc.finalize_turn_cas(input).await {
+                                                    Ok(outcome) if outcome.won_cas => {
+                                                        let _ = tx.send(StreamEvent::Error(ErrorData {
+                                                            code: code.clone(),
+                                                            message,
+                                                        })).await;
+                                                    }
+                                                    Ok(_) => {}
+                                                    Err(fe) => {
+                                                        warn!(error = %fe, "finalization failed on ci limit exceeded");
+                                                        let _ = tx.send(StreamEvent::Error(ErrorData {
+                                                            code: code.clone(),
+                                                            message,
+                                                        })).await;
+                                                    }
+                                                }
+                                            } else {
+                                                let _ = tx.send(StreamEvent::Error(ErrorData {
+                                                    code: code.clone(),
+                                                    message,
+                                                })).await;
+                                            }
+
+                                            provider_stream.cancel();
+
+                                            if let Some(ref fctx) = fin_ctx {
+                                                let ms = stream_start.elapsed().as_secs_f64() * 1000.0;
+                                                fctx.metrics.record_stream_failed(
+                                                    &fctx.provider_id,
+                                                    &fctx.effective_model,
+                                                    &code,
+                                                );
+                                                fctx.metrics.record_stream_total_latency_ms(
+                                                    &fctx.provider_id,
+                                                    &fctx.effective_model,
+                                                    ms,
+                                                );
+                                            }
+
+                                            let has_partial = !accumulated_text.is_empty();
+                                            return StreamOutcome {
+                                                terminal: StreamTerminal::Failed,
+                                                accumulated_text,
+                                                usage: None,
+                                                effective_model: model,
+                                                error_code: Some(code),
+                                                provider_response_id: None,
+                                                provider_partial_usage: has_partial,
+                                            };
+                                        }
+                                    }
+                                    ToolPhase::Done => {
+                                        code_interpreter_completed_count += 1;
+                                    }
+                                }
+                            }
+
                             let stream_event = StreamEvent::from(client_event);
                             if tx.send(stream_event).await.is_err() {
                                 // Receiver dropped (client disconnect handled by relay)
@@ -1899,6 +2079,7 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                                     None,
                                     None,
                                     web_search_completed_count,
+                                    code_interpreter_completed_count,
                                     first_token_time.map(|d| d.as_millis() as u64),
                                     Some(mid_elapsed.as_millis() as u64),
                                 );
@@ -1977,6 +2158,7 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                     None,
                     None,
                     web_search_completed_count,
+                    code_interpreter_completed_count,
                     first_token_time.map(|d| d.as_millis() as u64),
                     Some(elapsed.as_millis() as u64),
                 );
@@ -2032,6 +2214,7 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                         None,
                         Some(response_id.clone()),
                         web_search_completed_count,
+                        code_interpreter_completed_count,
                         first_token_time.map(|d| d.as_millis() as u64),
                         Some(elapsed.as_millis() as u64),
                     );
@@ -2156,6 +2339,7 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                         None,
                         None,
                         web_search_completed_count,
+                        code_interpreter_completed_count,
                         first_token_time.map(|d| d.as_millis() as u64),
                         Some(elapsed.as_millis() as u64),
                     );
@@ -2254,6 +2438,7 @@ fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepository + 'st
                         None,
                         None,
                         web_search_completed_count,
+                        code_interpreter_completed_count,
                         first_token_time.map(|d| d.as_millis() as u64),
                         Some(elapsed.as_millis() as u64),
                     );
@@ -2364,6 +2549,14 @@ mod tests {
             Ok(())
         }
 
+        async fn enqueue_chat_cleanup(
+            &self,
+            _runner: &(dyn modkit_db::secure::DBRunner + Sync),
+            _event: crate::domain::repos::ChatCleanupEvent,
+        ) -> Result<(), crate::domain::error::DomainError> {
+            Ok(())
+        }
+
         async fn enqueue_audit_event(
             &self,
             _runner: &(dyn modkit_db::secure::DBRunner + Sync),
@@ -2443,6 +2636,9 @@ mod tests {
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    reasoning_tokens: 0,
                 },
                 response_id: "resp-test".to_owned(),
                 content: full_text,
@@ -2472,6 +2668,9 @@ mod tests {
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    reasoning_tokens: 0,
                 },
                 response_id: "resp-test".to_owned(),
                 content: full_text,
@@ -2513,6 +2712,9 @@ mod tests {
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 4096,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    reasoning_tokens: 0,
                 },
                 partial_content: deltas.iter().copied().collect(),
             })));
@@ -2549,6 +2751,9 @@ mod tests {
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    reasoning_tokens: 0,
                 },
                 response_id: "resp-test".to_owned(),
                 content: "Hello".to_owned(),
@@ -2559,6 +2764,11 @@ mod tests {
             Self {
                 events: std::sync::Mutex::new(events),
             }
+        }
+
+        /// Provider that emits N `code_interpreter` start/done pairs, then completes.
+        fn with_code_interpreter_calls(count: usize) -> Self {
+            Self::with_tool_calls(&[("code_interpreter", count)])
         }
 
         /// Provider that emits tool start/done pairs for arbitrary tool names, then completes.
@@ -2589,6 +2799,9 @@ mod tests {
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    reasoning_tokens: 0,
                 },
                 response_id: "resp-test".to_owned(),
                 content: "Hello".to_owned(),
@@ -2652,6 +2865,7 @@ mod tests {
             4096,
             2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel,
             tx,
             None,
@@ -2703,6 +2917,7 @@ mod tests {
             4096,
             2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel,
             tx,
             None,
@@ -2747,6 +2962,7 @@ mod tests {
             4096,
             2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel,
             tx,
             None,
@@ -2840,6 +3056,7 @@ mod tests {
             4096,
             2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel.clone(),
             tx,
             None,
@@ -3485,6 +3702,270 @@ mod tests {
         assert_eq!(outcome.accumulated_text, "Hello");
     }
 
+    // ── flatten_preflight unit tests ──
+
+    /// `max_input_tokens` from `PreflightDecision::Allow` reaches `PreflightResult`.
+    #[test]
+    fn flatten_preflight_allow_propagates_max_input_tokens() {
+        use crate::config::EstimationBudgets;
+        use crate::domain::model::quota::PreflightDecision;
+
+        let decision = PreflightDecision::Allow {
+            effective_model: "m".to_owned(),
+            effective_provider_model_id: "m-provider".to_owned(),
+            reserve_tokens: 100,
+            max_output_tokens_applied: 1024,
+            reserved_credits_micro: 0,
+            policy_version_applied: 1,
+            minimal_generation_floor_applied: 50,
+            system_prompt: String::new(),
+            context_window: 128_000,
+            max_input_tokens: 65_536,
+            estimation_budgets: EstimationBudgets::default(),
+            max_retrieved_chunks_per_turn: 5,
+            max_tool_calls: 2,
+            tool_support: mini_chat_sdk::ModelToolSupport {
+                web_search: false,
+                file_search: false,
+                image_generation: false,
+                code_interpreter: false,
+                computer_use: false,
+                mcp: false,
+            },
+        };
+
+        let result = flatten_preflight(decision).expect("Allow should produce Ok");
+        assert_eq!(result.max_input_tokens, 65_536);
+        assert_eq!(result.context_window, 128_000);
+    }
+
+    /// `max_input_tokens` from `PreflightDecision::Downgrade` reaches `PreflightResult`.
+    #[test]
+    fn flatten_preflight_downgrade_propagates_max_input_tokens() {
+        use crate::config::EstimationBudgets;
+        use crate::domain::model::quota::{DowngradeReason, PreflightDecision};
+
+        let decision = PreflightDecision::Downgrade {
+            effective_model: "m-mini".to_owned(),
+            effective_provider_model_id: "m-mini-provider".to_owned(),
+            reserve_tokens: 50,
+            max_output_tokens_applied: 512,
+            reserved_credits_micro: 0,
+            policy_version_applied: 1,
+            minimal_generation_floor_applied: 50,
+            downgrade_from: "m".to_owned(),
+            downgrade_reason: DowngradeReason::PremiumQuotaExhausted,
+            system_prompt: String::new(),
+            context_window: 32_000,
+            max_input_tokens: 16_000,
+            estimation_budgets: EstimationBudgets::default(),
+            max_retrieved_chunks_per_turn: 5,
+            max_tool_calls: 2,
+            tool_support: mini_chat_sdk::ModelToolSupport {
+                web_search: false,
+                file_search: false,
+                image_generation: false,
+                code_interpreter: false,
+                computer_use: false,
+                mcp: false,
+            },
+        };
+
+        let result = flatten_preflight(decision).expect("Downgrade should produce Ok");
+        assert_eq!(result.max_input_tokens, 16_000);
+        assert_eq!(result.context_window, 32_000);
+        assert_eq!(result.quota_decision, "downgrade");
+    }
+
+    // ── InputTooLong integration tests ──
+
+    /// Build a `StreamService` whose model catalog sets `max_input_tokens` to
+    /// `context_window` (the invariant in `test_catalog_entry`). Using a small
+    /// `context_window` lets tests trigger `InputTooLong` with short content.
+    fn build_stream_service_with_context_window(
+        db: Arc<DbProvider>,
+        provider: Arc<dyn LlmProvider>,
+        context_window: u32,
+    ) -> StreamService<
+        TurnRepo,
+        MsgRepo,
+        OrmQuotaUsageRepo,
+        OrmChatRepo,
+        MockThreadSummaryRepo,
+        OrmAttachmentRepo,
+        OrmVectorStoreRepo,
+        OrmMessageAttachmentRepo,
+    > {
+        use crate::domain::service::finalization_service::FinalizationService;
+        use crate::domain::service::quota_settler::QuotaSettler;
+
+        #[allow(de0309_must_have_domain_model)]
+        struct MockQuotaSettler;
+        #[async_trait::async_trait]
+        impl QuotaSettler for MockQuotaSettler {
+            async fn settle_in_tx(
+                &self,
+                _tx: &modkit_db::secure::DbTx<'_>,
+                _scope: &AccessScope,
+                _input: crate::domain::model::quota::SettlementInput,
+            ) -> Result<
+                crate::domain::model::quota::SettlementOutcome,
+                crate::domain::error::DomainError,
+            > {
+                Ok(crate::domain::model::quota::SettlementOutcome {
+                    settlement_method: crate::domain::model::quota::SettlementMethod::Released,
+                    actual_credits_micro: 0,
+                    charged_tokens: 0,
+                    overshoot_capped: false,
+                })
+            }
+        }
+
+        let metrics: Arc<dyn crate::domain::ports::MiniChatMetricsPort> =
+            Arc::new(crate::domain::ports::metrics::NoopMetrics);
+        let provider_resolver = Arc::new(ProviderResolver::single_provider(provider));
+        let turn_repo = Arc::new(TurnRepo);
+        let message_repo = Arc::new(MsgRepo::new(modkit_db::odata::LimitCfg {
+            default: 20,
+            max: 100,
+        }));
+        let finalization = Arc::new(FinalizationService::new(
+            Arc::clone(&db),
+            Arc::clone(&turn_repo),
+            Arc::clone(&message_repo),
+            Arc::new(MockQuotaSettler) as Arc<dyn QuotaSettler>,
+            Arc::new(NoopOutboxEnqueuer) as Arc<dyn crate::domain::repos::OutboxEnqueuer>,
+            Arc::clone(&metrics),
+        ));
+
+        // Keep max_output_tokens well below context_window so preflight maths
+        // don't overflow or reject before our InputTooLong check runs.
+        #[allow(clippy::integer_division)]
+        let max_output_tokens = (context_window / 4).max(1);
+        let quota_svc = Arc::new(crate::domain::service::QuotaService::new(
+            Arc::clone(&db),
+            Arc::new(OrmQuotaUsageRepo),
+            Arc::new(MockPolicySnapshotProvider::new(
+                mini_chat_sdk::PolicySnapshot {
+                    user_id: Uuid::nil(),
+                    policy_version: 1,
+                    model_catalog: vec![test_catalog_entry(TestCatalogEntryParams {
+                        model_id: "gpt-5.2".to_owned(),
+                        provider_model_id: "gpt-5.2-2025-03-26".to_owned(),
+                        display_name: "GPT 5.2".to_owned(),
+                        tier: mini_chat_sdk::ModelTier::Standard,
+                        enabled: true,
+                        is_default: true,
+                        input_tokens_credit_multiplier_micro: 1_000_000,
+                        output_tokens_credit_multiplier_micro: 1_000_000,
+                        multimodal_capabilities: vec![],
+                        context_window,
+                        max_output_tokens,
+                        description: String::new(),
+                        provider_display_name: String::new(),
+                        multiplier_display: "1x".to_owned(),
+                        provider_id: "openai".to_owned(),
+                    })],
+                    kill_switches: mini_chat_sdk::KillSwitches::default(),
+                },
+            )),
+            Arc::new(MockUserLimitsProvider::new(mini_chat_sdk::UserLimits {
+                user_id: Uuid::nil(),
+                policy_version: 1,
+                standard: mini_chat_sdk::TierLimits {
+                    limit_daily_credits_micro: 100_000_000,
+                    limit_monthly_credits_micro: 1_000_000_000,
+                },
+                premium: mini_chat_sdk::TierLimits {
+                    limit_daily_credits_micro: 50_000_000,
+                    limit_monthly_credits_micro: 500_000_000,
+                },
+            })),
+            crate::config::EstimationBudgets::default(),
+            crate::config::QuotaConfig {
+                overshoot_tolerance_factor: 1.10,
+                ..crate::config::QuotaConfig::default()
+            },
+        ));
+
+        StreamService::new(
+            db,
+            turn_repo,
+            message_repo,
+            Arc::new(OrmChatRepo::new(modkit_db::odata::LimitCfg {
+                default: 20,
+                max: 100,
+            })),
+            mock_enforcer(),
+            provider_resolver,
+            crate::config::StreamingConfig::default(),
+            finalization,
+            quota_svc,
+            mock_thread_summary_repo(),
+            Arc::new(crate::infra::db::repo::attachment_repo::AttachmentRepository),
+            Arc::new(crate::infra::db::repo::vector_store_repo::VectorStoreRepository),
+            Arc::new(crate::infra::db::repo::message_attachment_repo::MessageAttachmentRepository),
+            crate::config::ContextConfig::default(),
+            crate::config::RagConfig::default(),
+            metrics,
+        )
+    }
+
+    /// A message whose estimated token count exceeds `max_input_tokens` is
+    /// rejected with `StreamError::InputTooLong` before any DB write.
+    ///
+    /// Setup: model catalog has `context_window = max_input_tokens = 500`.
+    /// Content: 1500 ASCII bytes → ~523 estimated tokens (default budgets).
+    ///   ceil(1500/4) + 100 = 475; with 10 % margin: ceil(475 * 110 / 100) = 523.
+    ///   523 > 500 → `InputTooLong`.
+    #[tokio::test]
+    async fn run_stream_input_too_long_returns_error() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&[]));
+        let svc = build_stream_service_with_context_window(db, provider, 500);
+
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let (tx, _rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+
+        // 1500 bytes → estimated ~523 tokens, which exceeds max_input_tokens=500
+        let long_content = "a".repeat(1500);
+
+        let err = svc
+            .run_stream(
+                ctx,
+                chat_id,
+                Uuid::new_v4(),
+                long_content,
+                test_resolved_model(),
+                false,
+                Vec::new(),
+                cancel,
+                tx,
+            )
+            .await
+            .expect_err("should be InputTooLong");
+
+        match err {
+            StreamError::InputTooLong {
+                estimated_tokens,
+                max_input_tokens,
+            } => {
+                assert_eq!(max_input_tokens, 500);
+                assert!(
+                    estimated_tokens > u64::from(max_input_tokens),
+                    "estimated {estimated_tokens} should exceed limit {max_input_tokens}"
+                );
+            }
+            other => panic!("expected InputTooLong, got: {other:?}"),
+        }
+    }
+
     // ── Integration tests (8.2, 8.3) ──
 
     /// 8.2: Duplicate `request_id` returns `Replay` (service-level equivalent of 409).
@@ -3839,6 +4320,7 @@ mod tests {
             4096,
             2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel,
             tx,
             Some(fctx),
@@ -4592,6 +5074,7 @@ mod tests {
             4096,
             2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel,
             tx,
             None,
@@ -4637,6 +5120,7 @@ mod tests {
             4096,
             2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel,
             tx,
             None,
@@ -4692,6 +5176,7 @@ mod tests {
             4096,
             2, // max_tool_calls
             2, // web_search_max_calls
+            2, // code_interpreter_max_calls
             cancel,
             tx,
             None,
@@ -4710,6 +5195,149 @@ mod tests {
         let outcome = handle.await.expect("task should not panic");
         assert_eq!(outcome.terminal, StreamTerminal::Completed);
         // No error events
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::Error(_))));
+    }
+
+    // ── Per-message code interpreter call limit tests ──
+
+    /// 6.8: Code interpreter calls within limit — stream completes normally.
+    #[tokio::test]
+    async fn test_ci_per_message_limit_not_exceeded() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::with_code_interpreter_calls(2)); // 2 calls, limit is 2
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(32);
+        let cancel = CancellationToken::new();
+
+        let handle = spawn_provider_task::<TurnRepo, MsgRepo>(
+            provider,
+            "test-alias".to_owned(),
+            mock_ctx(),
+            vec![LlmMessage::user("hi")],
+            None,
+            vec![],
+            "test-model".into(),
+            "test-model".into(),
+            4096,
+            2, // max_tool_calls
+            2, // web_search_max_calls
+            2, // code_interpreter_max_calls
+            cancel,
+            tx,
+            None,
+            std::collections::HashMap::new(),
+        );
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            let is_term = ev.is_terminal();
+            events.push(ev);
+            if is_term {
+                break;
+            }
+        }
+
+        let outcome = handle.await.expect("task should not panic");
+        assert_eq!(outcome.terminal, StreamTerminal::Completed);
+
+        // Expect: 1 delta + 2*(start+done) tool events + 1 done = 6 events
+        assert_eq!(events.len(), 6);
+        assert!(matches!(events.last(), Some(StreamEvent::Done(_))));
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::Error(_))));
+    }
+
+    /// 6.9: Code interpreter calls exceed limit — stream terminates with error.
+    #[tokio::test]
+    async fn test_ci_per_message_limit_exceeded() {
+        // 3 code_interpreter calls but limit is 2 — the 3rd start should trigger error
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::with_code_interpreter_calls(3));
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(32);
+        let cancel = CancellationToken::new();
+
+        let handle = spawn_provider_task::<TurnRepo, MsgRepo>(
+            provider,
+            "test-alias".to_owned(),
+            mock_ctx(),
+            vec![LlmMessage::user("hi")],
+            None,
+            vec![],
+            "test-model".into(),
+            "test-model".into(),
+            4096,
+            2, // max_tool_calls
+            2, // web_search_max_calls
+            2, // code_interpreter_max_calls
+            cancel,
+            tx,
+            None,
+            std::collections::HashMap::new(),
+        );
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            let is_term = ev.is_terminal();
+            events.push(ev);
+            if is_term {
+                break;
+            }
+        }
+
+        let outcome = handle.await.expect("task should not panic");
+        assert_eq!(outcome.terminal, StreamTerminal::Failed);
+        assert_eq!(
+            outcome.error_code.as_deref(),
+            Some("code_interpreter_calls_exceeded")
+        );
+
+        // Last event should be an error
+        let last = events.last().expect("should have events");
+        match last {
+            StreamEvent::Error(data) => {
+                assert_eq!(data.code, "code_interpreter_calls_exceeded");
+            }
+            other => panic!("expected Error event, got: {other:?}"),
+        }
+    }
+
+    /// 6.10: Other tool calls don't count toward code interpreter limit.
+    #[tokio::test]
+    async fn test_ci_per_message_counter_ignores_other_tools() {
+        // 5 file_search calls + 1 code_interpreter call, limit is 2 — should complete
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::with_tool_calls(&[
+            ("file_search", 5),
+            ("code_interpreter", 1),
+        ]));
+        let (tx, mut rx) = mpsc::channel::<StreamEvent>(32);
+        let cancel = CancellationToken::new();
+
+        let handle = spawn_provider_task::<TurnRepo, MsgRepo>(
+            provider,
+            "test-alias".to_owned(),
+            mock_ctx(),
+            vec![LlmMessage::user("hi")],
+            None,
+            vec![],
+            "test-model".into(),
+            "test-model".into(),
+            4096,
+            2, // max_tool_calls
+            2, // web_search_max_calls
+            2, // code_interpreter_max_calls
+            cancel,
+            tx,
+            None,
+            std::collections::HashMap::new(),
+        );
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            let is_term = ev.is_terminal();
+            events.push(ev);
+            if is_term {
+                break;
+            }
+        }
+
+        let outcome = handle.await.expect("task should not panic");
+        assert_eq!(outcome.terminal, StreamTerminal::Completed);
         assert!(!events.iter().any(|e| matches!(e, StreamEvent::Error(_))));
     }
 
@@ -5734,6 +6362,12 @@ mod tests {
         fn increment_attachments_pending(&self) {}
         fn decrement_attachments_pending(&self) {}
         fn record_image_inputs_per_turn(&self, _: u32) {}
+        fn record_code_interpreter_calls(&self, _: &str, _: u32) {}
+        fn record_cleanup_completed(&self, _: &str) {}
+        fn record_cleanup_failed(&self, _: &str) {}
+        fn record_cleanup_retry(&self, _: &str, _: &str) {}
+        fn record_cleanup_backlog(&self, _: &str, _: &str, _: i64) {}
+        fn record_cleanup_vs_with_failed_attachments(&self) {}
     }
 
     // ── Metric emission tests ────────────────────────────────────────────
@@ -6000,5 +6634,79 @@ mod tests {
         assert_eq!(metrics.active_streams_inc.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.active_streams_dec.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.stream_total_latency_ms.load(Ordering::Relaxed), 1);
+    }
+
+    /// `run_stream_for_mutation` returns `InputTooLong` for oversized content
+    /// and marks the already-committed turn as `Failed` so it does not stay
+    /// stuck in `Running` state.
+    ///
+    /// Setup: model catalog has `context_window = max_input_tokens = 500`.
+    /// Content: 1500 ASCII bytes → ~523 estimated tokens > 500 → `InputTooLong`.
+    #[tokio::test]
+    async fn run_stream_for_mutation_input_too_long_marks_turn_failed() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+        insert_running_turn(&db, tenant_id, user_id, chat_id, request_id, turn_id).await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&[]));
+        let svc = build_stream_service_with_context_window(db.clone(), provider, 500);
+
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let (tx, _rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+
+        let err = svc
+            .run_stream_for_mutation(
+                ctx,
+                chat_id,
+                request_id,
+                turn_id,
+                "a".repeat(1500),
+                test_resolved_model(),
+                false,
+                None,
+                cancel,
+                tx,
+            )
+            .await
+            .expect_err("should be InputTooLong");
+
+        match err {
+            StreamError::InputTooLong {
+                estimated_tokens,
+                max_input_tokens,
+            } => {
+                assert_eq!(max_input_tokens, 500);
+                assert!(
+                    estimated_tokens > u64::from(max_input_tokens),
+                    "estimated {estimated_tokens} should exceed limit {max_input_tokens}"
+                );
+            }
+            other => panic!("expected InputTooLong, got: {other:?}"),
+        }
+
+        // The pre-committed turn must be marked Failed, not left in Running.
+        let conn = db.conn().unwrap();
+        let scope = AccessScope::allow_all();
+        let turn = TurnRepo
+            .find_by_chat_and_request_id(&conn, &scope, chat_id, request_id)
+            .await
+            .expect("DB query should succeed")
+            .expect("turn must exist");
+        assert_eq!(
+            turn.state,
+            TurnState::Failed,
+            "turn should be marked Failed after InputTooLong"
+        );
+        assert_eq!(
+            turn.error_code.as_deref(),
+            Some("input_too_long"),
+            "error_code should be set to input_too_long"
+        );
     }
 }

@@ -68,6 +68,36 @@ pub enum DomainError {
         instance: String,
     },
 
+    /// CORS: the request origin is not in the allowed origins list.
+    #[error("CORS origin not allowed: {origin}")]
+    CorsOriginNotAllowed { origin: String, instance: String },
+
+    /// CORS: the preflight request method is not in the allowed methods list.
+    #[error("CORS method not allowed: {method}")]
+    CorsMethodNotAllowed { method: String, instance: String },
+
+    /// CORS: a preflight request header is not in the allowed headers list.
+    #[error("CORS header not allowed: {header}")]
+    CorsHeaderNotAllowed { header: String, instance: String },
+
+    #[error("{detail}")]
+    StreamAborted { detail: String, instance: String },
+
+    #[error("{detail}")]
+    LinkUnavailable { detail: String, instance: String },
+
+    #[error("{detail}")]
+    CircuitBreakerOpen { detail: String, instance: String },
+
+    #[error("{detail}")]
+    IdleTimeout { detail: String, instance: String },
+
+    #[error("plugin not found: {detail}")]
+    PluginNotFound { detail: String },
+
+    #[error("plugin in use: {detail}")]
+    PluginInUse { detail: String },
+
     /// The request was denied by the authorization policy.
     #[error("access forbidden: {detail}")]
     Forbidden { detail: String },
