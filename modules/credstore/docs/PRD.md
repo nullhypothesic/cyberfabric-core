@@ -169,7 +169,6 @@ Additionally, the platform runs in multiple environments: Kubernetes (where an e
 ### 4.2 Out of Scope
 
 - Full Credstore RAML API parity (only subset needed)
-- Encryption key management (delegated to backend)
 - Automatic secret rotation or expiration
 - Secret versioning or history
 - Cross-tenant secret transfer (secrets cannot change ownership)
@@ -339,6 +338,17 @@ The system **MUST** provide an OS-protected storage plugin for desktop/VM enviro
 
 **Rationale**: Desktop/VM environments lack access to VendorA Credstore.
 **Actors**: `cpt-cf-credstore-actor-platform-module`
+<!-- cpt-cf-id-content -->
+
+#### External Key Management
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-fr-external-key-mgmt`
+
+<!-- cpt-cf-id-content -->
+The Credentials Storage plugin **MUST** support pluggable key management via a `KeyProvider` abstraction. Two implementations are required: (1) local database storage for development and simple deployments, (2) external key management service integration (e.g., HashiCorp Vault, AWS KMS) for production environments. In production multi-tenant deployments, encryption keys **MUST** be separable from the database containing encrypted credentials, so that a single database compromise does not expose both ciphertext and decryption keys.
+
+**Rationale**: Storing encryption keys in the same database as encrypted data is a known security anti-pattern. Regulatory and enterprise security requirements demand key–data separation. A pluggable `KeyProvider` enables operational flexibility while enforcing defense-in-depth.
+**Actors**: `cpt-cf-credstore-actor-backend`
 <!-- cpt-cf-id-content -->
 
 #### Read-Only / Read-Write Credential Separation
@@ -617,6 +627,7 @@ Secret values **MUST NOT** appear in logs, error messages, or debug output at an
 | OAuth/token provider | Shared component for Credstore REST authentication tokens | `p1` |
 | `tenant_resolver` | Provides tenant hierarchy information (used by Gateway module for hierarchical resolution walk-up) | `p1` |
 | `types_registry` | GTS-based plugin registration and discovery | `p1` |
+| External Key Service | External key management service (Vault, KMS) for tenant key storage when `ExternalKeyProvider` is active. Required for production deployments with key–data separation. | `p1` |
 
 ## 11. Assumptions
 
@@ -627,6 +638,7 @@ Secret values **MUST NOT** appear in logs, error messages, or debug output at an
 - Tenant hierarchy is managed externally and accessible via `tenant_resolver` (used by Gateway for hierarchical walk-up)
 - `sharing` field is stored in VendorA Credstore schema as metadata (used by Gateway for access control decisions)
 - One storage plugin is active per deployment
+- Tenant encryption keys are managed by a pluggable `KeyProvider` (Credentials Storage plugin); production multi-tenant deployments use an external key management service for key–data separation
 
 ## 12. Risks
 
@@ -636,6 +648,8 @@ Secret values **MUST NOT** appear in logs, error messages, or debug output at an
 | Secret values leaked through logs | Critical security incident | NFR enforcement, code review, log scrubbing |
 | Hierarchy walk-up performance at deep nesting | Increased latency for resolve operations | Gateway implements efficient walk-up with early termination; cache tenant hierarchy queries; monitor resolution depth |
 | ExternalID encoding collision | Wrong secret returned | Deterministic encoding with base64url; comprehensive test coverage |
+| External key service unavailability | All encrypt/decrypt operations blocked; credential reads and writes fail | High-availability key service deployment; readiness probe reflects KMS connectivity; key caching with short TTL for read-path resilience; circuit breaker for key service calls |
+| Keys co-located with encrypted data (DatabaseKeyProvider) | Single breach exposes both ciphertext and keys | Use `ExternalKeyProvider` in production; `DatabaseKeyProvider` restricted to development/test environments by deployment policy |
 
 ## 13. Open Questions
 
