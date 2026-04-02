@@ -334,6 +334,18 @@ The system **MUST** verify that the resolved model supports the capabilities req
 
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`
 
+#### Request Traceability
+
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-fr-request-traceability-v1`
+
+The response `id` serves as the gateway request identifier. The system **MUST** propagate this identifier throughout the entire request processing pipeline — provider adapter calls, usage events reported to Usage Tracker, error events, and audit events. All internal processing stages **MUST** be correlatable back to the originating response `id`.
+
+The system **MUST** capture the `provider_request_id` returned by the provider (when available) and include it in usage events reported to Usage Tracker and in error events. This enables end-to-end correlation between gateway operations and provider-side request logs.
+
+Cross-cutting concern — applies to all operations, no dedicated UC.
+
+**Actors**: `cpt-cf-llm-gateway-actor-consumer`, `cpt-cf-llm-gateway-actor-provider`, `cpt-cf-llm-gateway-actor-usage-tracker`
+
 ### P2 — Reliability & Governance
 
 #### Provider Fallback
@@ -1051,6 +1063,7 @@ Not applicable — LLM Gateway exposes only a REST API (documented in DESIGN.md)
 - **Budget enforcement edge cases** (Owner: Platform Architecture, Resolve by: with quota enforcement ownership decision above): The following scenarios must be addressed when the ownership boundary is decided: (a) *Provider stream without usage* — if a provider stream closes before delivering usage data (network error, provider error mid-stream), policy must specify whether to debit input tokens only, report zero, or surface an error; (b) *Fallback billing* — when a primary provider fails after consuming input tokens, policy must define whether partial cost is reported before initiating fallback or only on final completion, with one usage event per committed debit and no double-reporting across fallback attempts; (c) *Background job budgeting* — quota is checked at submission time but the job executes minutes later under a possibly changed quota state, requiring the reserve/settle pattern to span the submission-to-execution gap if Gateway owns enforcement.
 - **Rate limiting mechanism** (Owner: Platform Architecture, Resolve by: before P2 implementation begins): Rate limiting (`cpt-cf-llm-gateway-fr-rate-limiting-v1`) is closely related to quota management. Whether rate limiting and quota enforcement are provided by the same component or separate components is an open question.
 - **Request monitoring and observability** (Owner: Platform Architecture, Resolve by: before P1 implementation begins): The LLM Gateway needs to track how many requests are being processed, including metrics such as request counts, latency, error rates, and token usage per provider/model. However, the platform does not yet have a standardized approach to monitoring and observability across modules. A platform-wide monitoring strategy must be agreed upon before implementing module-level metrics, to ensure consistency and avoid fragmented solutions.
+- **Cross-module request traceability** (Owner: Platform Architecture, Resolve by: before P1 implementation begins): The platform needs a mechanism that assigns a request ID at the incoming requests gateway (api-gateway module) and propagates it through all inter-module calls via ClientHub/SDK traits. This would enable end-to-end request tracing across module boundaries — for example, a consumer request arriving at the API gateway, flowing through LLM Gateway, then to Model Registry and Usage Tracker, all correlated by a single platform-level request ID. Currently, each module operates with its own request context; there is no standardized correlation ID propagated across inter-module boundaries. This is a platform-level concern that affects all modules, not just LLM Gateway. The LLM Gateway's response `id` (`cpt-cf-llm-gateway-fr-request-traceability-v1`) provides module-level traceability, but a platform-wide mechanism is needed for cross-module correlation.
 
 ## 14. Traceability
 

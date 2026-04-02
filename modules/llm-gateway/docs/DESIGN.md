@@ -72,6 +72,7 @@ See [PRD.md](./PRD.md) section 1 "Overview" — Key Problems Solved:
 | `cpt-cf-llm-gateway-fr-rate-limiting-v1` | Distributed rate limiter |
 | `cpt-cf-llm-gateway-fr-batch-processing-v1` | Provider batch API abstraction |
 | `cpt-cf-llm-gateway-fr-audit-events-v1` | Audit Module event emission |
+| `cpt-cf-llm-gateway-fr-request-traceability-v1` | Response `id` propagated as correlation ID; `provider_request_id` captured in usage/error events |
 
 #### NFR Allocation
 
@@ -1367,6 +1368,17 @@ All labels are bounded to enumerable values:
 
 Unbounded identifiers (tenant ID, request ID, user ID) **MUST NOT** be used as metric labels — they belong in structured logs and distributed traces, not in metric dimensions.
 
+#### Request Traceability in Events
+
+Per `cpt-cf-llm-gateway-fr-request-traceability-v1`, the response `id` (gateway request identifier) and `provider_request_id` (when available) are propagated through all internal processing and included in:
+
+- **Usage events** reported to Usage Tracker — enables correlation between gateway request and provider-side billing/logs
+- **Error events** — enables troubleshooting with the provider using their request ID
+- **Audit events** emitted via Audit Module — enables compliance tracing of the full request lifecycle
+- **Structured logs** — all log entries within a request processing pipeline include the response `id`; `provider_request_id` is logged after provider response is received
+
+These identifiers are not used as metric labels (unbounded cardinality).
+
 ## 4. Additional Context
 
 ### 4.1 Quality Attribute Coverage
@@ -1415,13 +1427,13 @@ Not applicable — Gateway exposes a programmatic API (REST/WebSocket) consumed 
 
 #### Business Alignment
 
-All functional requirements (23 FRs) and non-functional requirements (4 NFRs) from the PRD are mapped to architecture drivers in section 1.2. Business capabilities (provider abstraction, governance, security) are realized through the component model in section 3.2.
+All functional requirements (24 FRs) and non-functional requirements (4 NFRs) from the PRD are mapped to architecture drivers in section 1.2. Business capabilities (provider abstraction, governance, security) are realized through the component model in section 3.2.
 
 ## 5. Traceability
 
 | Source | Direction | Target | Coverage |
 |--------|-----------|--------|----------|
-| PRD FRs (23) | → | DESIGN Architecture Drivers (section 1.2) | All covered |
+| PRD FRs (24) | → | DESIGN Architecture Drivers (section 1.2) | All covered |
 | PRD NFRs (5) | → | DESIGN Architecture Drivers (section 1.2) | All covered |
 | ADRs (7) | → | DESIGN Architecture Drivers + inline on principles/constraints | All covered |
 | DESIGN Components (7) | → | DECOMPOSITION | Pending |
