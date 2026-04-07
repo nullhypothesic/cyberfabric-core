@@ -3820,29 +3820,29 @@ async fn cors_multiple_specific_origins() {
 /// buffer fills without finding the terminator.
 async fn read_http_response_headers(stream: &mut tokio::net::TcpStream) -> String {
     use tokio::io::AsyncReadExt;
-    let mut buf = vec![0u8; 4096];
-    let mut filled = 0usize;
+    // Read one byte at a time so we never consume bytes beyond the
+    // \r\n\r\n header terminator. Chunk-based reads can over-read into
+    // the WebSocket frame stream, silently swallowing data and causing
+    // flaky EOF errors on the first frame read.
+    let mut buf = Vec::with_capacity(4096);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let n = tokio::time::timeout_at(deadline, stream.read(&mut buf[filled..]))
+        let mut byte = [0u8; 1];
+        tokio::time::timeout_at(deadline, stream.read_exact(&mut byte))
             .await
             .expect("timed out reading HTTP response headers")
-            .expect("read error");
-        assert!(n > 0, "unexpected EOF before header terminator");
-        filled += n;
-        let s = String::from_utf8_lossy(&buf[..filled]);
-        if s.contains("\r\n\r\n") {
-            return s.into_owned();
+            .expect("read error / unexpected EOF");
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            return String::from_utf8_lossy(&buf).into_owned();
         }
-        assert!(
-            filled < buf.len(),
-            "header buffer full without \\r\\n\\r\\n"
-        );
+        assert!(buf.len() < 4096, "header buffer full without \\r\\n\\r\\n");
     }
 }
 
 /// Helper: perform a WebSocket handshake over a raw TCP stream.
-/// Returns the stream positioned after the 101 response headers.
+/// Returns the stream positioned after the 101 response headers and after
+/// confirming the proxy bridge is fully operational via a Ping/Pong probe.
 async fn ws_handshake(stream: &mut tokio::net::TcpStream, uri: &str) {
     use tokio::io::AsyncWriteExt;
     let req = format!(
@@ -3860,6 +3860,11 @@ async fn ws_handshake(stream: &mut tokio::net::TcpStream, uri: &str) {
         resp.starts_with("HTTP/1.1 101"),
         "expected 101 Switching Protocols, got: {resp}"
     );
+    // Ensure the proxy bridge is fully operational before returning.
+    // Without this, the spawned bridge task may still be awaiting
+    // on_upgrade when the caller sends its first data frame, causing
+    // flaky "EOF on frame 0" failures under CI resource pressure.
+    ws_readiness_probe(stream).await;
 }
 
 /// Helper: build a masked WebSocket frame for sending from a client.
@@ -3937,6 +3942,31 @@ async fn read_ws_frame(stream: &mut tokio::net::TcpStream) -> Option<(u8, Vec<u8
         }
     }
     Some((opcode, payload))
+}
+
+/// Send a Ping and wait for the matching Pong, confirming the proxy bridge
+/// pipeline is fully operational before the test sends data frames.
+///
+/// The Ping is buffered in the TCP kernel even if the bridge task hasn't
+/// started reading yet — once `frame_relay` begins, it forwards the Ping
+/// to the upstream, axum's tungstenite layer auto-responds with Pong, and
+/// the Pong arrives back here.
+async fn ws_readiness_probe(stream: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncWriteExt;
+    let probe = b"ready";
+    let ping = build_masked_frame(0x9, probe);
+    stream.write_all(&ping).await.unwrap();
+    loop {
+        match read_ws_frame(stream).await {
+            Some((0xA, data)) if data == probe => return,
+            Some((0xA, _)) => continue, // stale or unrelated Pong
+            Some((0x9, _)) => continue, // Ping from upstream
+            other => panic!(
+                "readiness probe failed: expected Pong with payload {:?}, got {other:?}",
+                std::str::from_utf8(probe).unwrap(),
+            ),
+        }
+    }
 }
 
 /// Helper: set up an upstream + route pointing at the mock's /ws/echo endpoint.
