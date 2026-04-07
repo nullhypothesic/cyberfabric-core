@@ -90,6 +90,7 @@ See [PRD.md](./PRD.md) section 1 "Overview" — Key Problems Solved:
 | `cpt-cf-llm-gateway-adr-file-storage` | FileStorage for all media handling |
 | `cpt-cf-llm-gateway-adr-circuit-breaking` | Circuit breaking at OAGW + health-based routing at Gateway |
 | `cpt-cf-llm-gateway-adr-open-responses-protocol` | Open Responses protocol for LLM completion requests |
+| `cpt-cf-llm-gateway-adr-image-generation-api` | Responses API with custom CyberFabric extensions for image generation |
 
 ### 1.3 Architecture Layers
 
@@ -190,8 +191,9 @@ Bidirectional items (used as both input context and output):
 Output-oriented items (model → consumer):
 - MessageOutput — Model message (type: "message", id, status, role: user | assistant | system | developer, content: OutputContentPart[])
 - ReasoningOutput — Model reasoning (type: "reasoning", id, summary, content: ReasoningText[] | null, encrypted_content)
+- DataOutput — CyberFabric extension: binary data output (type: "cyberfabric:data", id, status: in_progress | completed, mime_type, base64: string | null, url: string | null). Generic binary output item used for image generation and extensible to audio/video. See [ADR-0006](./ADR/0006-cpt-cf-llm-gateway-adr-image-generation-api.md).
 
-Provider-specific items use extension format: `{provider_slug}:{item_type}` (e.g., `openai:web_search_call`).
+Provider-specific items use extension format: `{provider_slug}:{item_type}` (e.g., `openai:web_search_call`). CyberFabric extensions use the `cyberfabric:` prefix (e.g., `cyberfabric:data`).
 
 *Content Parts (`content/`):*
 
@@ -218,6 +220,7 @@ Tool definitions share a single base type (`Tool`) with GTS type inheritance, di
 - FunctionTool — Function definition (type: "function", name, description, parameters: JSONSchema, strict: boolean). Open Responses standard.
 - ToolReference — CyberFabric extension: reference to Type Registry (type: "reference", schema_id). Gateway resolves schema_id via Type Registry before forwarding to provider.
 - ToolInlineGTS — CyberFabric extension: inline GTS schema (type: "inline_gts", schema). Gateway resolves GTS schema to JSON Schema before forwarding.
+- ImageGenerationTool — CyberFabric extension: built-in image generation tool (type: "cyberfabric:image_generation"). Follows the Open Responses hosted tool extension format. Parameters: aspect_ratio (1:1, 2:3, 3:2, 3:4, 4:3, 9:16, 16:9), resolution (megapixels: 0.5, 1, 2, 4), quality (low, medium, high, auto), output_format (png, jpeg, webp), output_compression (0–100, for jpeg), response_format (base64, url). See [ADR-0006](./ADR/0006-cpt-cf-llm-gateway-adr-image-generation-api.md).
 
 Tool control:
 - tool_choice: "auto" (default) | "required" | "none" | {type: "function", name: string}
@@ -256,8 +259,8 @@ Not part of the Open Responses specification. Gateway-specific endpoints for lon
 - MessageItem → ContentPart: contains 1..*
 - MessageOutput → OutputContentPart: contains 0..*
 - OutputText → UrlCitation: contains 0..* (annotations)
-- Item ← MessageItem, FunctionCallItem, FunctionCallOutputItem, ItemReference, ReasoningItem, MessageOutput, ReasoningOutput
-- Tool ← FunctionTool, ToolReference, ToolInlineGTS
+- Item ← MessageItem, FunctionCallItem, FunctionCallOutputItem, ItemReference, ReasoningItem, MessageOutput, ReasoningOutput, DataOutput
+- Tool ← FunctionTool, ToolReference, ToolInlineGTS, ImageGenerationTool
 - ContentPart ← InputText, InputImage, InputFile, InputAudio, InputVideo
 - OutputContentPart ← OutputText, Refusal
 - EmbeddingRequest → Usage: returns
@@ -478,6 +481,8 @@ Event types:
 | `response.function_call_arguments.delta` | Function call arguments delta (incremental JSON) |
 | `response.reasoning_summary_part.added` | Reasoning summary part started |
 | `response.reasoning_summary_part.done` | Reasoning summary part completed |
+| `cyberfabric:response.data.in_progress` | CyberFabric extension: binary data output item started processing (e.g., image generation in progress) |
+| `cyberfabric:response.data.done` | CyberFabric extension: binary data output item completed with final data (base64 or URL) |
 
 Format:
 
@@ -516,6 +521,7 @@ Key streaming semantics:
 - Item lifecycle: added → content deltas → done
 - Response lifecycle: created → queued → in_progress → completed | failed | incomplete
 - Provider-specific streaming events use extension format: `{provider_slug}:{event_type}`
+- CyberFabric extension events use `cyberfabric:` prefix: `cyberfabric:response.data.in_progress` (binary output started), `cyberfabric:response.data.done` (binary output completed with data)
 
 ### 3.4 Interactions & Sequences
 
