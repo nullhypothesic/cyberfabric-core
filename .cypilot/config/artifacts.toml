@@ -325,3 +325,15 @@ required = false
 require_kind_registered_in_kit = true
 require_md_extension = true
 fail_on_unmatched_markdown = true
+
+[[systems]]
+name = "credentials-storage"
+slug = "pc-cs"
+kit = "sdlc"
+artifacts_dir = "modules/credstore/plugins/credentials-storage"
+artifacts = [
+  { name = "Plugin PRD", path = "modules/credstore/plugins/credentials-storage/PRD.md", kind = "PRD", traceability = "DOCS-ONLY" },
+  { name = "Plugin Design", path = "modules/credstore/plugins/credentials-storage/DESIGN.md", kind = "DESIGN", traceability = "DOCS-ONLY" },
+]
+codebase = []
+children = []
