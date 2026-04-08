@@ -32,7 +32,7 @@ const MAX_CODE_INTERPRETER_OUTPUT_CHARS: usize = 8_192;
 
 /// Raw provider SSE event from the Responses API.
 #[derive(Debug, Clone)]
-enum ProviderEvent {
+pub(super) enum ProviderEvent {
     ResponseOutputTextDelta {
         delta: String,
     },
@@ -58,7 +58,7 @@ enum ProviderEvent {
         error: ProviderErrorPayload,
     },
     ResponseIncomplete {
-        reason: String,
+        response: ResponseObject,
     },
     Unknown {
         #[allow(dead_code)]
@@ -77,6 +77,15 @@ pub struct ResponseObject {
     #[serde(default)]
     pub output: Vec<OutputItem>,
     pub usage: RawUsage,
+    #[serde(default)]
+    pub incomplete_details: Option<IncompleteDetails>,
+}
+
+/// Details returned when a response finishes with status `"incomplete"`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IncompleteDetails {
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -101,9 +110,28 @@ pub struct RawUsage {
     output_tokens_details: Option<OutputTokensDetails>,
 }
 
+impl RawUsage {
+    /// Convert to the domain [`Usage`] type.
+    pub(super) fn to_usage(&self) -> Usage {
+        Usage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_input_tokens: self
+                .input_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.cached_tokens),
+            cache_write_input_tokens: 0,
+            reasoning_tokens: self
+                .output_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.reasoning_tokens),
+        }
+    }
+}
+
 /// Provider error payload from `response.failed` event.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct ProviderErrorPayload {
+pub(super) struct ProviderErrorPayload {
     #[serde(default)]
     code: String,
     #[serde(default)]
@@ -118,7 +146,7 @@ struct ProviderErrorEnvelope {
 
 /// Parse an error response body, handling both `{"error":{...}}` (`OpenAI`)
 /// and flat `{"code":"...","message":"..."}` shapes.
-fn parse_error_response(bytes: &[u8]) -> LlmProviderError {
+pub(super) fn parse_error_response(bytes: &[u8]) -> LlmProviderError {
     // Try OpenAI envelope first: {"error": {"message": "...", "code": "..."}}
     if let Ok(envelope) = serde_json::from_slice::<ProviderErrorEnvelope>(bytes) {
         let raw = envelope.error.message.clone();
@@ -236,8 +264,7 @@ struct ResponseFailedData {
 
 #[derive(Deserialize)]
 struct ResponseIncompleteData {
-    #[serde(default)]
-    reason: String,
+    response: ResponseObject,
 }
 
 /// A single output item from `response.code_interpreter_call.completed`.
@@ -369,7 +396,7 @@ impl FromServerEvent for ProviderEvent {
                         }
                     })?;
                 Ok(ProviderEvent::ResponseIncomplete {
-                    reason: data.reason,
+                    response: data.response,
                 })
             }
 
@@ -412,7 +439,10 @@ impl FromServerEvent for ProviderEvent {
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Translate a raw Responses API event into the shared contract.
-fn translate_provider_event(event: &ProviderEvent, accumulated_text: &str) -> TranslatedEvent {
+pub(super) fn translate_provider_event(
+    event: &ProviderEvent,
+    accumulated_text: &str,
+) -> TranslatedEvent {
     match event {
         ProviderEvent::ResponseOutputTextDelta { delta } => {
             TranslatedEvent::Sse(ClientSseEvent::Delta {
@@ -475,21 +505,7 @@ fn translate_provider_event(event: &ProviderEvent, accumulated_text: &str) -> Tr
 
         ProviderEvent::ResponseCompleted { response } => {
             let citations = extract_citations(response, accumulated_text);
-            let usage = Usage {
-                input_tokens: response.usage.input_tokens,
-                output_tokens: response.usage.output_tokens,
-                cache_read_input_tokens: response
-                    .usage
-                    .input_tokens_details
-                    .as_ref()
-                    .map_or(0, |d| d.cached_tokens),
-                cache_write_input_tokens: 0,
-                reasoning_tokens: response
-                    .usage
-                    .output_tokens_details
-                    .as_ref()
-                    .map_or(0, |d| d.reasoning_tokens),
-            };
+            let usage = response.usage.to_usage();
             let raw = serde_json::to_value(response).unwrap_or_default();
             TranslatedEvent::Terminal(TerminalOutcome::Completed {
                 usage,
@@ -513,16 +529,15 @@ fn translate_provider_event(event: &ProviderEvent, accumulated_text: &str) -> Tr
             })
         }
 
-        ProviderEvent::ResponseIncomplete { reason } => {
+        ProviderEvent::ResponseIncomplete { response } => {
+            let reason = response
+                .incomplete_details
+                .as_ref()
+                .map_or_else(String::new, |d| d.reason.clone());
+            let usage = response.usage.to_usage();
             TranslatedEvent::Terminal(TerminalOutcome::Incomplete {
-                reason: reason.clone(),
-                usage: Usage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    cache_write_input_tokens: 0,
-                    reasoning_tokens: 0,
-                },
+                reason,
+                usage,
                 partial_content: accumulated_text.to_owned(),
             })
         }
@@ -530,7 +545,10 @@ fn translate_provider_event(event: &ProviderEvent, accumulated_text: &str) -> Tr
 }
 
 /// Extract citations from a `ResponseCompleted`'s output annotations.
-fn extract_citations(response: &ResponseObject, accumulated_text: &str) -> Vec<Citation> {
+pub(super) fn extract_citations(
+    response: &ResponseObject,
+    accumulated_text: &str,
+) -> Vec<Citation> {
     let mut citations = Vec::new();
 
     for output_item in &response.output {
@@ -721,6 +739,17 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
         }
     }
 
+    // Responses API uses `reasoning: { effort: "..." }` instead of the
+    // top-level `reasoning_effort` key used by Chat Completions.
+    if let Some(body_obj) = body.as_object_mut()
+        && let Some(effort) = body_obj.remove("reasoning_effort")
+    {
+        body_obj.insert(
+            "reasoning".to_owned(),
+            serde_json::json!({ "effort": effort }),
+        );
+    }
+
     body
 }
 
@@ -905,21 +934,7 @@ impl crate::infra::llm::LlmProvider for OpenAiResponsesProvider {
         // ever is, map_citation_ids() must be applied by the caller.
         let citations = extract_citations(&response_obj, &content);
 
-        let usage = Usage {
-            input_tokens: response_obj.usage.input_tokens,
-            output_tokens: response_obj.usage.output_tokens,
-            cache_read_input_tokens: response_obj
-                .usage
-                .input_tokens_details
-                .as_ref()
-                .map_or(0, |d| d.cached_tokens),
-            cache_write_input_tokens: 0,
-            reasoning_tokens: response_obj
-                .usage
-                .output_tokens_details
-                .as_ref()
-                .map_or(0, |d| d.reasoning_tokens),
-        };
+        let usage = response_obj.usage.to_usage();
 
         let raw = serde_json::to_value(&response_obj).unwrap_or_default();
 
@@ -1062,7 +1077,7 @@ mod tests {
         async fn list_routes(
             &self,
             _: SecurityContext,
-            _: uuid::Uuid,
+            _: Option<uuid::Uuid>,
             _: &ListQuery,
         ) -> Result<Vec<Route>, ServiceGatewayError> {
             unimplemented!()
@@ -1448,6 +1463,44 @@ mod tests {
         assert!(body.get("tools").is_none());
     }
 
+    #[test]
+    fn builder_reasoning_effort_nested_under_reasoning() {
+        let request = llm_request("o3")
+            .message(LlmMessage::user("Think hard"))
+            .additional_params(serde_json::json!({
+                "temperature": 1.0,
+                "reasoning_effort": "high"
+            }))
+            .build_streaming();
+
+        let body = build_request_body(&request, true);
+
+        // Top-level key must be removed
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "reasoning_effort should not appear at top level"
+        );
+        // Must be nested as `reasoning.effort`
+        assert_eq!(body["reasoning"]["effort"], "high");
+        // Other additional_params are still top-level
+        assert_eq!(body["temperature"], 1.0);
+    }
+
+    #[test]
+    fn builder_no_reasoning_key_when_effort_absent() {
+        let request = llm_request("gpt-4o")
+            .message(LlmMessage::user("Hello"))
+            .additional_params(serde_json::json!({
+                "temperature": 0.7
+            }))
+            .build_streaming();
+
+        let body = build_request_body(&request, true);
+
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoning").is_none());
+    }
+
     // ── Unit tests: FromServerEvent ────────────────────────────────────────
 
     #[test]
@@ -1684,14 +1737,23 @@ mod tests {
     fn parse_response_incomplete_event() {
         let event = ServerEvent {
             event: Some("response.incomplete".to_string()),
-            data: r#"{"reason":"max_output_tokens"}"#.to_string(),
+            data: r#"{"response":{"id":"resp-inc","output":[],"usage":{"input_tokens":200,"output_tokens":4096},"incomplete_details":{"reason":"max_output_tokens"}}}"#.to_string(),
             id: None,
             retry: None,
         };
         let result = ProviderEvent::from_server_event(event).unwrap();
-        assert!(
-            matches!(result, ProviderEvent::ResponseIncomplete { reason } if reason == "max_output_tokens")
-        );
+        match result {
+            ProviderEvent::ResponseIncomplete { response } => {
+                assert_eq!(response.id, "resp-inc");
+                assert_eq!(response.usage.input_tokens, 200);
+                assert_eq!(response.usage.output_tokens, 4096);
+                assert_eq!(
+                    response.incomplete_details.as_ref().unwrap().reason,
+                    "max_output_tokens"
+                );
+            }
+            _ => panic!("expected ResponseIncomplete"),
+        }
     }
 
     #[test]
@@ -1865,6 +1927,7 @@ mod tests {
                     input_tokens_details: None,
                     output_tokens_details: None,
                 },
+                incomplete_details: None,
             },
         };
         let translated = translate_provider_event(&event, "Hello");
@@ -1898,6 +1961,7 @@ mod tests {
                         reasoning_tokens: 60,
                     }),
                 },
+                incomplete_details: None,
             },
         };
         let translated = translate_provider_event(&event, "");
@@ -1933,17 +1997,31 @@ mod tests {
     #[test]
     fn translate_incomplete_returns_terminal() {
         let event = ProviderEvent::ResponseIncomplete {
-            reason: "max_output_tokens".into(),
+            response: ResponseObject {
+                id: "resp-inc".into(),
+                output: vec![],
+                usage: RawUsage {
+                    input_tokens: 200,
+                    output_tokens: 4096,
+                    input_tokens_details: None,
+                    output_tokens_details: None,
+                },
+                incomplete_details: Some(IncompleteDetails {
+                    reason: "max_output_tokens".into(),
+                }),
+            },
         };
         let translated = translate_provider_event(&event, "partial");
         match translated {
             TranslatedEvent::Terminal(TerminalOutcome::Incomplete {
                 reason,
+                usage,
                 partial_content,
-                ..
             }) => {
                 assert_eq!(reason, "max_output_tokens");
                 assert_eq!(partial_content, "partial");
+                assert_eq!(usage.input_tokens, 200);
+                assert_eq!(usage.output_tokens, 4096);
             }
             _ => panic!("expected Terminal(Incomplete)"),
         }
@@ -1984,6 +2062,7 @@ mod tests {
                 input_tokens_details: None,
                 output_tokens_details: None,
             },
+            incomplete_details: None,
         };
         let citations = extract_citations(&response, "");
         assert_eq!(citations.len(), 1);
@@ -2020,6 +2099,7 @@ mod tests {
                 input_tokens_details: None,
                 output_tokens_details: None,
             },
+            incomplete_details: None,
         };
         let citations = extract_citations(&response, "");
         assert_eq!(citations.len(), 1);
@@ -2046,6 +2126,7 @@ mod tests {
                 input_tokens_details: None,
                 output_tokens_details: None,
             },
+            incomplete_details: None,
         };
         let citations = extract_citations(&response, "");
         assert!(citations.is_empty());
@@ -2078,6 +2159,7 @@ mod tests {
                 input_tokens_details: None,
                 output_tokens_details: None,
             },
+            incomplete_details: None,
         };
         let citations = extract_citations(&response, accumulated);
         assert_eq!(citations.len(), 1);
@@ -2110,6 +2192,7 @@ mod tests {
                 input_tokens_details: None,
                 output_tokens_details: None,
             },
+            incomplete_details: None,
         };
         let citations = extract_citations(&response, "Hello world");
         assert_eq!(citations.len(), 1);
@@ -2142,6 +2225,7 @@ mod tests {
                 input_tokens_details: None,
                 output_tokens_details: None,
             },
+            incomplete_details: None,
         };
         let citations = extract_citations(&response, "Hello");
         assert_eq!(citations.len(), 1);

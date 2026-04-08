@@ -115,6 +115,8 @@ data:
           secrets:
             - key: "azure-openai-key"
               value: "${AZURE_OPENAI_API_KEY}"
+            - key: "vllm-local-key"
+              value: "local-dev-key"
 
       file-parser:
         config:
@@ -127,6 +129,11 @@ data:
           client_credentials:
             client_id: "mini-chat"
             client_secret: "mini-chat-dev-secret"
+          thread_summary_worker:
+            enabled: true
+            summary_model_id: "gpt-4.1-mini"
+            compression_threshold_pct: 80
+            summary_system_prompt: "You are a conversation summarizer. Given a conversation (and optionally an existing summary), produce a detailed structured summary. Respond with an <analysis> block (your reasoning) followed by a <summary> block (the final summary). Only the <summary> content will be stored. Do not invent information not present in the conversation."
           providers:
             azure_openai:
               kind: openai_responses
@@ -139,6 +146,19 @@ data:
                 header: "api-key"
                 prefix: ""
                 secret_ref: "azure-openai-key"
+            vllm_local:
+              kind: vllm_responses
+              storage_kind: openai
+              host: "127.0.0.1"
+              port: 8000
+              use_http: true
+              upstream_alias: "vllm-local"
+              api_path: "/v1/responses"
+              auth_plugin_type: "gts.x.core.oagw.auth_plugin.v1~x.core.oagw.apikey.v1"
+              auth_config:
+                header: "Authorization"
+                prefix: "Bearer "
+                secret_ref: "vllm-local-key"
 
       static-mini-chat-audit-plugin:
         config:
@@ -160,6 +180,7 @@ data:
               tier: Premium
               enabled: true
               system_prompt: "You are a helpful, concise assistant. Answer clearly and directly."
+              thread_summary_prompt: ""
               multimodal_capabilities: ["VISION_INPUT"]
               context_window: 1047576
               max_output_tokens: 32768
@@ -246,6 +267,7 @@ data:
               tier: Standard
               enabled: true
               system_prompt: "You are a helpful, concise assistant. Answer clearly and directly."
+              thread_summary_prompt: ""
               multimodal_capabilities: ["VISION_INPUT"]
               context_window: 1047576
               max_output_tokens: 32768
@@ -321,9 +343,185 @@ data:
                 is_default: false
                 sort_order: 1
 
+            - model_id: "qwen3-0.6b"
+              provider_model_id: "Qwen/Qwen3-0.6B"
+              display_name: "Qwen3 0.6B (vLLM local)"
+              description: "Local vLLM model for development"
+              version: "3.0"
+              provider_id: "vllm_local"
+              provider_display_name: "vLLM Local"
+              icon: ""
+              tier: Standard
+              enabled: true
+              system_prompt: "You are a helpful, concise assistant. Answer clearly and directly."
+              thread_summary_prompt: ""
+              multimodal_capabilities: []
+              context_window: 40960
+              max_output_tokens: 4096
+              max_input_tokens: 40960
+              input_tokens_credit_multiplier_micro: 0
+              output_tokens_credit_multiplier_micro: 0
+              multiplier_display: "0x"
+              estimation_budgets:
+                bytes_per_token_conservative: 4
+                fixed_overhead_tokens: 100
+                safety_margin_pct: 10
+                image_token_budget: 0
+                tool_surcharge_tokens: 0
+                web_search_surcharge_tokens: 0
+                code_interpreter_surcharge_tokens: 0
+                minimal_generation_floor: 50
+              max_retrieved_chunks_per_turn: 0
+              max_tool_calls: 0
+              general_config:
+                type: ""
+                tier: "standard"
+                available_from: "1970-01-01T00:00:00Z"
+                max_file_size_mb: 0
+                api_params:
+                  temperature: 0.2
+                  top_p: 1.0
+                  frequency_penalty: 0.0
+                  presence_penalty: 0.0
+                  stop: []
+                features:
+                  streaming: true
+                  function_calling: false
+                  structured_output: false
+                  fine_tuning: false
+                  distillation: false
+                  fim_completion: false
+                  chat_prefix_completion: false
+                input_type:
+                  text: true
+                  image: false
+                  audio: false
+                  video: false
+                tool_support:
+                  web_search: false
+                  file_search: false
+                  image_generation: false
+                  code_interpreter: false
+                  computer_use: false
+                  mcp: false
+                supported_endpoints:
+                  chat_completions: true
+                  responses: true
+                  realtime: false
+                  assistants: false
+                  batch_api: false
+                  fine_tuning: false
+                  embeddings: false
+                  videos: false
+                  image_generation: false
+                  image_edit: false
+                  audio_speech_generation: false
+                  audio_transcription: false
+                  audio_translation: false
+                  moderations: false
+                  completions: false
+                token_policy:
+                  input_tokens_credit_multiplier: 0.0
+                  output_tokens_credit_multiplier: 0.0
+                performance:
+                  response_latency_ms: 200
+                  speed_tokens_per_second: 200
+              preference:
+                is_default: false
+                sort_order: 2
+
+            # ── GPT-4.1 Mini with tiny context (E2E thread summary testing) ──
+            - model_id: "gpt-4.1-mini-tiny-ctx"
+              provider_model_id: "gpt-4.1-mini"
+              display_name: "GPT-4.1 Mini (Tiny Context - E2E)"
+              description: "E2E testing model with small context for thread summary trigger"
+              version: "4.1"
+              provider_id: "azure_openai"
+              provider_display_name: "Azure OpenAI"
+              icon: ""
+              tier: Standard
+              enabled: true
+              system_prompt: "You are a helpful assistant. Be verbose - write detailed, long responses with explanations."
+              thread_summary_prompt: ""
+              multimodal_capabilities: ["VISION_INPUT"]
+              context_window: 4096
+              max_output_tokens: 1024
+              max_input_tokens: 3072
+              input_tokens_credit_multiplier_micro: 1000000
+              output_tokens_credit_multiplier_micro: 3000000
+              multiplier_display: "1x"
+              estimation_budgets:
+                bytes_per_token_conservative: 4
+                fixed_overhead_tokens: 100
+                safety_margin_pct: 10
+                image_token_budget: 1000
+                tool_surcharge_tokens: 500
+                web_search_surcharge_tokens: 500
+                code_interpreter_surcharge_tokens: 1000
+                minimal_generation_floor: 50
+              max_retrieved_chunks_per_turn: 5
+              max_tool_calls: 10
+              general_config:
+                type: ""
+                tier: "standard"
+                available_from: "1970-01-01T00:00:00Z"
+                max_file_size_mb: 25
+                api_params:
+                  temperature: 0.7
+                  top_p: 1.0
+                  frequency_penalty: 0.0
+                  presence_penalty: 0.0
+                  stop: []
+                features:
+                  streaming: true
+                  function_calling: true
+                  structured_output: true
+                  fine_tuning: false
+                  distillation: false
+                  fim_completion: false
+                  chat_prefix_completion: false
+                input_type:
+                  text: true
+                  image: true
+                  audio: false
+                  video: false
+                tool_support:
+                  web_search: false
+                  file_search: false
+                  image_generation: false
+                  code_interpreter: false
+                  computer_use: false
+                  mcp: false
+                supported_endpoints:
+                  chat_completions: true
+                  responses: true
+                  realtime: false
+                  assistants: false
+                  batch_api: false
+                  fine_tuning: false
+                  embeddings: false
+                  videos: false
+                  image_generation: false
+                  image_edit: false
+                  audio_speech_generation: false
+                  audio_transcription: false
+                  audio_translation: false
+                  moderations: false
+                  completions: false
+                token_policy:
+                  input_tokens_credit_multiplier: 1.0
+                  output_tokens_credit_multiplier: 3.0
+                performance:
+                  response_latency_ms: 400
+                  speed_tokens_per_second: 150
+              preference:
+                is_default: false
+                sort_order: 99
+
       oagw:
         config:
           proxy_timeout_secs: 60
+          allow_http_upstream: true
 
     opentelemetry:
       tracing:

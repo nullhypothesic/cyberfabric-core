@@ -324,6 +324,18 @@ impl ProviderStream {
             }
         }
 
+        // After the terminal event, drain remaining inner-stream frames so
+        // the upstream HTTP body is fully consumed before the connection is
+        // dropped. This prevents Pingora "Downstream ConnectionClosed"
+        // errors when the provider sends trailing SSE frames after the
+        // terminal event (e.g. response.incomplete → stream close).
+        if self.terminal.is_some() && !self.cancel.is_cancelled() {
+            let _drain = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while self.inner.next().await.is_some() {}
+            })
+            .await;
+        }
+
         match self.terminal {
             Some(terminal) => terminal,
             None if self.cancel.is_cancelled() => TerminalOutcome::Incomplete {
@@ -366,8 +378,12 @@ impl Stream for ProviderStream {
         loop {
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(TranslatedEvent::Sse(event)))) => {
-                    // Accumulate delta text for fallback partial_content
-                    if let ClientSseEvent::Delta { ref content, .. } = event {
+                    // Accumulate only visible text (not reasoning) for DB content.
+                    if let ClientSseEvent::Delta {
+                        r#type: "text",
+                        ref content,
+                    } = event
+                    {
                         this.accumulated_text.push_str(content);
                     }
                     return Poll::Ready(Some(Ok(event)));

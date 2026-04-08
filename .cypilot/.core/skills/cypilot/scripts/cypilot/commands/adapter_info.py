@@ -9,10 +9,10 @@ Shows project root, cypilot directory, rules, systems, and registry status.
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Optional
 
+from ..utils._tomllib_compat import tomllib
 from ..utils.files import (
     find_cypilot_directory,
     find_project_root,
@@ -34,7 +34,6 @@ def _load_json_file(path: Path) -> Optional[dict]:
 def _read_kit_conf(conf_path: Path) -> dict:
     """Read kit conf.toml and return key fields."""
     try:
-        import tomllib
         with open(conf_path, "rb") as f:
             data = tomllib.load(f)
         out: dict = {}
@@ -42,7 +41,7 @@ def _read_kit_conf(conf_path: Path) -> dict:
             if k in data:
                 out[k] = data[k]
         return out
-    except Exception:
+    except (OSError, ValueError):
         return {}
 
 def cmd_adapter_info(argv: list[str]) -> int:
@@ -108,10 +107,9 @@ def cmd_adapter_info(argv: list[str]) -> int:
     registry = _load_json_file(registry_path) if registry_path.suffix == ".json" else None
     if registry is None and registry_path.suffix == ".toml" and registry_path.is_file():
         try:
-            import tomllib
             with open(registry_path, "rb") as f:
                 registry = tomllib.load(f)
-        except Exception:
+        except (OSError, ValueError):
             registry = None
     # Load core.toml for version/project_root/kits (authoritative source)
     core_data: Optional[dict] = None
@@ -119,10 +117,9 @@ def cmd_adapter_info(argv: list[str]) -> int:
     for cp in [(adapter_dir / "config" / "core.toml"), (adapter_dir / "core.toml")]:
         if cp.is_file():
             try:
-                import tomllib as _tl
                 with open(cp, "rb") as f:
-                    core_data = _tl.load(f)
-            except (_tl.TOMLDecodeError, OSError) as exc:
+                    core_data = tomllib.load(f)
+            except (tomllib.TOMLDecodeError, OSError) as exc:
                 core_load_error = f"{type(exc).__name__}: {exc}"
             break
 
@@ -244,7 +241,7 @@ def cmd_adapter_info(argv: list[str]) -> int:
                         ],
                         "systems": [_system_to_dict(s) for s in (getattr(meta, "systems", []) or [])],
                     }
-            except Exception:
+            except (OSError, ValueError, KeyError):
                 expanded = registry
 
         config["artifacts_registry"] = expanded
@@ -391,7 +388,7 @@ def cmd_adapter_info(argv: list[str]) -> int:
             if ws_err:
                 ws_data["error"] = ws_err
             config["workspace"] = ws_data
-    except Exception as exc:
+    except (OSError, ValueError, KeyError) as exc:
         config["workspace"] = {"active": False, "error": str(exc)}
     # @cpt-end:cpt-cypilot-algo-core-infra-display-info:p1:inst-info-workspace-section
 

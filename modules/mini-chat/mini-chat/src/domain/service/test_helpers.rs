@@ -19,8 +19,8 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::models::ResolvedModel;
 use crate::domain::repos::{
-    AttachmentCleanupEvent, ModelResolver, OutboxEnqueuer, PolicySnapshotProvider,
-    ThreadSummaryRepository, UserLimitsProvider,
+    AttachmentCleanupEvent, ChatCleanupEvent, ModelResolver, OutboxEnqueuer,
+    PolicySnapshotProvider, ThreadSummaryRepository, UserLimitsProvider,
 };
 use crate::domain::service::AuditEnvelope;
 
@@ -376,6 +376,19 @@ impl ThreadSummaryRepository for MockThreadSummaryRepo {
     {
         Ok(None)
     }
+
+    async fn upsert_with_cas<C: modkit_db::secure::DBRunner>(
+        &self,
+        _runner: &C,
+        _chat_id: uuid::Uuid,
+        _tenant_id: uuid::Uuid,
+        _expected_base_frontier: Option<&crate::domain::repos::SummaryFrontier>,
+        _new_frontier: &crate::domain::repos::SummaryFrontier,
+        _summary_text: &str,
+        _token_estimate: i32,
+    ) -> Result<u64, crate::domain::error::DomainError> {
+        Ok(1)
+    }
 }
 
 pub fn mock_thread_summary_repo() -> Arc<MockThreadSummaryRepo> {
@@ -458,9 +471,10 @@ pub fn test_catalog_entry(params: TestCatalogEntryParams) -> ModelCatalogEntry {
                 temperature: 0.7,
                 top_p: 1.0,
                 frequency_penalty: 0.0,
-
                 presence_penalty: 0.0,
                 stop: vec![],
+                extra_body: None,
+                reasoning_effort: None,
             },
             features: ModelFeatures {
                 streaming: true,
@@ -779,6 +793,95 @@ pub async fn insert_test_message_attachment(
         .expect("insert test message attachment");
 }
 
+// ── Noop FileStorageProvider ──
+
+/// No-op file storage for tests. All operations succeed immediately.
+#[allow(de0309_must_have_domain_model)]
+pub struct NoopFileStorage;
+
+#[async_trait]
+impl crate::domain::ports::FileStorageProvider for NoopFileStorage {
+    async fn upload_file(
+        &self,
+        _ctx: modkit_security::SecurityContext,
+        _provider_id: &str,
+        _params: crate::domain::ports::UploadFileParams,
+    ) -> Result<(String, u64), crate::domain::ports::FileStorageError> {
+        Ok(("test-file-id".to_owned(), 0))
+    }
+
+    async fn delete_file(
+        &self,
+        _ctx: modkit_security::SecurityContext,
+        _provider_id: &str,
+        _provider_file_id: &str,
+    ) -> Result<(), crate::domain::ports::FileStorageError> {
+        Ok(())
+    }
+}
+
+/// No-op vector store provider for tests.
+#[allow(de0309_must_have_domain_model)]
+pub struct NoopVectorStoreProvider;
+
+#[async_trait]
+impl crate::domain::ports::VectorStoreProvider for NoopVectorStoreProvider {
+    async fn create_vector_store(
+        &self,
+        _ctx: modkit_security::SecurityContext,
+        _provider_id: &str,
+    ) -> Result<String, crate::domain::ports::FileStorageError> {
+        Ok("test-vs-id".to_owned())
+    }
+
+    async fn add_file_to_vector_store(
+        &self,
+        _ctx: modkit_security::SecurityContext,
+        _provider_id: &str,
+        _params: crate::domain::ports::AddFileToVectorStoreParams,
+    ) -> Result<(), crate::domain::ports::FileStorageError> {
+        Ok(())
+    }
+
+    async fn delete_vector_store(
+        &self,
+        _ctx: modkit_security::SecurityContext,
+        _provider_id: &str,
+        _vector_store_id: &str,
+    ) -> Result<(), crate::domain::ports::FileStorageError> {
+        Ok(())
+    }
+}
+
+/// File storage that always fails with a transient error.
+#[allow(de0309_must_have_domain_model)]
+pub struct FailingFileStorage;
+
+#[async_trait]
+impl crate::domain::ports::FileStorageProvider for FailingFileStorage {
+    async fn upload_file(
+        &self,
+        _ctx: modkit_security::SecurityContext,
+        _provider_id: &str,
+        _params: crate::domain::ports::UploadFileParams,
+    ) -> Result<(String, u64), crate::domain::ports::FileStorageError> {
+        Err(crate::domain::ports::FileStorageError::Unavailable {
+            message: "simulated provider failure".to_owned(),
+        })
+    }
+
+    async fn delete_file(
+        &self,
+        _ctx: modkit_security::SecurityContext,
+        _provider_id: &str,
+        _provider_file_id: &str,
+    ) -> Result<(), crate::domain::ports::FileStorageError> {
+        Err(crate::domain::ports::FileStorageError::Unavailable {
+            message: "simulated provider failure".to_owned(),
+        })
+    }
+}
+
 // ── Noop & Recording OutboxEnqueuer ──
 
 /// No-op outbox enqueuer for tests that don't need outbox assertions.
@@ -801,10 +904,24 @@ impl OutboxEnqueuer for NoopOutboxEnqueuer {
     ) -> Result<(), crate::domain::error::DomainError> {
         Ok(())
     }
+    async fn enqueue_chat_cleanup(
+        &self,
+        _runner: &(dyn modkit_db::secure::DBRunner + Sync),
+        _event: ChatCleanupEvent,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        Ok(())
+    }
     async fn enqueue_audit_event(
         &self,
         _runner: &(dyn modkit_db::secure::DBRunner + Sync),
         _event: AuditEnvelope,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        Ok(())
+    }
+    async fn enqueue_thread_summary(
+        &self,
+        _runner: &(dyn modkit_db::secure::DBRunner + Sync),
+        _payload: crate::domain::repos::ThreadSummaryTaskPayload,
     ) -> Result<(), crate::domain::error::DomainError> {
         Ok(())
     }
@@ -816,6 +933,8 @@ impl OutboxEnqueuer for NoopOutboxEnqueuer {
 pub struct RecordingOutboxEnqueuer {
     pub usage_events: Mutex<Vec<mini_chat_sdk::UsageEvent>>,
     pub cleanup_events: Mutex<Vec<AttachmentCleanupEvent>>,
+    pub chat_cleanup_events: Mutex<Vec<ChatCleanupEvent>>,
+    pub thread_summary_payloads: Mutex<Vec<crate::domain::repos::ThreadSummaryTaskPayload>>,
     recorded_audit_events: Mutex<Vec<AuditEnvelope>>,
     recorded_flush_count: AtomicU32,
 }
@@ -825,6 +944,8 @@ impl RecordingOutboxEnqueuer {
         Self {
             usage_events: Mutex::new(Vec::new()),
             cleanup_events: Mutex::new(Vec::new()),
+            chat_cleanup_events: Mutex::new(Vec::new()),
+            thread_summary_payloads: Mutex::new(Vec::new()),
             recorded_audit_events: Mutex::new(Vec::new()),
             recorded_flush_count: AtomicU32::new(0),
         }
@@ -861,12 +982,28 @@ impl OutboxEnqueuer for RecordingOutboxEnqueuer {
         self.cleanup_events.lock().unwrap().push(event);
         Ok(())
     }
+    async fn enqueue_chat_cleanup(
+        &self,
+        _runner: &(dyn modkit_db::secure::DBRunner + Sync),
+        event: ChatCleanupEvent,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        self.chat_cleanup_events.lock().unwrap().push(event);
+        Ok(())
+    }
     async fn enqueue_audit_event(
         &self,
         _runner: &(dyn modkit_db::secure::DBRunner + Sync),
         event: AuditEnvelope,
     ) -> Result<(), crate::domain::error::DomainError> {
         self.recorded_audit_events.lock().unwrap().push(event);
+        Ok(())
+    }
+    async fn enqueue_thread_summary(
+        &self,
+        _runner: &(dyn modkit_db::secure::DBRunner + Sync),
+        payload: crate::domain::repos::ThreadSummaryTaskPayload,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        self.thread_summary_payloads.lock().unwrap().push(payload);
         Ok(())
     }
     fn flush(&self) {
@@ -896,10 +1033,26 @@ impl OutboxEnqueuer for FailingOutboxEnqueuer {
             "simulated outbox enqueue failure".to_owned(),
         ))
     }
+    async fn enqueue_chat_cleanup(
+        &self,
+        _runner: &(dyn modkit_db::secure::DBRunner + Sync),
+        _event: ChatCleanupEvent,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        Err(crate::domain::error::DomainError::database(
+            "simulated outbox enqueue failure".to_owned(),
+        ))
+    }
     async fn enqueue_audit_event(
         &self,
         _runner: &(dyn modkit_db::secure::DBRunner + Sync),
         _event: AuditEnvelope,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        Ok(())
+    }
+    async fn enqueue_thread_summary(
+        &self,
+        _runner: &(dyn modkit_db::secure::DBRunner + Sync),
+        _payload: crate::domain::repos::ThreadSummaryTaskPayload,
     ) -> Result<(), crate::domain::error::DomainError> {
         Ok(())
     }
@@ -1002,7 +1155,7 @@ impl ServiceGatewayClientV1 for MockOagwGateway {
     async fn list_routes(
         &self,
         _: modkit_security::SecurityContext,
-        _: uuid::Uuid,
+        _: Option<uuid::Uuid>,
         _: &oagw_sdk::ListQuery,
     ) -> Result<Vec<oagw_sdk::Route>, ServiceGatewayError> {
         unimplemented!()
@@ -1173,6 +1326,18 @@ impl crate::domain::ports::MiniChatMetricsPort for TestMetrics {
     fn record_code_interpreter_calls(&self, _: &str, _: u32) {
         self.code_interpreter_calls.fetch_add(1, Ordering::Relaxed);
     }
+    fn record_cleanup_completed(&self, _: &str) {}
+    fn record_cleanup_failed(&self, _: &str) {}
+    fn record_cleanup_retry(&self, _: &str, _: &str) {}
+    fn record_cleanup_backlog(&self, _: &str, _: &str, _: i64) {}
+    fn record_cleanup_vs_with_failed_attachments(&self) {}
+    fn record_orphan_detected(&self, _: &str) {}
+    fn record_orphan_finalized(&self, _: &str) {}
+    fn record_orphan_scan_duration_seconds(&self, _: f64) {}
+    fn record_thread_summary_trigger(&self, _: &str) {}
+    fn record_thread_summary_execution(&self, _: &str) {}
+    fn record_thread_summary_cas_conflict(&self) {}
+    fn record_summary_fallback(&self) {}
 }
 
 // ── Mock User Limits Provider ──
