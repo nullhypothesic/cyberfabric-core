@@ -133,14 +133,15 @@ This plugin was extracted from the Credentials Storage microservice (Rust, inter
 
 ### 4.1 In Scope
 
-- Schema CRUD (create, list, get, update, delete)
-- Credential definition CRUD with schema binding, default values, and application access control
-- Credential CRUD with encryption at rest and field-level masking
-- Credential merge/propagation resolution (own → inherited → default)
+- Schema CRUD — create, list, get, update, delete (App)
+- Credential definition CRUD with schema binding, default values, and application access control (App)
+- Credential read with field-level masking (App, Admin)
+- Credential write — create, update, delete with encryption at rest (Admin)
+- Credential merge/propagation resolution — own → inherited → default (App, Admin)
 - Per-tenant encryption key management via pluggable KeyProvider
-- JWT-based authentication for all API endpoints
-- Permission-based authorization for write operations
-- Application-level access control (allowed_app_ids on credential definitions)
+- JWT-based authentication for all API endpoints (App, Admin)
+- Permission-based authorization for credential write operations (Admin)
+- Application-level access control — allowed_app_ids on credential definitions (App)
 
 ### 4.2 Out of Scope
 
