@@ -86,7 +86,7 @@ This plugin was extracted from the Credentials Storage microservice (Rust, inter
 - Encrypt all credentials before storing them in the database so that no secret is ever persisted in plaintext; each tenant's data is cryptographically isolated from other tenants
 - Enable schema-driven credential validation so credential structure is enforced at creation time, reducing runtime errors from malformed credentials by 100%
 - Support credential propagation across tenant hierarchies so child tenants inherit parent credentials without manual duplication
-- Enable key–data separation for production deployments so that a single database compromise does not expose both ciphertext and decryption keys
+- Store encryption keys alongside encrypted data in the same database
 
 ### 1.4 Glossary
 
@@ -144,6 +144,7 @@ This plugin was extracted from the Credentials Storage microservice (Rust, inter
 
 ### 4.2 Out of Scope
 
+- Pluggable external key providers for key–data separation (planned; KeyProvider abstraction accommodates it)
 - Encryption key rotation (planned future capability; KeyProvider abstraction accommodates it)
 - User-scoped credentials (personal secrets per user, similar to Google Colab secrets)
 - Secret versioning or history
