@@ -113,9 +113,9 @@ This plugin was extracted from the Credentials Storage microservice (Rust, inter
 
 ### 2.2 System Actors
 
-#### Constructor Application
+#### CyberFabric Application
 
-**ID**: `cpt-pc-cs-actor-constructor-app`
+**ID**: `cpt-pc-cs-actor-cyberfabric-app`
 
 **Role**: Platform application that retrieves decrypted credential values at runtime. Identified by `application_id` from JWT claims. Access is restricted to credential definitions that include the application in their `allowed_app_ids` list.
 **Needs**: Retrieve decrypted credential values for authorized credential definitions. Credential resolution must traverse the tenant hierarchy transparently.
@@ -125,7 +125,7 @@ This plugin was extracted from the Credentials Storage microservice (Rust, inter
 ### 3.1 Module-Specific Environment Constraints
 
 - The plugin requires a database for persistent storage of schemas, credential definitions, credentials, and tenant keys (when local key storage is active)
-- The plugin requires access to a JWT issuer (Constructor IDP) for authentication
+- The plugin requires access to a JWT issuer (Vendor IDP) for authentication
 - The plugin requires access to the Permission Service for write-operation authorization
 - When external key management is active, the plugin requires network access to the external key service
 
@@ -172,7 +172,7 @@ The system **MUST** encrypt all credential values before persistence. No plainte
 - [ ] `p1` - **ID**: `cpt-pc-cs-fr-auth-jwt`
 
 <!-- cpt-cf-id-content -->
-All API endpoints **MUST** require JWT Bearer token authentication. Tokens **MUST** be validated against JWKS endpoints provided by the Constructor IDP. Identity claims (tenant_id, application_id) **MUST** be extracted and propagated to the service layer.
+All API endpoints **MUST** require JWT Bearer token authentication. Tokens **MUST** be validated against JWKS endpoints provided by the Vendor IDP. Identity claims (tenant_id, application_id) **MUST** be extracted and propagated to the service layer.
 
 **Rationale**: Ensures all API access is authenticated and tenant/application identity is available for authorization and scoping decisions.
 **Actors**: `cpt-pc-cs-actor-tenant-admin`, `cpt-pc-cs-actor-constructor-app`
@@ -306,7 +306,7 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 
 - [ ] `p1` - **ID**: `cpt-pc-cs-contract-jwt-auth`
 
-- **Direction**: required from client (inbound JWT from Constructor IDP)
+- **Direction**: required from client (inbound JWT from Vendor IDP)
 - **Protocol/Format**: HTTPS for JWKS endpoint retrieval; JWT Bearer token on all API requests
 - **Compatibility**: Standard JWKS/JWT; IDP changes to signing keys propagate via JWKS refresh
 
@@ -419,7 +419,7 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 | Dependency | Description | Criticality |
 |------------|-------------|-------------|
 | CredStore Gateway | Parent module that routes requests to this plugin via `CredStorePluginClientV1` trait | `p1` |
-| Constructor IDP | JWT issuer for authentication — provides JWKS endpoints for token validation | `p1` |
+| Vendor IDP | JWT issuer for authentication — provides JWKS endpoints for token validation | `p1` |
 | Permission Service | Authorization — validates `Credential.Manage` permission for write operations | `p1` |
 | Platform Tenant API | Tenant hierarchy information for credential propagation resolution | `p1` |
 | Database (PostgreSQL initially) | Persistent storage for schemas, definitions, credentials, and tenant keys | `p1` |
@@ -428,7 +428,7 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 ## 11. Assumptions
 
 - The CredStore gateway selects this plugin at runtime via GTS configuration; only one storage plugin is active per deployment
-- JWT tokens from Constructor IDP contain `tenant_id` and `application_id` claims
+- JWT tokens from Vendor IDP contain `tenant_id` and `application_id` claims
 - Permission Service is reachable over internal Kubernetes network
 - Tenant hierarchy information is available via platform API
 - Tenant encryption keys are auto-generated on first credential creation for a tenant

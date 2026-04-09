@@ -169,7 +169,7 @@ setup.
 
 - [ ] `p2` - **ID**: `cpt-pc-cs-constraint-platform-integration`
 
-The service must integrate with the Constructor platform ecosystem: JWT tokens from the Constructor IDP, permission
+The service must integrate with the CyberFabric platform ecosystem: JWT tokens from the Vendor IDP, permission
 checks via the Permission Service, and tenant hierarchy from the platform API. All inter-service communication uses
 internal Kubernetes DNS.
 
@@ -192,7 +192,7 @@ budgets, readiness/liveness probes, and graceful shutdown.
 - [ ] `p2` - **ID**: `cpt-pc-cs-constraint-jwt-auth`
 
 All API endpoints require JWT Bearer token authentication. Tokens must be validated against JWKS endpoints provided by
-the Constructor IDP. Identity claims (tenant_id, application_id) must be extracted and propagated to the service layer.
+the Vendor IDP. Identity claims (tenant_id, application_id) must be extracted and propagated to the service layer.
 
 #### Multi-Tenant Hierarchy Support
 
@@ -446,7 +446,7 @@ shared infrastructure.
 | Authentication | Service-specific: Vault token, Kubernetes ServiceAccount, IAM role            |
 | Error Handling | Key Service unavailable blocks all encrypt/decrypt operations; readiness probe reflects KMS connectivity |
 
-#### JWT Issuer (Constructor IDP)
+#### JWT Issuer (Vendor IDP)
 
 | Aspect         | Details                                                                |
 |----------------|------------------------------------------------------------------------|
