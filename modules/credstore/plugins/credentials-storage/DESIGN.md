@@ -397,23 +397,23 @@ shared infrastructure.
 
 **Endpoints Overview**:
 
-| Method   | Path                                | Description                         | Stability |
-|----------|-------------------------------------|-------------------------------------|-----------|
-| `POST`   | `/v1/schemas`                       | Create credential schema            | stable    |
-| `GET`    | `/v1/schemas`                       | List all schemas                    | stable    |
-| `GET`    | `/v1/schemas/{id}`                  | Get schema by ID                    | stable    |
-| `PUT`    | `/v1/schemas/{id}`                  | Update schema                       | stable    |
-| `DELETE` | `/v1/schemas/{id}`                  | Delete schema                       | stable    |
-| `POST`   | `/v1/credential-definitions`        | Create credential definition        | stable    |
-| `GET`    | `/v1/credential-definitions`        | List all definitions                | stable    |
-| `GET`    | `/v1/credential-definitions/{id}`   | Get definition by ID                | stable    |
-| `PUT`    | `/v1/credential-definitions/{id}`   | Update definition                   | stable    |
-| `DELETE` | `/v1/credential-definitions/{id}`   | Delete definition                   | stable    |
-| `POST`   | `/v1/credentials`                   | Create tenant credential            | stable    |
-| `GET`    | `/v1/credentials`                   | List credentials (merged, filtered) | stable    |
-| `GET`    | `/v1/credentials/{definition_name}` | Get credential by definition name   | stable    |
-| `PUT`    | `/v1/credentials/{definition_name}` | Update credential                   | stable    |
-| `DELETE` | `/v1/credentials/{definition_name}` | Delete credential                   | stable    |
+| Method   | Path                            | Description                         | Stability |
+|----------|---------------------------------|-------------------------------------|-----------|
+| `POST`   | `/schemas`                      | Create credential schema            | stable    |
+| `GET`    | `/schemas`                      | List all schemas                    | stable    |
+| `GET`    | `/schemas/{id}`                 | Get schema by ID                    | stable    |
+| `PUT`    | `/schemas/{id}`                 | Update schema                       | stable    |
+| `DELETE` | `/schemas/{id}`                 | Delete schema                       | stable    |
+| `POST`   | `/credential-definitions`       | Create credential definition        | stable    |
+| `GET`    | `/credential-definitions`       | List all definitions                | stable    |
+| `GET`    | `/credential-definitions/{id}`  | Get definition by ID                | stable    |
+| `PUT`    | `/credential-definitions/{id}`  | Update definition                   | stable    |
+| `DELETE` | `/credential-definitions/{id}`  | Delete definition                   | stable    |
+| `POST`   | `/credentials`                  | Create tenant credential            | stable    |
+| `GET`    | `/credentials`                  | List credentials (merged, filtered) | stable    |
+| `GET`    | `/credentials/{definition_name}`| Get credential by definition name   | stable    |
+| `PUT`    | `/credentials/{definition_name}`| Update credential                   | stable    |
+| `DELETE` | `/credentials/{definition_name}`| Delete credential                   | stable    |
 
 ### 3.4 Internal Dependencies
 
@@ -486,7 +486,7 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant EXT as External KMS (optional)
 
-    Admin->>API: POST /v1/credentials (JWT + body)
+    Admin->>API: POST /credentials (JWT + body)
     API->>API: Validate JWT, extract tenant_id
     API->>Perm: Check Credential.Manage permission
     Perm-->>API: Allowed
@@ -536,7 +536,7 @@ sequenceDiagram
     participant Repo as Credentials Repository
     participant DB as PostgreSQL
 
-    App->>API: GET /v1/credentials/{name} (JWT + tenant_id)
+    App->>API: GET /credentials/{name} (JWT + tenant_id)
     API->>API: Validate JWT, extract app_id + tenant_id
     API->>Svc: get_credential(tenant_id, definition_name, app_id)
     Svc->>Repo: get_credential(tenant_id, definition_name)
