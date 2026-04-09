@@ -93,7 +93,7 @@ This plugin was extracted from the Credentials Storage microservice (Rust, inter
 | Term | Definition |
 |------|------------|
 | Schema | A JSON Schema definition that describes the structure of credential values and which fields to mask |
-| Credential Definition | A template binding a schema to an application, with default values and an access control list of allowed applications |
+| Credential Definition | A named configuration that links a schema to a specific application, provides default credential values, and specifies which applications are allowed to access credentials of this type |
 | Credential | A tenant-specific encrypted credential value associated with a credential definition |
 | Tenant Key | A per-tenant encryption key used for credential encryption and decryption |
 | KeyProvider | An abstraction for tenant key management — implementations may store keys locally or delegate to an external service |
