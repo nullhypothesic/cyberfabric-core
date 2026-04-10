@@ -1249,7 +1249,7 @@ All errors follow the platform RFC 9457 Problem Details format. The authoritativ
 | Concern | Disposition | Owning artifact / system | AM-specific note |
 |---------|-------------|--------------------------|------------------|
 | End-user UX and portal workflows | Out of scope | Portal/UI products | AM exposes REST and SDK contracts only. |
-| Token validation, federation, session renewal, MFA | Inherited | [docs/arch/authorization/AUTHN_JWT_OIDC_PLUGIN.md](../../../../docs/arch/authorization/AUTHN_JWT_OIDC_PLUGIN.md), [docs/arch/authorization/DESIGN.md](../../../../docs/arch/authorization/DESIGN.md) | AM trusts the normalized `SecurityContext`; it never validates bearer tokens itself. |
+| Token validation, federation, session renewal, MFA | Inherited | [OIDC AuthN Plugin DESIGN.md](../../authn-resolver/plugins/oidc-authn-plugin/docs/DESIGN.md), [docs/arch/authorization/DESIGN.md](../../../../docs/arch/authorization/DESIGN.md) | AM trusts the normalized `SecurityContext`; it never validates bearer tokens itself. |
 | Compliance program, privacy orchestration, DSAR, legal hold | Inherited with module contribution | [docs/security/SECURITY.md](../../../../docs/security/SECURITY.md) | AM contributes data-minimization, audit hooks, and explicit ownership boundaries, but is not the legal or policy control plane. |
 | API gateway rate limiting and request shaping | Inherited | [docs/modkit_unified_system/README.md](../../../../docs/modkit_unified_system/README.md) | AM relies on shared gateway and framework controls rather than module-specific throttling. |
 | Deployment topology and load balancing | Inherited with AM coordination notes below | Platform runtime and SRE practice | AM only defines bootstrap and recurring-job coordination requirements. |
@@ -1264,7 +1264,7 @@ AM is a control-plane authority for tenant data, not an authentication or author
 
 | Caller / path | Trust boundary at AM | Session / federation owner | Outbound auth expectation |
 |---------------|----------------------|----------------------------|---------------------------|
-| Human administrators using REST APIs | AM receives an already-authenticated `SecurityContext` from the platform AuthN pipeline | Platform AuthN per [AUTHN_JWT_OIDC_PLUGIN.md](../../../../docs/arch/authorization/AUTHN_JWT_OIDC_PLUGIN.md) | None; AM does not mint, refresh, or validate user tokens |
+| Human administrators using REST APIs | AM receives an already-authenticated `SecurityContext` from the platform AuthN pipeline | Platform AuthN per [OIDC AuthN Plugin DESIGN.md](../../authn-resolver/plugins/oidc-authn-plugin/docs/DESIGN.md) | None; AM does not mint, refresh, or validate user tokens |
 | Bootstrap and background jobs | AM treats these as trusted runtime-owned flows and emits `actor=system` where required | Platform runtime and deployment controls | None beyond internal service startup and lifecycle wiring |
 | AM -> IdP provider | AM calls the provider contract; the provider authenticates to its IdP using deployment-managed credentials | Provider implementation and platform secret management | AM must never persist or log raw IdP credentials |
 | AM -> GTS / Resource Group / other platform services | In-process ClientHub or platform-managed service auth | Platform runtime and authorization framework | `SecurityContext` is propagated where the downstream contract requires caller identity; AM does not invent service identities ad hoc |

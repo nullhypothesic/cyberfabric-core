@@ -104,16 +104,16 @@ pub struct SecurityContext {
 
 ### AuthN Resolver
 
-> Source: [`AUTHN_JWT_OIDC_PLUGIN.md`](../arch/authorization/AUTHN_JWT_OIDC_PLUGIN.md) · [ADR-0002](../arch/authorization/ADR/0002-split-authn-authz-resolvers.md) · [ADR-0003](../arch/authorization/ADR/0003-authn-resolver-minimalist-interface.md)
+> Source: [`OIDC AuthN Plugin DESIGN.md`](../../modules/system/authn-resolver/plugins/oidc-authn-plugin/docs/DESIGN.md) · [ADR-0002](../arch/authorization/ADR/0002-split-authn-authz-resolvers.md) · [ADR-0003](../arch/authorization/ADR/0003-authn-resolver-minimalist-interface.md)
 
-Validates bearer tokens (JWT signature verification or introspection), extracts claims, and constructs the `SecurityContext`. AuthN and AuthZ are **split into independent resolver modules** (ADR-0002) with pluggable vendor-specific implementations.
+Validates bearer JWTs via OIDC discovery and JWKS, extracts claims, and constructs the `SecurityContext`. AuthN and AuthZ are **split into independent resolver modules** (ADR-0002) with pluggable vendor-specific implementations.
 
-The **reference OIDC/JWT plugin** supports:
+The current **OIDC AuthN plugin** supports:
 
 - **JWT tokens** — local validation via OIDC discovery → JWKS → signature verification (`kid`, `exp`, optional `aud`), with configurable claim mapping to `SecurityContext` fields.
-- **Opaque tokens** — RFC 7662 introspection with configurable modes: `never` (JWT only), `opaque_only` (default), or `always` (strict revocation checking).
+- **Opaque tokens** — out of scope for this plugin; non-JWT bearer tokens are rejected.
 - **S2S identity** — `exchange_client_credentials` (OAuth2 client credentials grant) for service-to-service calls, producing the same `SecurityContext` pipeline.
-- **Caching** — JWKS and introspection results cached with TTL bounded by `min(token_exp - now, configured_ttl)`.
+- **Caching** — JWKS cached with refresh and bounded stale serving; S2S tokens cached with TTL bounded by `min(token_exp - now, configured_ttl)`.
 
 ### AuthZ Resolver (PDP) — AuthZEN with Constraint Extensions
 

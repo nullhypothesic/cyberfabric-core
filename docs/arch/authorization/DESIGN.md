@@ -511,13 +511,13 @@ For the rationale behind this single-method interface design, see [ADR 0003: Aut
 
 ### Implementation Reference
 
-For a complete implementation of JWT + OIDC authentication (JWT local validation, token introspection, OpenID Connect Discovery), see **[AUTHN_JWT_OIDC_PLUGIN.md](./AUTHN_JWT_OIDC_PLUGIN.md)**.
+For the current OIDC AuthN Resolver plugin design (JWT local validation, OpenID Connect Discovery, JWKS caching, service-to-service token exchange), see **[modules/system/authn-resolver/plugins/oidc-authn-plugin/docs/DESIGN.md](../../../modules/system/authn-resolver/plugins/oidc-authn-plugin/docs/DESIGN.md)**.
 
-This reference implementation covers:
-- JWT and opaque token support
-- Multiple validation modes (`never`, `opaque_only`, `always`)
+This plugin design covers:
+- JWT token validation
 - OpenID Connect Discovery integration
-- JWKS and introspection caching
+- JWKS caching and refresh
+- Service-to-service client credentials exchange
 - Configuration examples for standard OIDC providers
 
 ---
@@ -1467,6 +1467,7 @@ These questions require further design work.
 
 11. **S2S SecurityContext caching** — Modules may call `exchange_client_credentials()` frequently (on every background task iteration, on every inter-module call). Open questions:
     - **TTL strategy** — What default TTL for cached `SecurityContext`? Static plugin has no token expiry (effectively infinite), production plugins depend on OAuth2 token TTL. Proposal: default 5 min, configurable.
+    - **Cache identity** — If credentials and scopes remain request-level inputs, any S2S cache key must include at least `client_id`, normalized scopes, and a non-reversible credential fingerprint. `client_id` alone is insufficient because it can reuse the wrong token across scope or credential changes.
     - **`AuthenticationResult.expires_at`** — Should `AuthenticationResult` include an `expires_at: Option<DateTime>` field so the plugin can communicate token lifetime to the caller? This enables smart caller-side caching without hardcoded TTLs.
     - **`S2sSecurityContextProvider`** — Should there be a standard cached wrapper in the SDK (`authn-resolver-sdk`) that modules use instead of calling `exchange_client_credentials()` directly? Design: ArcSwap-based cache with TTL from `expires_at`, automatic refresh on expiry.
     - **Plugin-level caching** — Production plugins can reuse `modkit-auth::oauth2::Token` handles with auto-refresh internally. Should this be a requirement or recommendation for plugin implementors?
@@ -1477,7 +1478,7 @@ These questions require further design work.
 ## References
 
 ### Authentication
-- [AUTHN_JWT_OIDC_PLUGIN.md](./AUTHN_JWT_OIDC_PLUGIN.md) — JWT + OIDC plugin reference implementation
+- [modules/system/authn-resolver/plugins/oidc-authn-plugin/docs/DESIGN.md](../../../modules/system/authn-resolver/plugins/oidc-authn-plugin/docs/DESIGN.md) — OIDC AuthN Resolver plugin design
 - [RFC 6749: OAuth 2.0 Authorization Framework](https://datatracker.ietf.org/doc/html/rfc6749) (§4.4 Client Credentials Grant — S2S authentication)
 - [RFC 7519: JSON Web Token (JWT)](https://datatracker.ietf.org/doc/html/rfc7519)
 - [RFC 7662: OAuth 2.0 Token Introspection](https://datatracker.ietf.org/doc/html/rfc7662)
