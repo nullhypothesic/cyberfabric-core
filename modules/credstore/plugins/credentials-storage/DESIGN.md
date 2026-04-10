@@ -557,12 +557,17 @@ sequenceDiagram
     end
 
     Svc->>Svc: Verify app_id authorized (owner or in allowed_app_ids)
-    Svc->>KP: get_key(credential.tenant_id)
-    KP-->>Svc: tenant_key
-    Svc->>Crypto: decrypt(encrypted_value, tenant_key)
-    Crypto-->>Svc: decrypted_value
-    Svc-->>API: CredentialView(decrypted, origin)
-    API-->>App: 200 OK (decrypted value + origin metadata)
+
+    alt origin ≠ "Definition"
+        Svc->>KP: get_key(credential.tenant_id)
+        KP-->>Svc: tenant_key
+        Svc->>Crypto: decrypt(encrypted_value, tenant_key)
+        Crypto-->>Svc: decrypted_value
+        Svc-->>API: CredentialView(decrypted, origin)
+    else origin = "Definition"
+        Svc-->>API: CredentialView(default_value, origin)
+    end
+    API-->>App: 200 OK (value + origin metadata)
 ```
 
 **Description**: Application retrieves a credential. The service resolves the value through the merge chain (own →
