@@ -86,7 +86,7 @@ This plugin was extracted from the Credentials Storage microservice (Rust, inter
 - Encrypt all credentials before storing them in the database so that no secret is ever persisted in plaintext; each tenant's data is cryptographically isolated from other tenants
 - Enable schema-driven credential validation so credential structure is enforced at creation time, reducing runtime errors from malformed credentials by 100%
 - Support credential propagation across tenant hierarchies so child tenants inherit parent credentials without manual duplication
-- Store encryption keys alongside encrypted data in the same database
+- Store encryption keys in the same database by default; support external key services via pluggable KeyProvider for production deployments requiring key–data separation
 
 ### 1.4 Glossary
 
