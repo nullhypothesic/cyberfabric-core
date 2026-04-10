@@ -113,9 +113,9 @@ This plugin was extracted from the Credentials Storage microservice (Rust, inter
 
 ### 2.2 System Actors
 
-#### CyberFabric Application
+#### Vendor Application
 
-**ID**: `cpt-pc-cs-actor-cyberfabric-app`
+**ID**: `cpt-pc-cs-actor-vendor-app`
 
 **Role**: Platform application that retrieves decrypted credential values at runtime. Identified by `application_id` from JWT claims. Access is restricted to credential definitions that include the application in their `allowed_app_ids` list.
 **Needs**: Retrieve decrypted credential values for authorized credential definitions. Credential resolution must traverse the tenant hierarchy transparently.
@@ -165,7 +165,7 @@ This plugin was extracted from the Credentials Storage microservice (Rust, inter
 The system **MUST** encrypt all credential values before persistence. No plaintext credential data **MUST** reach the persistence layer.
 
 **Rationale**: Defense-in-depth — even if the database is compromised or SQL injection occurs, credential values remain protected.
-**Actors**: `cpt-pc-cs-actor-tenant-admin`, `cpt-pc-cs-actor-constructor-app`
+**Actors**: `cpt-pc-cs-actor-tenant-admin`, `cpt-pc-cs-actor-vendor-app`
 <!-- cpt-cf-id-content -->
 
 #### JWT Authentication
@@ -176,7 +176,7 @@ The system **MUST** encrypt all credential values before persistence. No plainte
 All API endpoints **MUST** require JWT Bearer token authentication. Tokens **MUST** be validated against JWKS endpoints provided by the Vendor IDP. Identity claims (tenant_id, application_id) **MUST** be extracted and propagated to the service layer.
 
 **Rationale**: Ensures all API access is authenticated and tenant/application identity is available for authorization and scoping decisions.
-**Actors**: `cpt-pc-cs-actor-tenant-admin`, `cpt-pc-cs-actor-constructor-app`
+**Actors**: `cpt-pc-cs-actor-tenant-admin`, `cpt-pc-cs-actor-vendor-app`
 <!-- cpt-cf-id-content -->
 
 #### Permission-Based Authorization
@@ -200,7 +200,7 @@ The system **MUST** validate `Credential.Manage` permission via the external Per
 The system **MUST** resolve credential values through the tenant hierarchy using a three-source merge chain: (1) the tenant's own credential, (2) an inherited credential from a parent tenant (where propagation is enabled), (3) the credential definition's default value. The first available source in this order **MUST** be returned. The response **MUST** indicate the origin of the resolved value.
 
 **Rationale**: Enables parent tenants to share credentials with child tenants without manual duplication, while allowing child tenants to override with their own values.
-**Actors**: `cpt-pc-cs-actor-constructor-app`
+**Actors**: `cpt-pc-cs-actor-vendor-app`
 <!-- cpt-cf-id-content -->
 
 #### Field-Level Masking
@@ -222,7 +222,7 @@ The system **MUST** apply field-level masking to credential values in user-facin
 The system **MUST** return decrypted credential values to authorized applications. Application identity **MUST** be determined from the JWT `application_id` claim. The response path for applications **MUST** differ from the user-facing response path (which returns masked values).
 
 **Rationale**: Applications need the actual credential values to authenticate with external services.
-**Actors**: `cpt-pc-cs-actor-constructor-app`
+**Actors**: `cpt-pc-cs-actor-vendor-app`
 <!-- cpt-cf-id-content -->
 
 #### Application Access Control
@@ -233,7 +233,7 @@ The system **MUST** return decrypted credential values to authorized application
 The system **MUST** enforce application-level access control on credential retrieval. Each credential definition **MUST** specify an `allowed_app_ids` list. Only the owning application and applications in this list **MUST** be permitted to retrieve decrypted credential values. Unauthorized applications **MUST** receive a not-found response.
 
 **Rationale**: Prevents unauthorized applications from accessing credentials outside their scope.
-**Actors**: `cpt-pc-cs-actor-constructor-app`
+**Actors**: `cpt-pc-cs-actor-vendor-app`
 <!-- cpt-cf-id-content -->
 
 ## 6. Non-Functional Requirements
@@ -357,7 +357,7 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 
 - [ ] `p1` - **ID**: `cpt-pc-cs-usecase-app-retrieve-cred`
 
-**Actor**: `cpt-pc-cs-actor-constructor-app`
+**Actor**: `cpt-pc-cs-actor-vendor-app`
 
 **Preconditions**:
 - Application is authenticated with a valid JWT containing application_id and tenant_id
@@ -382,7 +382,7 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 
 - [ ] `p1` - **ID**: `cpt-pc-cs-usecase-credential-inheritance`
 
-**Actor**: `cpt-pc-cs-actor-constructor-app`
+**Actor**: `cpt-pc-cs-actor-vendor-app`
 
 **Preconditions**:
 - Parent tenant has a credential with propagation enabled

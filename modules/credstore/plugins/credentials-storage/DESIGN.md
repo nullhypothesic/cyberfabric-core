@@ -524,7 +524,7 @@ external key management service), encrypts it, generates a masked version, and p
 
 **Use cases**: `cpt-pc-cs-usecase-app-retrieve-cred`, `cpt-pc-cs-usecase-credential-inheritance`
 
-**Actors**: `cpt-pc-cs-actor-constructor-app`
+**Actors**: `cpt-pc-cs-actor-vendor-app`
 
 ```mermaid
 sequenceDiagram
