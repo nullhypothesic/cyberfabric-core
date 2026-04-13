@@ -276,18 +276,6 @@ API responses **MUST** complete within 100ms at p95 under 100 concurrent request
 **Architecture Allocation**: See DESIGN.md for implementation approach
 <!-- cpt-cf-id-content -->
 
-#### Availability
-
-- [ ] `p2` - **ID**: `cpt-pc-cs-nfr-availability`
-
-<!-- cpt-cf-id-content -->
-The service **MUST** maintain 99.9% monthly uptime.
-
-**Threshold**: ≤ 43.8 minutes of downtime per month
-**Rationale**: Credential unavailability blocks all dependent application operations.
-**Architecture Allocation**: See DESIGN.md for implementation approach
-<!-- cpt-cf-id-content -->
-
 ## 7. Public Library Interfaces
 
 ### 7.1 Public API Surface

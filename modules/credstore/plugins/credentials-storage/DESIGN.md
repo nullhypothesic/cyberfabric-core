@@ -66,7 +66,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-pc-cs-nfr-encryption`       | 100% encryption at rest            | Cryptography Service + KeyProvider           | All credential values pass through encrypt() before persistence; no direct DB writes bypass encryption | Integration tests verify no plaintext in DB                                              |
 | `cpt-pc-cs-nfr-tenant-isolation` | Per-tenant cryptographic isolation | KeyProvider + Cryptography Service           | Each tenant has a unique AES-256 key; keys never shared across tenants; keys can be isolated in external KMS | Unit tests verify key uniqueness; integration tests verify cross-tenant decryption fails |
 | `cpt-pc-cs-nfr-response-time`    | p95 ≤ 100ms at 100 concurrent      | All layers                                   | Async I/O via Tokio; connection pooling; in-memory JWKS cache                                          | Load testing with k6 or similar                                                          |
-| `cpt-pc-cs-nfr-availability`     | 99.9% monthly uptime               | Infrastructure + Service Layer               | Kubernetes HPA; readiness/liveness probes; graceful shutdown                                           | Monitoring via OpenTelemetry metrics                                                     |
+
 
 ### 1.3 Architecture Layers
 
