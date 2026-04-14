@@ -693,8 +693,6 @@ graph LR
 
 ## 4. Additional context
 
-- This service was extracted from the monolith Tenant Settings module (Epic APS-1044). The monolith credential
-  management code should be deprecated once migration is complete.
 - User secrets (personal secrets per user, similar to Google Colab secrets) are a planned capability not yet
   implemented. The current data model may need extensions to support user-scoped credentials.
 - Encryption key storage in the application database (`DatabaseKeyProvider`) is suitable for development and
