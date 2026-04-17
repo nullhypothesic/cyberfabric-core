@@ -169,12 +169,14 @@ All persistent data (schemas, definitions, credentials, tenant keys) must be sto
 CyberFabric is database-agnostic; the concrete engine is selected by platform configuration. No alternative storage
 backends (e.g., object stores, in-memory caches) are permitted for primary persistence without a new ADR.
 
-#### Kubernetes Deployment
+#### Horizontal Scalability & Operability
 
-- [ ] `p2` - **ID**: `cpt-pc-cs-constraint-kubernetes`
+- [ ] `p2` - **ID**: `cpt-pc-cs-constraint-scalability`
 
-The service must be deployable on Kubernetes via Helm chart, supporting horizontal pod autoscaling, pod disruption
-budgets, readiness/liveness probes, and graceful shutdown.
+The module must be runnable as stateless, horizontally scalable instances behind a load balancer — with no in-process
+state that prevents scale-out. Instances must expose readiness and liveness signals, support graceful shutdown (drain
+in-flight requests before exit), and tolerate rolling updates without dropped requests. The concrete runtime environment
+(Kubernetes, bare VMs, managed container platforms) is not prescribed; CyberFabric is environment-agnostic.
 
 #### JWT-Based Authentication
 
