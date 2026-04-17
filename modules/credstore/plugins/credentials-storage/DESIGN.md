@@ -161,15 +161,6 @@ knowledge of HTTP or SQL specifics. This separation enables unit testing of busi
 setup.
 
 ### 2.2 Constraints
-
-#### Constructor Platform Integration
-
-- [ ] `p2` - **ID**: `cpt-pc-cs-constraint-platform-integration`
-
-The service must integrate with the CyberFabric platform ecosystem: JWT tokens from the Vendor IDP, permission
-checks via the Permission Service, and tenant hierarchy from the platform API. All inter-service communication uses
-internal Kubernetes DNS.
-
 #### Database Persistence
 
 - [ ] `p2` - **ID**: `cpt-pc-cs-constraint-db`
