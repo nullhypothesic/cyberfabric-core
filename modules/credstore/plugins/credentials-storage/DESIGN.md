@@ -73,7 +73,7 @@ Requirements that significantly influence architecture decisions.
 graph TB
     Client["Client (App / Admin)"]
 
-    subgraph "Credentials Storage Service"
+    subgraph "Credentials Storage Module"
         HTTP["HTTP Layer<br/>Axum Endpoints + Middleware"]
         SVC["Service Layer<br/>Business Logic + Crypto"]
         REPO["Repository Layer<br/>SQLx + Sea-Query"]
@@ -81,9 +81,9 @@ graph TB
         KP["KeyProvider Port"]
     end
 
-    PG["PostgreSQL"]
-    IDP["JWT Issuer (IDP)"]
-    PERM["Permission Service"]
+    DB["DB"]
+    AUTHN["AuthN Resolver"]
+    AUTHZ["AuthZ Resolver"]
     EXT_KMS["External Key Service<br/>(Vault / KMS)"]
 
     Client -->|"REST/JSON"| HTTP
@@ -91,11 +91,11 @@ graph TB
     SVC -->|"Queries"| REPO
     SVC -->|"get/create key"| KP
     SVC -.->|"Uses"| DOM
-    REPO -->|"SQL"| PG
-    KP -->|"Local mode"| PG
+    REPO -->|"SQL"| DB
+    KP -->|"Local mode"| DB
     KP -->|"External mode"| EXT_KMS
-    HTTP -->|"JWKS"| IDP
-    HTTP -->|"Permission Check"| PERM
+    HTTP -->|"JWKS"| AUTHN
+    HTTP -->|"Permission Check"| AUTHZ
 ```
 
 | Layer          | Responsibility                                                                      | Technology                     |
