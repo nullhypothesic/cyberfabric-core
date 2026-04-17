@@ -184,7 +184,7 @@ All API endpoints **MUST** require JWT Bearer token authentication. Tokens **MUS
 - [ ] `p1` - **ID**: `cpt-pc-cs-fr-auth-permission`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** validate `Credential.Manage` permission via the external Permission Service before allowing write operations (create, update, delete) on schemas, credential definitions, and credentials.
+The system **MUST** use the CyberFabric authZ (authorization) Permission Service to resolve and validate the `Credential.Manage` permission before allowing write operations (create, update, delete) on schemas, credential definitions, and credentials.
 
 **Rationale**: Enforces least-privilege access control for mutating operations.
 **Actors**: `cpt-pc-cs-actor-tenant-admin`
