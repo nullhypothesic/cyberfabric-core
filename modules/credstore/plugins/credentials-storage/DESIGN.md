@@ -28,12 +28,13 @@
 
 ### 1.1 Architectural Vision
 
-Credentials Storage is designed as a standalone microservice with a layered hexagonal architecture that isolates domain
-logic from infrastructure concerns. The architecture prioritizes security-by-default: every credential value is
-encrypted before reaching the persistence layer, and access control is enforced at multiple levels — JWT authentication,
-permission-based authorization, and application-level access restrictions.
+Credentials Storage is designed as a self-contained module (deployable as part of the CredStore gateway or as a
+standalone microservice) with a layered hexagonal architecture that isolates domain logic from infrastructure concerns.
+The architecture prioritizes security-by-default: every credential value is encrypted before reaching the persistence
+layer, and access control is enforced at multiple levels — JWT authentication, permission-based authorization, and
+application-level access restrictions.
 
-The service follows a clean separation of concerns across four layers: HTTP endpoints handle request routing and
+The module follows a clean separation of concerns across four layers: HTTP endpoints handle request routing and
 validation, a service layer encapsulates business logic and orchestrates encryption, a repository layer abstracts data
 access, and a domain layer defines core entities free of infrastructure dependencies. This layering enables independent
 testing and evolution of each concern.
