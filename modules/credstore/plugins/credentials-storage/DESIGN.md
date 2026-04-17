@@ -170,12 +170,13 @@ The service must integrate with the CyberFabric platform ecosystem: JWT tokens f
 checks via the Permission Service, and tenant hierarchy from the platform API. All inter-service communication uses
 internal Kubernetes DNS.
 
-#### PostgreSQL Persistence
+#### Database Persistence
 
-- [ ] `p2` - **ID**: `cpt-pc-cs-constraint-postgresql`
+- [ ] `p2` - **ID**: `cpt-pc-cs-constraint-db`
 
-PostgreSQL is the platform-standard database. All persistent data (schemas, definitions, credentials, tenant keys) must
-be stored in PostgreSQL. No alternative databases are permitted without a new ADR.
+All persistent data (schemas, definitions, credentials, tenant keys) must be stored in the platform-provided database.
+CyberFabric is database-agnostic; the concrete engine is selected by platform configuration. No alternative storage
+backends (e.g., object stores, in-memory caches) are permitted for primary persistence without a new ADR.
 
 #### Kubernetes Deployment
 
@@ -418,14 +419,14 @@ shared infrastructure.
 |-------------------|-------------------------------------------|-------------------------------------------------------------------|
 | `authn`           | JWT validation middleware, JWKS caching   | Extract and validate JWT Bearer tokens; provide identity context  |
 | `core-sdk`        | Permission check client                   | Verify `Credential.Manage` permission via Permission Service      |
-| `db-utils`        | Connection pool factory, migration runner | Create PostgreSQL connection pools; run forward-only migrations   |
+| `db-utils`        | Connection pool factory, migration runner | Create DB connection pools; run forward-only migrations           |
 | `http-client`     | HTTP client wrapper                       | Make HTTP calls to Permission Service and other platform services |
 | `telemetry`       | OpenTelemetry provider, health tracker    | Initialize tracing, metrics, and health check infrastructure      |
 | `telemetry-axum`  | Axum middleware                           | Inject tracing spans and request metrics into HTTP layer          |
 
 ### 3.5 External Dependencies
 
-#### PostgreSQL Database
+#### Database
 
 | Aspect                | Details                                                                          |
 |-----------------------|----------------------------------------------------------------------------------|
@@ -480,7 +481,7 @@ sequenceDiagram
     participant KP as KeyProvider
     participant Crypto as Cryptography Service
     participant Repo as Credentials Repository
-    participant DB as PostgreSQL
+    participant DB as Database
     participant EXT as External KMS (optional)
 
     Admin->>API: POST /credentials (JWT + body)
@@ -531,7 +532,7 @@ sequenceDiagram
     participant KP as KeyProvider
     participant Crypto as Cryptography Service
     participant Repo as Credentials Repository
-    participant DB as PostgreSQL
+    participant DB as Database
 
     App->>API: GET /credentials/{name} (JWT + tenant_id)
     API->>API: Validate JWT, extract app_id + tenant_id
@@ -671,11 +672,11 @@ configured to delegate tenant key management to a separate service:
 
 ```mermaid
 graph LR
-    CS["Credentials Storage<br/>Service"]
-    PG["PostgreSQL<br/>(credentials only)"]
+    CS["Credentials Storage<br/>Module"]
+    DB["Database<br/>(credentials only)"]
     KMS["External Key Service<br/>(Vault / KMS)"]
 
-    CS -->|"encrypted credentials"| PG
+    CS -->|"encrypted credentials"| DB
     CS -->|"mTLS"| KMS
 ```
 
@@ -684,7 +685,7 @@ graph LR
   Credentials Storage pods only
 - **Authentication**: Service-to-service authentication (Vault token, Kubernetes SA, IAM role) — credentials for the
   Key Service are injected via Kubernetes Secret and never stored in the application database
-- **Blast radius**: Compromising the PostgreSQL database yields only ciphertext (useless without keys).
+- **Blast radius**: Compromising the database yields only ciphertext (useless without keys).
   Compromising the Key Service yields only keys (useless without ciphertext). Both services must be compromised
   simultaneously to extract plaintext credentials.
 
