@@ -116,7 +116,7 @@ Production multi-tenant deployments require per-tenant cryptographic isolation, 
 
 **ID**: `cpt-pc-cs-actor-vendor-app`
 
-**Role**: Platform application that retrieves decrypted credential values at runtime. Identified by `application_id` from JWT claims. Access is restricted to credential definitions that include the application in their `allowed_app_ids` list.
+**Role**: Platform application that retrieves decrypted credential values at runtime. Identified by `application_id` carried in the `SecurityContext` produced by the CyberFabric AuthN Resolver. Access is restricted to credential definitions that include the application in their `allowed_app_ids` list.
 **Needs**: Retrieve decrypted credential values for authorized credential definitions. Credential resolution must traverse the tenant hierarchy transparently.
 
 ## 3. Operational Concept & Environment
@@ -124,8 +124,8 @@ Production multi-tenant deployments require per-tenant cryptographic isolation, 
 ### 3.1 Module-Specific Environment Constraints
 
 - The plugin requires a database for persistent storage of schemas, credential definitions, credentials, and tenant keys (when local key storage is active)
-- The plugin requires access to a JWT issuer (Vendor IDP) for authentication
-- The plugin requires access to the Permission Service for write-operation authorization
+- The plugin requires access to the CyberFabric AuthN Resolver for authentication (token validation and `SecurityContext` production)
+- The plugin requires access to the CyberFabric AuthZ Resolver for write-operation authorization
 - When external key management is active, the plugin requires network access to the external key service
 
 ## 4. Scope
@@ -138,7 +138,7 @@ Production multi-tenant deployments require per-tenant cryptographic isolation, 
 - Credential write — create, update, delete with encryption at rest (Admin)
 - Credential merge/propagation resolution — own → inherited → default (App, Admin)
 - Per-tenant encryption key management via pluggable KeyProvider
-- JWT-based authentication for all API endpoints (App, Admin)
+- Authentication for all API endpoints via the CyberFabric AuthN Resolver (App, Admin)
 - Permission-based authorization for credential write operations (Admin)
 - Application-level access control — allowed_app_ids on credential definitions (App)
 
@@ -167,14 +167,14 @@ The system **MUST** encrypt all credential values before persistence. No plainte
 **Actors**: `cpt-pc-cs-actor-tenant-admin`, `cpt-pc-cs-actor-vendor-app`
 <!-- cpt-cf-id-content -->
 
-#### JWT Authentication
+#### AuthN Resolver Authentication
 
-- [ ] `p1` - **ID**: `cpt-pc-cs-fr-auth-jwt`
+- [ ] `p1` - **ID**: `cpt-pc-cs-fr-auth-authn`
 
 <!-- cpt-cf-id-content -->
-All API endpoints **MUST** require JWT Bearer token authentication. Tokens **MUST** be validated against JWKS endpoints provided by the Vendor IDP. Identity claims (tenant_id, application_id) **MUST** be extracted and propagated to the service layer.
+All API endpoints **MUST** require an authenticated request. Token validation **MUST** be delegated to the CyberFabric AuthN Resolver. The token format (JWT, opaque, or other) is not prescribed by this module — it is determined by the AuthN Resolver plugin. The module **MUST** consume the resulting `SecurityContext` (`subject_id`, `subject_tenant_id`, `token_scopes`, and `application_id` when present) and propagate it to the service layer.
 
-**Rationale**: Ensures all API access is authenticated and tenant/application identity is available for authorization and scoping decisions.
+**Rationale**: Aligns the module with the CyberFabric AuthN model, keeps token-format concerns inside the resolver, and makes tenant/application identity available for authorization and scoping decisions.
 **Actors**: `cpt-pc-cs-actor-tenant-admin`, `cpt-pc-cs-actor-vendor-app`
 <!-- cpt-cf-id-content -->
 
@@ -183,7 +183,7 @@ All API endpoints **MUST** require JWT Bearer token authentication. Tokens **MUS
 - [ ] `p1` - **ID**: `cpt-pc-cs-fr-auth-permission`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** use the CyberFabric authZ (authorization) Permission Service to resolve and validate the `Credential.Manage` permission before allowing write operations (create, update, delete) on schemas, credential definitions, and credentials.
+The system **MUST** obtain an access decision from the CyberFabric AuthZ Resolver (PDP) for the `Credential.Manage` permission before allowing write operations (create, update, delete) on schemas, credential definitions, and credentials. The module acts as the PEP: it sends the AuthZ request with the authenticated subject, action, resource, and tenant context, and it **MUST** enforce the returned decision (and apply any returned constraints to the target query).
 
 **Rationale**: Enforces least-privilege access control for mutating operations.
 **Actors**: `cpt-pc-cs-actor-tenant-admin`
@@ -218,7 +218,7 @@ The system **MUST** apply field-level masking to credential values in user-facin
 - [ ] `p1` - **ID**: `cpt-pc-cs-fr-credential-decrypt-app`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** return decrypted credential values to authorized applications. Application identity **MUST** be determined from the JWT `application_id` claim. The response path for applications **MUST** differ from the user-facing response path (which returns masked values).
+The system **MUST** return decrypted credential values to authorized applications. Application identity **MUST** be determined from the `application_id` field of the `SecurityContext` produced by the AuthN Resolver. The response path for applications **MUST** differ from the user-facing response path (which returns masked values).
 
 **Rationale**: Applications need the actual credential values to authenticate with external services.
 **Actors**: `cpt-pc-cs-actor-vendor-app`
@@ -285,26 +285,26 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 
 - **Type**: REST API
 - **Stability**: stable
-- **Description**: REST/JSON API for schema CRUD, credential definition CRUD, and credential CRUD with encryption and masking. All endpoints require JWT authentication.
+- **Description**: REST/JSON API for schema CRUD, credential definition CRUD, and credential CRUD with encryption and masking. All endpoints require an authenticated `SecurityContext` produced by the CyberFabric AuthN Resolver.
 - **Breaking Change Policy**: Versioned URL path (`/api/credentials-storage/v1/`); backward-compatible within major version
 
 ### 7.2 External Integration Contracts
 
-#### JWT Authentication Contract
+#### AuthN Resolver Contract
 
-- [ ] `p1` - **ID**: `cpt-pc-cs-contract-jwt-auth`
+- [ ] `p1` - **ID**: `cpt-pc-cs-contract-authn`
 
-- **Direction**: required from client (inbound JWT from Vendor IDP)
-- **Protocol/Format**: HTTPS for JWKS endpoint retrieval; JWT Bearer token on all API requests
-- **Compatibility**: Standard JWKS/JWT; IDP changes to signing keys propagate via JWKS refresh
+- **Direction**: required from client (inbound bearer token from caller; outbound validation call to the CyberFabric AuthN Resolver)
+- **Protocol/Format**: HTTP `Authorization: Bearer <token>` on all API requests; validation delegated to the AuthN Resolver module/plugin (in-process or out-of-process per resolver deployment). Response to the module is a `SecurityContext`.
+- **Compatibility**: Token format (JWT, opaque, other) is owned by the AuthN Resolver plugin; the module depends on the stable `SecurityContext` shape, not on any specific token format.
 
-#### Permission Service Contract
+#### AuthZ Resolver Contract
 
-- [ ] `p1` - **ID**: `cpt-pc-cs-contract-permission-check`
+- [ ] `p1` - **ID**: `cpt-pc-cs-contract-authz`
 
-- **Direction**: required from client (outbound to Permission Service)
-- **Protocol/Format**: HTTP/REST call to platform Permission Service API
-- **Compatibility**: Service-to-service via internal Kubernetes network; Permission Service API changes require plugin update
+- **Direction**: required from client (outbound access-evaluation call to the CyberFabric AuthZ Resolver)
+- **Protocol/Format**: AuthZEN-style access-evaluation request (subject, action, resource, context) delegated to the AuthZ Resolver module/plugin; response is a decision plus optional query-level constraints that the module compiles into its data-access predicates.
+- **Compatibility**: The module depends on the stable AuthZ Resolver request/response contract; vendor-specific policy format and storage are owned by the AuthZ Resolver plugin.
 
 #### Tenant Hierarchy Contract
 
@@ -323,8 +323,8 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 **Actor**: `cpt-pc-cs-actor-tenant-admin`
 
 **Preconditions**:
-- Admin is authenticated with a valid JWT containing tenant_id
-- Admin has `Credential.Manage` permission
+- Admin's request carries a valid `SecurityContext` (produced by the AuthN Resolver) with `subject_tenant_id` set
+- Admin has `Credential.Manage` permission (verified via the AuthZ Resolver)
 
 **Main Flow**:
 1. Admin creates a schema defining the credential structure and masked fields
@@ -347,7 +347,7 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 **Actor**: `cpt-pc-cs-actor-vendor-app`
 
 **Preconditions**:
-- Application is authenticated with a valid JWT containing application_id and tenant_id
+- Application's request carries a valid `SecurityContext` (produced by the AuthN Resolver) with `application_id` and `subject_tenant_id`
 - Application is in the credential definition's allowed_app_ids list (or is the owning application)
 
 **Main Flow**:
@@ -399,25 +399,25 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 - [ ] Applications receive decrypted values; non-application callers receive masked values
 - [ ] Application access control enforces allowed_app_ids — unauthorized apps receive not-found
 - [ ] Credential propagation resolves through the three-source merge chain (own → inherited → default)
-- [ ] All API endpoints require JWT authentication
-- [ ] Write operations require `Credential.Manage` permission
+- [ ] All API endpoints require an authenticated `SecurityContext` produced by the CyberFabric AuthN Resolver
+- [ ] Write operations require a permit decision from the CyberFabric AuthZ Resolver for the `Credential.Manage` permission
 
 ## 10. Dependencies
 
 | Dependency | Description | Criticality |
 |------------|-------------|-------------|
 | CredStore Gateway | Parent module that routes requests to this plugin via `CredStorePluginClientV1` trait | `p1` |
-| Vendor IDP | JWT issuer for authentication — provides JWKS endpoints for token validation | `p1` |
-| Permission Service | Authorization — validates `Credential.Manage` permission for write operations | `p1` |
-| Platform Tenant API | Tenant hierarchy information for credential propagation resolution | `p1` |
-| Database (PostgreSQL initially) | Persistent storage for schemas, definitions, credentials, and tenant keys | `p1` |
+| CyberFabric AuthN Resolver | Authentication — validates bearer tokens and produces `SecurityContext` (token format owned by the resolver plugin) | `p1` |
+| CyberFabric AuthZ Resolver | Authorization (PDP) — returns the access decision and any query-level constraints for the `Credential.Manage` permission on write operations | `p1` |
+| CyberFabric Tenant Resolver | Tenant hierarchy queries for credential propagation resolution (delegates to vendor Tenant Service via plugin) | `p1` |
+| Database | Persistent storage for schemas, definitions, credentials, and tenant keys (concrete engine selected by platform configuration) | `p1` |
 | External Key Service | External key management service (Vault, KMS) for tenant key storage when external KeyProvider is active | `p2` |
 
 ## 11. Assumptions
 
 - The CredStore gateway selects this plugin at runtime via GTS configuration; only one storage plugin is active per deployment
-- JWT tokens from Vendor IDP contain `tenant_id` and `application_id` claims
-- Permission Service is reachable over internal Kubernetes network
+- The `SecurityContext` produced by the CyberFabric AuthN Resolver carries `subject_tenant_id` and, for vendor applications, `application_id`
+- The CyberFabric AuthN Resolver and AuthZ Resolver are reachable from the module (in-process plugin or out-of-process service, per platform deployment)
 - Tenant hierarchy information is available via platform API
 - Tenant encryption keys are auto-generated on first credential creation for a tenant
 - The default KeyProvider stores keys in the same database as credentials; an external KeyProvider is available for production deployments requiring key–data separation
@@ -426,10 +426,10 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| External key service unavailability | All encrypt/decrypt operations blocked when external KeyProvider is active | High-availability key service deployment; readiness probe reflects KMS connectivity; key caching with short TTL |
+| External key service unavailability | All encrypt/decrypt operations blocked when external KeyProvider is active | High-availability key service deployment; readiness signal reflects KMS connectivity; key caching with short TTL |
 | Keys co-located with encrypted data (local KeyProvider) | Single breach exposes both ciphertext and keys | Use external KeyProvider in production multi-tenant deployments; restrict local KeyProvider to development/test |
 | Schema evolution breaks existing credentials | Existing credentials fail validation against updated schema | Schema versioning strategy; backward-compatible schema changes only |
-| Permission Service unavailability | Write operations blocked | Circuit breaker pattern; readiness probe reflects Permission Service connectivity |
+| AuthZ Resolver unavailability | Write operations blocked | Circuit breaker pattern; readiness signal reflects AuthZ Resolver connectivity |
 | Credential propagation depth at deep nesting | Increased latency for credential resolution | Early termination on first resolved value; cache tenant hierarchy queries |
 
 ## 13. Open Questions

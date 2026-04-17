@@ -31,8 +31,8 @@
 Credentials Storage is designed as a self-contained module (deployable as part of the CredStore gateway or as a
 standalone microservice) with a layered hexagonal architecture that isolates domain logic from infrastructure concerns.
 The architecture prioritizes security-by-default: every credential value is encrypted before reaching the persistence
-layer, and access control is enforced at multiple levels — JWT authentication, permission-based authorization, and
-application-level access restrictions.
+layer, and access control is enforced at multiple levels — AuthN-validated identity (via the CyberFabric AuthN Resolver),
+authorization decisions from the CyberFabric AuthZ Resolver, and application-level access restrictions.
 
 
 Tenant encryption key management is abstracted behind a `KeyProvider` port, allowing keys to be stored either locally
@@ -53,8 +53,8 @@ Requirements that significantly influence architecture decisions.
 | `cpt-pc-cs-fr-credential-mask` — Field-level masking                | Schema-driven masking applied at service layer before response construction                          |
 | `cpt-pc-cs-fr-credential-decrypt-app` — Decrypted values for apps   | Separate app/user response paths in endpoint layer with identity-based routing                       |
 | `cpt-pc-cs-fr-definition-allowed-apps` — Application access control | Service-level authorization check against definition's allowed_app_ids list                          |
-| `cpt-pc-cs-fr-auth-jwt` — JWT authentication                        | Axum middleware extracts and validates JWT; identity propagated through request context              |
-| `cpt-pc-cs-fr-auth-permission` — Permission checks                  | Permission middleware calls external Permission Service before write operations                      |
+| `cpt-pc-cs-fr-auth-authn` — AuthN Resolver authentication           | Axum AuthN middleware calls the CyberFabric AuthN Resolver; `SecurityContext` propagated through request context |
+| `cpt-pc-cs-fr-auth-permission` — Permission checks                  | PEP handler calls the CyberFabric AuthZ Resolver (PDP) before write operations and applies returned constraints  |
 
 #### NFR Allocation
 
@@ -62,7 +62,7 @@ Requirements that significantly influence architecture decisions.
 |----------------------------------|------------------------------------|----------------------------------------------|--------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------|
 | `cpt-pc-cs-nfr-encryption`       | 100% encryption at rest            | Cryptography Service + KeyProvider           | All credential values pass through encrypt() before persistence; no direct DB writes bypass encryption | Integration tests verify no plaintext in DB                                              |
 | `cpt-pc-cs-nfr-tenant-isolation` | Per-tenant cryptographic isolation | KeyProvider + Cryptography Service           | Each tenant has a unique AES-256 key; keys never shared across tenants; keys can be isolated in external KMS | Unit tests verify key uniqueness; integration tests verify cross-tenant decryption fails |
-| `cpt-pc-cs-nfr-response-time`    | p95 ≤ 100ms at 100 concurrent      | All layers                                   | Async I/O via Tokio; connection pooling; in-memory JWKS cache                                          | Load testing with k6 or similar                                                          |
+| `cpt-pc-cs-nfr-response-time`    | p95 ≤ 100ms at 100 concurrent      | All layers                                   | Async I/O via Tokio; connection pooling; AuthN/AuthZ Resolver calls reused across requests             | Load testing with k6 or similar                                                          |
 
 
 ### 1.3 Architecture Layers
@@ -87,20 +87,20 @@ graph TB
     EXT_KMS["External Key Service<br/>(Vault / KMS)"]
 
     Client -->|"REST/JSON"| HTTP
-    HTTP -->|"Identity Context"| SVC
+    HTTP -->|"SecurityContext"| SVC
     SVC -->|"Queries"| REPO
     SVC -->|"get/create key"| KP
     SVC -.->|"Uses"| DOM
     REPO -->|"SQL"| DB
     KP -->|"Local mode"| DB
     KP -->|"External mode"| EXT_KMS
-    HTTP -->|"JWKS"| AUTHN
-    HTTP -->|"Permission Check"| AUTHZ
+    HTTP -->|"authenticate"| AUTHN
+    HTTP -->|"access evaluation"| AUTHZ
 ```
 
 | Layer          | Responsibility                                                                      | Technology                     |
 |----------------|-------------------------------------------------------------------------------------|--------------------------------|
-| HTTP           | Request routing, JWT validation, permission middleware, error mapping, OpenAPI docs | Axum 0.8, Tower-HTTP, Utoipa   |
+| HTTP           | Request routing, AuthN middleware (AuthN Resolver call), AuthZ enforcement (AuthZ Resolver call), error mapping, OpenAPI docs | Axum 0.8, Tower-HTTP, Utoipa   |
 | Service        | Business logic, credential merge, encryption/decryption, masking, schema validation | Core Rust, AES-GCM, Serde JSON |
 | Repository     | Data access, query construction, connection management                              | SQLx 0.8, Sea-Query 0.32       |
 | KeyProvider    | Tenant key retrieval and creation; abstracts local DB vs external key service       | Trait-based port (see §3.2)    |
@@ -140,17 +140,18 @@ ciphertext and the keys needed to decrypt it.
 
 - [ ] `p2` - **ID**: `cpt-pc-cs-principle-least-privilege`
 
-Access control is enforced at multiple levels: JWT authentication verifies identity, permission middleware validates
-authorization, and application-level checks verify the caller is authorized for the specific credential definition.
-Users see only masked values; only authorized applications receive decrypted values.
+Access control is enforced at multiple levels: the CyberFabric AuthN Resolver verifies identity and produces a
+`SecurityContext`; the CyberFabric AuthZ Resolver returns the access decision (and optional query-level constraints);
+and application-level checks verify the caller is authorized for the specific credential definition. Users see only
+masked values; only authorized applications receive decrypted values.
 
 #### Defense in Depth
 
 - [ ] `p2` - **ID**: `cpt-pc-cs-principle-defense-in-depth`
 
-Security is layered: network-level (Kubernetes service mesh), transport-level (TLS), authentication (JWT),
-authorization (Permission Service), application-level (allowed_app_ids), and data-level (AES-256-GCM encryption). No
-single layer's failure exposes credentials.
+Security is layered: network-level (transport and network policy as provided by the runtime), transport-level (TLS),
+authentication (CyberFabric AuthN Resolver), authorization (CyberFabric AuthZ Resolver), application-level
+(`allowed_app_ids`), and data-level (AES-256-GCM encryption). No single layer's failure exposes credentials.
 
 #### Clean Architecture
 
@@ -178,12 +179,14 @@ state that prevents scale-out. Instances must expose readiness and liveness sign
 in-flight requests before exit), and tolerate rolling updates without dropped requests. The concrete runtime environment
 (Kubernetes, bare VMs, managed container platforms) is not prescribed; CyberFabric is environment-agnostic.
 
-#### JWT-Based Authentication
+#### AuthN Resolver Authentication
 
-- [ ] `p2` - **ID**: `cpt-pc-cs-constraint-jwt-auth`
+- [ ] `p2` - **ID**: `cpt-pc-cs-constraint-authn`
 
-All API endpoints require JWT Bearer token authentication. Tokens must be validated against JWKS endpoints provided by
-the Vendor IDP. Identity claims (tenant_id, application_id) must be extracted and propagated to the service layer.
+All API endpoints require an authenticated request. The module MUST NOT validate bearer tokens itself; validation is
+delegated to the CyberFabric AuthN Resolver, which produces a `SecurityContext`. Token format (JWT, opaque, or other)
+is determined by the AuthN Resolver plugin. The module propagates `SecurityContext` (`subject_id`, `subject_tenant_id`,
+`token_scopes`, and `application_id` when present) through the request context.
 
 #### Multi-Tenant Hierarchy Support
 
@@ -228,8 +231,8 @@ responses/errors to standard API formats.
 ##### Responsibility scope
 
 Route requests to appropriate service methods. Validate request payloads via deserialization and validator crate.
-Extract JWT identity (tenant_id, application_id) from authentication middleware. Map service errors to HTTP status codes
-and structured error responses. Serve OpenAPI documentation via Swagger UI.
+Read identity (`SecurityContext`) from the AuthN middleware (produced by the CyberFabric AuthN Resolver). Map service
+errors to HTTP status codes and structured error responses. Serve OpenAPI documentation via Swagger UI.
 
 ##### Responsibility boundaries
 
@@ -381,7 +384,7 @@ shared infrastructure.
 
 - [ ] `p2` - **ID**: `cpt-pc-cs-interface-rest-api`
 
-- **Contracts**: `cpt-pc-cs-contract-jwt-auth`, `cpt-pc-cs-contract-permission-check`,
+- **Contracts**: `cpt-pc-cs-contract-authn`, `cpt-pc-cs-contract-authz`,
   `cpt-pc-cs-contract-tenant-hierarchy`
 - **Technology**: REST/OpenAPI
 - **Base Path**: `/api/credentials-storage/v1/`
@@ -410,10 +413,10 @@ shared infrastructure.
 
 | Dependency Module | Interface Used                            | Purpose                                                           |
 |-------------------|-------------------------------------------|-------------------------------------------------------------------|
-| `authn`           | JWT validation middleware, JWKS caching   | Extract and validate JWT Bearer tokens; provide identity context  |
-| `core-sdk`        | Permission check client                   | Verify `Credential.Manage` permission via Permission Service      |
+| `authn`           | AuthN middleware + AuthN Resolver client  | Delegate token validation to the CyberFabric AuthN Resolver; surface `SecurityContext` to handlers |
+| `authz`           | AuthZ Resolver client (PEP helper)        | Build access-evaluation requests; apply the AuthZ Resolver's decision and returned constraints     |
 | `db-utils`        | Connection pool factory, migration runner | Create DB connection pools; run forward-only migrations           |
-| `http-client`     | HTTP client wrapper                       | Make HTTP calls to Permission Service and other platform services |
+| `http-client`     | HTTP client wrapper                       | Make HTTP calls to the AuthN/AuthZ Resolvers (in out-of-process mode) and other platform services  |
 | `telemetry`       | OpenTelemetry provider, health tracker    | Initialize tracing, metrics, and health check infrastructure      |
 | `telemetry-axum`  | Axum middleware                           | Inject tracing spans and request metrics into HTTP layer          |
 
@@ -434,26 +437,26 @@ shared infrastructure.
 |----------------|-------------------------------------------------------------------------------|
 | Purpose        | Tenant encryption key storage and lifecycle when `ExternalKeyProvider` is active. Provides key–data separation for production security posture. |
 | Protocol       | HTTPS/mTLS (Vault HTTP API, AWS KMS API, or custom REST/gRPC)                |
-| Authentication | Service-specific: Vault token, Kubernetes ServiceAccount, IAM role            |
-| Error Handling | Key Service unavailable blocks all encrypt/decrypt operations; readiness probe reflects KMS connectivity |
+| Authentication | Service-specific: Vault token, cloud IAM role, runtime service identity        |
+| Error Handling | Key Service unavailable blocks all encrypt/decrypt operations; readiness signal reflects KMS connectivity |
 
-#### JWT Issuer (Vendor IDP)
+#### CyberFabric AuthN Resolver
 
-| Aspect         | Details                                                                |
-|----------------|------------------------------------------------------------------------|
-| Purpose        | Authentication — issues JWT tokens with tenant and app identity claims |
-| Protocol       | HTTPS for JWKS endpoint retrieval                                      |
-| Authentication | Public key verification via JWKS                                       |
-| Caching        | JWKS results cached in-memory to reduce remote calls                   |
+| Aspect         | Details                                                                                               |
+|----------------|-------------------------------------------------------------------------------------------------------|
+| Purpose        | Authentication — validates the inbound bearer token and returns a `SecurityContext`                   |
+| Protocol       | In-process plugin call or out-of-process gRPC (per resolver deployment mode)                          |
+| Authentication | Same-process trust in-process; mTLS for out-of-process deployments                                    |
+| Token format   | Owned by the AuthN Resolver plugin (JWT, opaque, or other); this module depends on `SecurityContext`  |
 
-#### Permission Service
+#### CyberFabric AuthZ Resolver
 
-| Aspect         | Details                                                                       |
-|----------------|-------------------------------------------------------------------------------|
-| Purpose        | Authorization — validates `Credential.Manage` permission for write operations |
-| Protocol       | HTTP/REST call to platform API                                                |
-| Authentication | Service-to-service via internal Kubernetes network                            |
-| Error Handling | Permission denied returns 403; service unavailable blocks write operations    |
+| Aspect         | Details                                                                                      |
+|----------------|----------------------------------------------------------------------------------------------|
+| Purpose        | Authorization (PDP) — returns the decision and optional query-level constraints for `Credential.Manage` on write operations |
+| Protocol       | In-process plugin call or out-of-process gRPC (AuthZEN-style request/response)               |
+| Authentication | Same-process trust in-process; mTLS for out-of-process deployments                           |
+| Error Handling | Deny decision maps to 403; resolver unavailable blocks write operations                      |
 
 ### 3.6 Interactions & Sequences
 
@@ -469,7 +472,8 @@ shared infrastructure.
 sequenceDiagram
     actor Admin as Tenant Admin
     participant API as HTTP Endpoints
-    participant Perm as Permission Service
+    participant AuthN as AuthN Resolver
+    participant AuthZ as AuthZ Resolver (PDP)
     participant Svc as Credentials Service
     participant KP as KeyProvider
     participant Crypto as Cryptography Service
@@ -477,10 +481,11 @@ sequenceDiagram
     participant DB as Database
     participant EXT as External KMS (optional)
 
-    Admin->>API: POST /credentials (JWT + body)
-    API->>API: Validate JWT, extract tenant_id
-    API->>Perm: Check Credential.Manage permission
-    Perm-->>API: Allowed
+    Admin->>API: POST /credentials (Bearer + body)
+    API->>AuthN: authenticate(bearer_token)
+    AuthN-->>API: SecurityContext (subject_tenant_id, ...)
+    API->>AuthZ: access evaluation (Credential.Manage)
+    AuthZ-->>API: decision = permit
     API->>Svc: create_credential(tenant_id, definition_name, value)
     Svc->>Repo: get_definition(definition_name)
     Repo->>DB: SELECT credential_definition
@@ -505,9 +510,11 @@ sequenceDiagram
     API-->>Admin: 201 Created (masked response)
 ```
 
-**Description**: Administrator creates a credential. The system validates the JWT, checks permissions, validates the
-value against the schema, obtains the tenant's encryption key via the `KeyProvider` port (either from local DB or an
-external key management service), encrypts it, generates a masked version, and persists both encrypted and masked values.
+**Description**: Administrator creates a credential. The AuthN Resolver validates the bearer token and produces a
+`SecurityContext`; the AuthZ Resolver (PDP) returns the access decision for `Credential.Manage`; the service then
+validates the value against the schema, obtains the tenant's encryption key via the `KeyProvider` port (either from
+local DB or an external key management service), encrypts it, generates a masked version, and persists both encrypted
+and masked values.
 
 #### Retrieve Credential with Merge Resolution
 
@@ -521,14 +528,16 @@ external key management service), encrypts it, generates a masked version, and p
 sequenceDiagram
     actor App as Constructor App
     participant API as HTTP Endpoints
+    participant AuthN as AuthN Resolver
     participant Svc as Credentials Service
     participant KP as KeyProvider
     participant Crypto as Cryptography Service
     participant Repo as Credentials Repository
     participant DB as Database
 
-    App->>API: GET /credentials/{name} (JWT + tenant_id)
-    API->>API: Validate JWT, extract app_id + tenant_id
+    App->>API: GET /credentials/{name} (Bearer)
+    API->>AuthN: authenticate(bearer_token)
+    AuthN-->>API: SecurityContext (application_id, subject_tenant_id)
     API->>Svc: get_credential(tenant_id, definition_name, app_id)
     Svc->>Repo: get_credential(tenant_id, definition_name)
     Repo->>DB: SELECT credential WHERE tenant_id AND definition
@@ -579,7 +588,7 @@ inherited → default), verifies application authorization, decrypts the value, 
 | created        | TIMESTAMPTZ  | Creation timestamp                                     |
 | schema         | JSONB        | JSON Schema definition for credential value validation |
 | fields_to_mask | TEXT[]       | Array of field names to mask in user-facing responses  |
-| application_id | UUID         | Owning application ID (from JWT app_id claim)          |
+| application_id | UUID         | Owning application ID (from `SecurityContext.application_id`) |
 
 **PK**: `id`
 **Constraints**: UNIQUE(name), NOT NULL(name, schema, application_id)
@@ -646,17 +655,20 @@ and keys. See `cpt-pc-cs-principle-key-data-separation`.
 
 ### 3.8 Deployment Topology
 
-- [ ] `p3` - **ID**: `cpt-pc-cs-topology-k8s`
+- [ ] `p3` - **ID**: `cpt-pc-cs-topology-deployment`
 
-The service is deployed on Kubernetes as a single Deployment managed by a Helm chart:
+The module runs as one or more stateless instances of a single container/process behind a load balancer. The concrete
+runtime (bare metal, Kubernetes, managed container platform, VMs, etc.) is selected by the operator — CyberFabric does
+not prescribe one.
 
-- **Container image**: Multi-stage Alpine-based Docker image (~20MB runtime)
-- **Ports**: 8080 (REST API), configurable observability port (metrics/health)
-- **Probes**: Liveness and readiness probes on health endpoint
-- **Scaling**: Horizontal Pod Autoscaler (optional), Pod Disruption Budget
-- **Configuration**: Non-sensitive config via ConfigMap, secrets via Kubernetes Secret
-- **Networking**: ClusterIP Service, internal Kubernetes DNS for service discovery
-- **Graceful shutdown**: 30-second termination grace period with connection draining
+- **Packaging**: Small, self-contained deployment artifact (container image or native binary)
+- **Ports**: One HTTP listener for the REST API; a separate listener for metrics and health
+- **Health signals**: Liveness and readiness endpoints probed over HTTP by the runtime
+- **Scaling**: Horizontally scaled stateless instances; operator-managed min/max replicas and disruption policy
+- **Configuration**: Non-sensitive configuration provisioned via the runtime's config mechanism; secrets provisioned
+  via the runtime's secret-injection mechanism (never baked into the image)
+- **Service discovery**: Traffic reaches the module via a load balancer or the runtime's internal service discovery
+- **Graceful shutdown**: Instances drain in-flight requests during a bounded termination window before exit
 
 **Deployment Variant: External Key Service**
 
@@ -673,11 +685,12 @@ graph LR
     CS -->|"mTLS"| KMS
 ```
 
-- **Key Service** runs in a separate security domain (dedicated namespace, network policy, separate access controls)
-- **Network**: mTLS between Credentials Storage and Key Service; network policy restricts Key Service access to
-  Credentials Storage pods only
-- **Authentication**: Service-to-service authentication (Vault token, Kubernetes SA, IAM role) — credentials for the
-  Key Service are injected via Kubernetes Secret and never stored in the application database
+- **Key Service** runs in a separate security domain (isolated network policy or equivalent, separate access controls)
+- **Network**: mTLS between Credentials Storage and the Key Service; network policy restricts Key Service access to
+  Credentials Storage instances only
+- **Authentication**: Service-to-service authentication (Vault token, cloud IAM role, runtime-provided service
+  identity, etc.) — credentials for the Key Service are injected via the runtime's secret mechanism and never stored
+  in the application database
 - **Blast radius**: Compromising the database yields only ciphertext (useless without keys).
   Compromising the Key Service yields only keys (useless without ciphertext). Both services must be compromised
   simultaneously to extract plaintext credentials.
