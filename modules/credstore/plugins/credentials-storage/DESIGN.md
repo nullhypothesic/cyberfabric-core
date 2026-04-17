@@ -34,10 +34,6 @@ The architecture prioritizes security-by-default: every credential value is encr
 layer, and access control is enforced at multiple levels — JWT authentication, permission-based authorization, and
 application-level access restrictions.
 
-The module follows a clean separation of concerns across four layers: HTTP endpoints handle request routing and
-validation, a service layer encapsulates business logic and orchestrates encryption, a repository layer abstracts data
-access, and a domain layer defines core entities free of infrastructure dependencies. This layering enables independent
-testing and evolution of each concern.
 
 Tenant encryption key management is abstracted behind a `KeyProvider` port, allowing keys to be stored either locally
 (in-database, for development and simple deployments) or in a separate, hardened key management service (for production
