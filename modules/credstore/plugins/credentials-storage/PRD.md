@@ -79,7 +79,6 @@ The CredStore gateway supports multiple backend plugins for secret persistence. 
 
 Production multi-tenant deployments require per-tenant cryptographic isolation, defense-in-depth key management, and the ability to separate encryption keys from encrypted data. Existing backends do not natively support schema-driven credential validation, field-level masking for user-facing responses, or application-level access control lists. The Credentials Storage Plugin addresses these gaps by providing a self-contained credential management service with built-in encryption, schema validation, and tenant-aware credential resolution.
 
-This plugin was extracted from the Credentials Storage microservice (Rust, internal Constructor Tech service, Epic APS-1044). The original service's credential management code is to be deprecated once migration is complete.
 
 ### 1.3 Goals (Business Outcomes)
 
