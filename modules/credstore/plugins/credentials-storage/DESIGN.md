@@ -15,10 +15,9 @@
   - [3.1 Domain Model](#31-domain-model)
   - [3.2 Component Model](#32-component-model)
   - [3.3 API Contracts](#33-api-contracts)
-  - [3.4 Internal Dependencies](#34-internal-dependencies)
-  - [3.5 External Dependencies](#35-external-dependencies)
-  - [3.6 Interactions & Sequences](#36-interactions--sequences)
-  - [3.7 Database schemas & tables](#37-database-schemas--tables)
+  - [3.4 External Dependencies](#34-external-dependencies)
+  - [3.5 Interactions & Sequences](#35-interactions--sequences)
+  - [3.6 Database schemas & tables](#36-database-schemas--tables)
 - [4. Additional context](#4-additional-context)
 
 <!-- /toc -->
@@ -408,18 +407,7 @@ shared infrastructure.
 | `PUT`    | `/credentials/{definition_name}`| Update credential                   | stable    |
 | `DELETE` | `/credentials/{definition_name}`| Delete credential                   | stable    |
 
-### 3.4 Internal Dependencies
-
-| Dependency Module | Interface Used                            | Purpose                                                           |
-|-------------------|-------------------------------------------|-------------------------------------------------------------------|
-| `authn`           | AuthN middleware + AuthN Resolver client  | Delegate token validation to the CyberFabric AuthN Resolver; surface `SecurityContext` to handlers |
-| `authz`           | AuthZ Resolver client (PEP helper)        | Build access-evaluation requests; apply the AuthZ Resolver's decision and returned constraints     |
-| `db-utils`        | Connection pool factory, migration runner | Create DB connection pools; run forward-only migrations           |
-| `http-client`     | HTTP client wrapper                       | Make HTTP calls to the AuthN/AuthZ Resolvers (in out-of-process mode) and other platform services  |
-| `telemetry`       | OpenTelemetry provider, health tracker    | Initialize tracing, metrics, and health check infrastructure      |
-| `telemetry-axum`  | Axum middleware                           | Inject tracing spans and request metrics into HTTP layer          |
-
-### 3.5 External Dependencies
+### 3.4 External Dependencies
 
 #### Database
 
@@ -457,7 +445,7 @@ shared infrastructure.
 | Authentication | Same-process trust in-process; mTLS for out-of-process deployments                           |
 | Error Handling | Deny decision maps to 403; resolver unavailable blocks write operations                      |
 
-### 3.6 Interactions & Sequences
+### 3.5 Interactions & Sequences
 
 #### Create Credential with Encryption
 
@@ -572,7 +560,7 @@ sequenceDiagram
 **Description**: Application retrieves a credential. The service resolves the value through the merge chain (own →
 inherited → default), verifies application authorization, decrypts the value, and returns it with origin metadata.
 
-### 3.7 Database schemas & tables
+### 3.6 Database schemas & tables
 
 - [ ] `p3` - **ID**: `cpt-pc-cs-db-main`
 
