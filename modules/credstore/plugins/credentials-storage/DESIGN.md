@@ -14,10 +14,9 @@
 - [3. Technical Architecture](#3-technical-architecture)
   - [3.1 Domain Model](#31-domain-model)
   - [3.2 Component Model](#32-component-model)
-  - [3.3 API Contracts](#33-api-contracts)
-  - [3.4 External Dependencies](#34-external-dependencies)
-  - [3.5 Interactions & Sequences](#35-interactions--sequences)
-  - [3.6 Database schemas & tables](#36-database-schemas--tables)
+  - [3.3 External Dependencies](#33-external-dependencies)
+  - [3.4 Interactions & Sequences](#34-interactions--sequences)
+  - [3.5 Database schemas & tables](#35-database-schemas--tables)
 - [4. Additional context](#4-additional-context)
 
 <!-- /toc -->
@@ -351,36 +350,7 @@ shared infrastructure.
 
 - `cpt-pc-cs-component-services` — infrastructure creates service instances in ApiState
 
-### 3.3 API Contracts
-
-- [ ] `p2` - **ID**: `cpt-pc-cs-interface-rest-api`
-
-- **Contracts**: `cpt-pc-cs-contract-authn`, `cpt-pc-cs-contract-authz`,
-  `cpt-pc-cs-contract-tenant-hierarchy`
-- **Technology**: REST/OpenAPI
-- **Base Path**: `/api/credentials-storage/v1/`
-
-**Endpoints Overview**:
-
-| Method   | Path                            | Description                         | Stability |
-|----------|---------------------------------|-------------------------------------|-----------|
-| `POST`   | `/schemas`                      | Create credential schema            | stable    |
-| `GET`    | `/schemas`                      | List all schemas                    | stable    |
-| `GET`    | `/schemas/{id}`                 | Get schema by ID                    | stable    |
-| `PUT`    | `/schemas/{id}`                 | Update schema                       | stable    |
-| `DELETE` | `/schemas/{id}`                 | Delete schema                       | stable    |
-| `POST`   | `/credential-definitions`       | Create credential definition        | stable    |
-| `GET`    | `/credential-definitions`       | List all definitions                | stable    |
-| `GET`    | `/credential-definitions/{id}`  | Get definition by ID                | stable    |
-| `PUT`    | `/credential-definitions/{id}`  | Update definition                   | stable    |
-| `DELETE` | `/credential-definitions/{id}`  | Delete definition                   | stable    |
-| `POST`   | `/credentials`                  | Create tenant credential            | stable    |
-| `GET`    | `/credentials`                  | List credentials (merged, filtered) | stable    |
-| `GET`    | `/credentials/{definition_name}`| Get credential by definition name   | stable    |
-| `PUT`    | `/credentials/{definition_name}`| Update credential                   | stable    |
-| `DELETE` | `/credentials/{definition_name}`| Delete credential                   | stable    |
-
-### 3.4 External Dependencies
+### 3.3 External Dependencies
 
 #### Database
 
@@ -418,7 +388,7 @@ shared infrastructure.
 | Authentication | Same-process trust in-process; mTLS for out-of-process deployments                           |
 | Error Handling | Deny decision maps to 403; resolver unavailable blocks write operations                      |
 
-### 3.5 Interactions & Sequences
+### 3.4 Interactions & Sequences
 
 #### Create Credential with Encryption
 
@@ -533,7 +503,7 @@ sequenceDiagram
 **Description**: Application retrieves a credential. The service resolves the value through the merge chain (own →
 inherited → default), verifies application authorization, decrypts the value, and returns it with origin metadata.
 
-### 3.6 Database schemas & tables
+### 3.5 Database schemas & tables
 
 - [ ] `p3` - **ID**: `cpt-pc-cs-db-main`
 
