@@ -19,7 +19,6 @@
   - [3.5 External Dependencies](#35-external-dependencies)
   - [3.6 Interactions & Sequences](#36-interactions--sequences)
   - [3.7 Database schemas & tables](#37-database-schemas--tables)
-  - [3.8 Deployment Topology](#38-deployment-topology)
 - [4. Additional context](#4-additional-context)
 
 <!-- /toc -->
@@ -652,48 +651,6 @@ auto-generated when the first credential is created for a tenant.
 **Security note**: In production multi-tenant deployments, the `ExternalKeyProvider` is strongly recommended. Storing
 encryption keys in the same database as encrypted credentials means a single database compromise exposes both ciphertext
 and keys. See `cpt-pc-cs-principle-key-data-separation`.
-
-### 3.8 Deployment Topology
-
-- [ ] `p3` - **ID**: `cpt-pc-cs-topology-deployment`
-
-The module runs as one or more stateless instances of a single container/process behind a load balancer. The concrete
-runtime (bare metal, Kubernetes, managed container platform, VMs, etc.) is selected by the operator — CyberFabric does
-not prescribe one.
-
-- **Packaging**: Small, self-contained deployment artifact (container image or native binary)
-- **Ports**: One HTTP listener for the REST API; a separate listener for metrics and health
-- **Health signals**: Liveness and readiness endpoints probed over HTTP by the runtime
-- **Scaling**: Horizontally scaled stateless instances; operator-managed min/max replicas and disruption policy
-- **Configuration**: Non-sensitive configuration provisioned via the runtime's config mechanism; secrets provisioned
-  via the runtime's secret-injection mechanism (never baked into the image)
-- **Service discovery**: Traffic reaches the module via a load balancer or the runtime's internal service discovery
-- **Graceful shutdown**: Instances drain in-flight requests during a bounded termination window before exit
-
-**Deployment Variant: External Key Service**
-
-In production deployments with cybersecurity requirements for key–data separation, the `ExternalKeyProvider` is
-configured to delegate tenant key management to a separate service:
-
-```mermaid
-graph LR
-    CS["Credentials Storage<br/>Module"]
-    DB["Database<br/>(credentials only)"]
-    KMS["External Key Service<br/>(Vault / KMS)"]
-
-    CS -->|"encrypted credentials"| DB
-    CS -->|"mTLS"| KMS
-```
-
-- **Key Service** runs in a separate security domain (isolated network policy or equivalent, separate access controls)
-- **Network**: mTLS between Credentials Storage and the Key Service; network policy restricts Key Service access to
-  Credentials Storage instances only
-- **Authentication**: Service-to-service authentication (Vault token, cloud IAM role, runtime-provided service
-  identity, etc.) — credentials for the Key Service are injected via the runtime's secret mechanism and never stored
-  in the application database
-- **Blast radius**: Compromising the database yields only ciphertext (useless without keys).
-  Compromising the Key Service yields only keys (useless without ciphertext). Both services must be compromised
-  simultaneously to extract plaintext credentials.
 
 ## 4. Additional context
 
