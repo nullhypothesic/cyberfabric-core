@@ -217,31 +217,6 @@ resolution must traverse the tenant tree from child to parent.
 
 ### 3.2 Component Model
 
-#### HTTP Endpoints
-
-- [ ] `p2` - **ID**: `cpt-pc-cs-component-http-endpoints`
-
-##### Why this component exists
-
-Provides the REST API surface for all credential operations, translating HTTP requests into service calls and mapping
-responses/errors to standard API formats.
-
-##### Responsibility scope
-
-Route requests to appropriate service methods. Validate request payloads via deserialization and validator crate.
-Read identity (`SecurityContext`) from the AuthN middleware (produced by the CyberFabric AuthN Resolver). Map service
-errors to HTTP status codes and structured error responses. Serve OpenAPI documentation via Swagger UI.
-
-##### Responsibility boundaries
-
-Does NOT contain business logic — delegates to service layer. Does NOT access the database directly. Does NOT perform
-encryption/decryption.
-
-##### Related components (by ID)
-
-- `cpt-pc-cs-component-services` — delegates all business operations to service layer
-- `cpt-pc-cs-component-infrastructure` — uses ApiState for dependency injection
-
 #### Services
 
 - [ ] `p2` - **ID**: `cpt-pc-cs-component-services`
@@ -264,7 +239,6 @@ NOT manage database connections.
 
 ##### Related components (by ID)
 
-- `cpt-pc-cs-component-http-endpoints` — called by HTTP layer
 - `cpt-pc-cs-component-repositories` — delegates data persistence
 - `cpt-pc-cs-component-key-provider` — obtains tenant encryption keys for crypto operations
 - `cpt-pc-cs-component-domain` — uses domain entities for business operations
@@ -375,7 +349,6 @@ shared infrastructure.
 
 ##### Related components (by ID)
 
-- `cpt-pc-cs-component-http-endpoints` — infrastructure wires routes into the Axum router
 - `cpt-pc-cs-component-services` — infrastructure creates service instances in ApiState
 
 ### 3.3 API Contracts
