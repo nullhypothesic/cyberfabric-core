@@ -192,7 +192,7 @@ is determined by the AuthN Resolver plugin. The module propagates `SecurityConte
 
 - [ ] `p2` - **ID**: `cpt-pc-cs-constraint-multi-tenant`
 
-The service must support the Constructor platform's hierarchical tenant model for credential propagation. Credential
+The service must support a hierarchical tenant model for credential propagation. Credential
 resolution must traverse the tenant tree from child to parent.
 
 ## 3. Technical Architecture
@@ -526,7 +526,7 @@ and masked values.
 
 ```mermaid
 sequenceDiagram
-    actor App as Constructor App
+    actor App as Vendor App
     participant API as HTTP Endpoints
     participant AuthN as AuthN Resolver
     participant Svc as Credentials Service
