@@ -71,13 +71,13 @@ REQUIREMENT LANGUAGE:
 
 ### 1.1 Purpose
 
-The Credentials Storage Plugin is a backend plugin for the CredStore gateway module that provides encrypted credential storage with schema-driven validation, field-level masking, credential merge/propagation resolution, and pluggable tenant key management. It replaces reliance on external credential backends with a self-contained service that manages the full credential lifecycle internally.
+The Credentials Storage Plugin is a backend plugin for the CredStore gateway module that provides encrypted credential storage with schema-driven validation, credential merge/propagation resolution, and pluggable tenant key management. It replaces reliance on external credential backends with a self-contained service that manages the full credential lifecycle internally.
 
 ### 1.2 Background / Problem Statement
 
 The CredStore gateway supports multiple backend plugins for secret persistence. Existing plugins (VendorA Credstore, OS keychain) delegate encryption and storage to external systems, which limits control over encryption strategy, schema validation, and credential propagation logic.
 
-Production multi-tenant deployments require per-tenant cryptographic isolation, defense-in-depth key management, and the ability to separate encryption keys from encrypted data. Existing backends do not natively support schema-driven credential validation, field-level masking for user-facing responses, or application-level access control lists. The Credentials Storage Plugin addresses these gaps by providing a self-contained credential management service with built-in encryption, schema validation, and tenant-aware credential resolution.
+Production multi-tenant deployments require per-tenant cryptographic isolation, defense-in-depth key management, and the ability to separate encryption keys from encrypted data. Existing backends do not natively support schema-driven credential validation or application-level access control lists. The Credentials Storage Plugin addresses these gaps by providing a self-contained credential management service with built-in encryption, schema validation, and tenant-aware credential resolution.
 
 
 ### 1.3 Goals (Business Outcomes)
@@ -91,13 +91,12 @@ Production multi-tenant deployments require per-tenant cryptographic isolation, 
 
 | Term | Definition |
 |------|------------|
-| Schema | A JSON Schema definition that describes the structure of credential values and which fields to mask |
+| Schema | A JSON Schema definition that describes the structure of credential values |
 | Credential Definition | A named configuration that links a schema to a specific application, provides default credential values, and specifies which applications are allowed to access credentials of this type |
 | Credential | A tenant-specific encrypted credential value associated with a credential definition |
 | Tenant Key | A per-tenant encryption key used for credential encryption and decryption |
 | KeyProvider | An abstraction for tenant key management — implementations may store keys locally or delegate to an external service |
 | Credential Propagation | The process of resolving a credential value through the tenant hierarchy (own → inherited → default) |
-| Field-Level Masking | Replacing sensitive fields in a credential value with masked placeholders in user-facing responses |
 
 ## 2. Actors
 
@@ -134,7 +133,7 @@ Production multi-tenant deployments require per-tenant cryptographic isolation, 
 
 - Schema CRUD — create, list, get, update, delete (App)
 - Credential definition CRUD with schema binding, default values, and application access control (App)
-- Credential read with field-level masking (App, Admin)
+- Credential read (App, Admin)
 - Credential write — create, update, delete with encryption at rest (Admin)
 - Credential merge/propagation resolution — own → inherited → default (App, Admin)
 - Per-tenant encryption key management via pluggable KeyProvider
@@ -202,23 +201,12 @@ The system **MUST** resolve credential values through the tenant hierarchy using
 **Actors**: `cpt-pc-cs-actor-vendor-app`
 <!-- cpt-cf-id-content -->
 
-#### Field-Level Masking
-
-- [ ] `p1` - **ID**: `cpt-pc-cs-fr-credential-mask`
-
-<!-- cpt-cf-id-content -->
-The system **MUST** apply field-level masking to credential values in user-facing responses. Masked fields **MUST** be determined by the schema's `fields_to_mask` configuration. Pre-computed masked values **MUST** be stored alongside encrypted values.
-
-**Rationale**: Tenant admins need to see credential structure and metadata without exposing sensitive field values.
-**Actors**: `cpt-pc-cs-actor-tenant-admin`
-<!-- cpt-cf-id-content -->
-
 #### Decrypted Values for Applications
 
 - [ ] `p1` - **ID**: `cpt-pc-cs-fr-credential-decrypt-app`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** return decrypted credential values to authorized applications. Application identity **MUST** be determined from the `application_id` field of the `SecurityContext` produced by the AuthN Resolver. The response path for applications **MUST** differ from the user-facing response path (which returns masked values).
+The system **MUST** return decrypted credential values to authorized applications. Application identity **MUST** be determined from the `application_id` field of the `SecurityContext` produced by the AuthN Resolver.
 
 **Rationale**: Applications need the actual credential values to authenticate with external services.
 **Actors**: `cpt-pc-cs-actor-vendor-app`
@@ -285,7 +273,7 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 
 - **Type**: REST API
 - **Stability**: stable
-- **Description**: REST/JSON API for schema CRUD, credential definition CRUD, and credential CRUD with encryption and masking. All endpoints require an authenticated `SecurityContext` produced by the CyberFabric AuthN Resolver.
+- **Description**: REST/JSON API for schema CRUD, credential definition CRUD, and credential CRUD with encryption at rest. All endpoints require an authenticated `SecurityContext` produced by the CyberFabric AuthN Resolver.
 - **Breaking Change Policy**: Versioned URL path (`/api/credentials-storage/v1/`); backward-compatible within major version
 
 ### 7.2 External Integration Contracts
@@ -327,14 +315,13 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 - Admin has `Credential.Manage` permission (verified via the AuthZ Resolver)
 
 **Main Flow**:
-1. Admin creates a schema defining the credential structure and masked fields
+1. Admin creates a schema defining the credential structure
 2. Admin creates a credential definition binding the schema to an application, with default values and allowed_app_ids
 3. Admin creates a credential providing a value that validates against the schema
-4. System encrypts the value, generates a masked version, and persists both
-5. Admin retrieves the credential — system returns the masked value
+4. System encrypts the value and persists it
 
 **Postconditions**:
-- Credential is stored encrypted. Admin sees only masked values.
+- Credential is stored encrypted.
 
 **Alternative Flows**:
 - **Schema validation fails**: System rejects the credential with a validation error
@@ -395,8 +382,7 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 - [ ] All credential values are encrypted before persistence — zero plaintext in the database
 - [ ] Each tenant has a unique encryption key — cross-tenant decryption fails
 - [ ] Schema validation rejects credentials that do not match the defined JSON Schema
-- [ ] Field-level masking correctly replaces sensitive fields in user-facing responses
-- [ ] Applications receive decrypted values; non-application callers receive masked values
+- [ ] Applications receive decrypted values for authorized credential definitions
 - [ ] Application access control enforces allowed_app_ids — unauthorized apps receive not-found
 - [ ] Credential propagation resolves through the three-source merge chain (own → inherited → default)
 - [ ] All API endpoints require an authenticated `SecurityContext` produced by the CyberFabric AuthN Resolver

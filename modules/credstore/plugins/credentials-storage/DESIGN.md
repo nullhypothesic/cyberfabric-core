@@ -47,8 +47,7 @@ Requirements that significantly influence architecture decisions.
 |---------------------------------------------------------------------|------------------------------------------------------------------------------------------------------|
 | `cpt-pc-cs-fr-credential-encrypt` — Encrypt all values at rest      | Dedicated cryptography service with AES-256-GCM; per-tenant key management via pluggable KeyProvider  |
 | `cpt-pc-cs-fr-credential-propagate` — Hierarchical propagation      | Credential merge logic in service layer resolves tenant → parent → default chain                     |
-| `cpt-pc-cs-fr-credential-mask` — Field-level masking                | Schema-driven masking applied at service layer before response construction                          |
-| `cpt-pc-cs-fr-credential-decrypt-app` — Decrypted values for apps   | Separate app/user response paths in endpoint layer with identity-based routing                       |
+| `cpt-pc-cs-fr-credential-decrypt-app` — Decrypted values for apps   | Service layer decrypts credentials for authorized applications using the tenant's encryption key      |
 | `cpt-pc-cs-fr-definition-allowed-apps` — Application access control | Service-level authorization check against definition's allowed_app_ids list                          |
 | `cpt-pc-cs-fr-auth-authn` — AuthN Resolver authentication           | Axum AuthN middleware calls the CyberFabric AuthN Resolver; `SecurityContext` propagated through request context |
 | `cpt-pc-cs-fr-auth-permission` — Permission checks                  | PEP handler calls the CyberFabric AuthZ Resolver (PDP) before write operations and applies returned constraints  |
@@ -98,7 +97,7 @@ graph TB
 | Layer          | Responsibility                                                                      | Technology                     |
 |----------------|-------------------------------------------------------------------------------------|--------------------------------|
 | HTTP           | Request routing, AuthN middleware (AuthN Resolver call), AuthZ enforcement (AuthZ Resolver call), error mapping, OpenAPI docs | Axum 0.8, Tower-HTTP, Utoipa   |
-| Service        | Business logic, credential merge, encryption/decryption, masking, schema validation | Core Rust, AES-GCM, Serde JSON |
+| Service        | Business logic, credential merge, encryption/decryption, schema validation | Core Rust, AES-GCM, Serde JSON |
 | Repository     | Data access, query construction, connection management                              | SQLx 0.8, Sea-Query 0.32       |
 | KeyProvider    | Tenant key retrieval and creation; abstracts local DB vs external key service       | Trait-based port (see §3.2)    |
 | Domain         | Core entities (Schema, CredentialDefinition, Credential), value objects, enums      | Pure Rust structs              |
@@ -139,8 +138,7 @@ ciphertext and the keys needed to decrypt it.
 
 Access control is enforced at multiple levels: the CyberFabric AuthN Resolver verifies identity and produces a
 `SecurityContext`; the CyberFabric AuthZ Resolver returns the access decision (and optional query-level constraints);
-and application-level checks verify the caller is authorized for the specific credential definition. Users see only
-masked values; only authorized applications receive decrypted values.
+and application-level checks verify the caller is authorized for the specific credential definition.
 
 #### Defense in Depth
 
@@ -202,9 +200,9 @@ resolution must traverse the tenant tree from child to parent.
 
 | Entity               | Description                                                                                                  |
 |----------------------|--------------------------------------------------------------------------------------------------------------|
-| Schema               | Defines the JSON structure of credential values and which fields to mask. Bound to an application.           |
+| Schema               | Defines the JSON structure of credential values. Bound to an application.                                    |
 | CredentialDefinition | Template binding a schema to an application with default values and access control list.                     |
-| Credential           | An encrypted tenant-specific credential value for a given definition, with masking and propagation metadata. |
+| Credential           | An encrypted tenant-specific credential value for a given definition, with propagation metadata.             |
 | TenantKey            | A per-tenant AES-256-GCM encryption key used for credential encryption and decryption. Managed by the `KeyProvider` port — may reside in local DB or an external key management service. |
 
 **Relationships**:
@@ -212,7 +210,6 @@ resolution must traverse the tenant tree from child to parent.
 - Schema 1→N CredentialDefinition: each definition references one schema for validation
 - CredentialDefinition 1→N Credential: each credential belongs to one definition
 - TenantKey 1→N Credential: each tenant key encrypts all credentials for that tenant (key resolution via `KeyProvider`)
-- Schema → fields_to_mask: schema defines which fields are masked in credential responses
 
 ### 3.2 Component Model
 
@@ -222,14 +219,14 @@ resolution must traverse the tenant tree from child to parent.
 
 ##### Why this component exists
 
-Encapsulates all business logic including credential CRUD orchestration, encryption/decryption, masking, schema
+Encapsulates all business logic including credential CRUD orchestration, encryption/decryption, schema
 validation, and credential merge/propagation resolution.
 
 ##### Responsibility scope
 
-Orchestrate credential lifecycle: validate input against schema, encrypt values, generate masked values, persist via
-repository. Resolve credential merge from three sources (own → inherited → default). Obtain tenant encryption keys via
-`KeyProvider` (auto-generate on first use). Perform cryptographic operations (AES-256-GCM encrypt/decrypt).
+Orchestrate credential lifecycle: validate input against schema, encrypt values, persist via repository. Resolve
+credential merge from three sources (own → inherited → default). Obtain tenant encryption keys via `KeyProvider`
+(auto-generate on first use). Perform cryptographic operations (AES-256-GCM encrypt/decrypt).
 
 ##### Responsibility boundaries
 
@@ -432,19 +429,17 @@ sequenceDiagram
     KP-->>Svc: tenant_key
     Svc->>Crypto: encrypt(value, tenant_key)
     Crypto-->>Svc: encrypted_value
-    Svc->>Svc: Generate masked_value from fields_to_mask
-    Svc->>Repo: insert_credential(encrypted, masked, tenant_id)
+    Svc->>Repo: insert_credential(encrypted, tenant_id)
     Repo->>DB: INSERT credential
     DB-->>Repo: OK
     Svc-->>API: Credential created
-    API-->>Admin: 201 Created (masked response)
+    API-->>Admin: 201 Created
 ```
 
 **Description**: Administrator creates a credential. The AuthN Resolver validates the bearer token and produces a
 `SecurityContext`; the AuthZ Resolver (PDP) returns the access decision for `Credential.Manage`; the service then
 validates the value against the schema, obtains the tenant's encryption key via the `KeyProvider` port (either from
-local DB or an external key management service), encrypts it, generates a masked version, and persists both encrypted
-and masked values.
+local DB or an external key management service), encrypts it, and persists the encrypted value.
 
 #### Retrieve Credential with Merge Resolution
 
@@ -517,7 +512,6 @@ inherited → default), verifies application authorization, decrypts the value, 
 | name           | VARCHAR(255) | Unique schema name (case-insensitive)                  |
 | created        | TIMESTAMPTZ  | Creation timestamp                                     |
 | schema         | JSONB        | JSON Schema definition for credential value validation |
-| fields_to_mask | TEXT[]       | Array of field names to mask in user-facing responses  |
 | application_id | UUID         | Owning application ID (from `SecurityContext.application_id`) |
 
 **PK**: `id`
@@ -551,7 +545,6 @@ application_id)
 | id              | UUID        | Primary key                                              |
 | definition_id   | UUID        | Foreign key to credential_definitions table              |
 | encrypted_value | BYTEA       | AES-256-GCM encrypted credential value (nonce prepended) |
-| masked_value    | JSONB       | Pre-computed masked version for user-facing responses    |
 | propagate       | BOOLEAN     | Whether this credential propagates to child tenants      |
 | tenant_id       | UUID        | Tenant that owns this credential                         |
 | key_id          | UUID        | Foreign key to tenant_keys table (encryption key used)   |
