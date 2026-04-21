@@ -28,8 +28,15 @@
 Credentials Storage is designed as a self-contained module (deployable as part of the CredStore gateway or as a
 standalone microservice) with a layered hexagonal architecture that isolates domain logic from infrastructure concerns.
 The architecture prioritizes security-by-default: every credential value is encrypted before reaching the persistence
-layer, and access control is enforced at multiple levels — AuthN-validated identity (via the CyberFabric AuthN Resolver),
-authorization decisions from the CyberFabric AuthZ Resolver, and application-level access restrictions.
+layer, and access is enforced at multiple levels — AuthN-validated identity (via the CyberFabric AuthN Resolver),
+authorization decisions from the CyberFabric AuthZ Resolver for write operations, and `application_id`-scoped read
+access so callers can only see credentials owned by their own application.
+
+Stage 1 focuses strictly on encrypted storage and tenant-hierarchy propagation for credentials. Credential type
+definitions (formerly modeled as `Schema` and `CredentialDefinition` entities) are delegated to the Global Type System
+(GTS, `https://github.com/GlobalTypeSystem/gts-spec`), which is already the platform's type system for plugin
+registration. Each credential carries an opaque GTS type URI; GTS-backed validation and default-value resolution are
+deferred to stage 2.
 
 
 Tenant encryption key management is abstracted behind a `KeyProvider` port, allowing keys to be stored either locally
@@ -46,9 +53,8 @@ Requirements that significantly influence architecture decisions.
 | Requirement                                                         | Design Response                                                                                      |
 |---------------------------------------------------------------------|------------------------------------------------------------------------------------------------------|
 | `cpt-pc-cs-fr-credential-encrypt` — Encrypt all values at rest      | Dedicated cryptography service with AES-256-GCM; per-tenant key management via pluggable KeyProvider  |
-| `cpt-pc-cs-fr-credential-propagate` — Hierarchical propagation      | Credential merge logic in service layer resolves tenant → parent → default chain                     |
-| `cpt-pc-cs-fr-credential-decrypt-app` — Decrypted values for apps   | Service layer decrypts credentials for authorized applications using the tenant's encryption key      |
-| `cpt-pc-cs-fr-definition-allowed-apps` — Application access control | Service-level authorization check against definition's allowed_app_ids list                          |
+| `cpt-pc-cs-fr-credential-propagate` — Hierarchical propagation      | Credential merge logic in service layer resolves own → inherited chain up the tenant tree            |
+| `cpt-pc-cs-fr-credential-decrypt-app` — Decrypted values for apps   | Service layer decrypts credentials for the owning application using the tenant's encryption key       |
 | `cpt-pc-cs-fr-auth-authn` — AuthN Resolver authentication           | Axum AuthN middleware calls the CyberFabric AuthN Resolver; `SecurityContext` propagated through request context |
 | `cpt-pc-cs-fr-auth-permission` — Permission checks                  | PEP handler calls the CyberFabric AuthZ Resolver (PDP) before write operations and applies returned constraints  |
 
@@ -97,10 +103,10 @@ graph TB
 | Layer          | Responsibility                                                                      | Technology                     |
 |----------------|-------------------------------------------------------------------------------------|--------------------------------|
 | HTTP           | Request routing, AuthN middleware (AuthN Resolver call), AuthZ enforcement (AuthZ Resolver call), error mapping, OpenAPI docs | Axum 0.8, Tower-HTTP, Utoipa   |
-| Service        | Business logic, credential merge, encryption/decryption, schema validation | Core Rust, AES-GCM, Serde JSON |
+| Service        | Business logic, credential merge (own → inherited), encryption/decryption           | Core Rust, AES-GCM, Serde JSON |
 | Repository     | Data access, query construction, connection management                              | SQLx 0.8, Sea-Query 0.32       |
 | KeyProvider    | Tenant key retrieval and creation; abstracts local DB vs external key service       | Trait-based port (see §3.2)    |
-| Domain         | Core entities (Schema, CredentialDefinition, Credential), value objects, enums      | Pure Rust structs              |
+| Domain         | Core entities (Credential, TenantKey), value objects, enums                         | Pure Rust structs              |
 | Infrastructure | Configuration, telemetry, server lifecycle, connection pooling                      | Tokio, OpenTelemetry, Clap     |
 
 ## 2. Principles & Constraints
@@ -138,15 +144,17 @@ ciphertext and the keys needed to decrypt it.
 
 Access control is enforced at multiple levels: the CyberFabric AuthN Resolver verifies identity and produces a
 `SecurityContext`; the CyberFabric AuthZ Resolver returns the access decision (and optional query-level constraints);
-and application-level checks verify the caller is authorized for the specific credential definition.
+and credential lookup is scoped by the caller's `application_id` so callers can only see credentials owned by their
+application.
 
 #### Defense in Depth
 
 - [ ] `p2` - **ID**: `cpt-pc-cs-principle-defense-in-depth`
 
 Security is layered: network-level (transport and network policy as provided by the runtime), transport-level (TLS),
-authentication (CyberFabric AuthN Resolver), authorization (CyberFabric AuthZ Resolver), application-level
-(`allowed_app_ids`), and data-level (AES-256-GCM encryption). No single layer's failure exposes credentials.
+authentication (CyberFabric AuthN Resolver), authorization (CyberFabric AuthZ Resolver), application scoping (credential
+lookup filtered by `SecurityContext.application_id`), and data-level (AES-256-GCM encryption). No single layer's failure
+exposes credentials.
 
 #### Clean Architecture
 
@@ -161,9 +169,10 @@ setup.
 
 - [ ] `p2` - **ID**: `cpt-pc-cs-constraint-db`
 
-All persistent data (schemas, definitions, credentials, tenant keys) must be stored in the platform-provided database.
-CyberFabric is database-agnostic; the concrete engine is selected by platform configuration. No alternative storage
-backends (e.g., object stores, in-memory caches) are permitted for primary persistence without a new ADR.
+All persistent data (credentials and, when `DatabaseKeyProvider` is active, tenant keys) must be stored in the
+platform-provided database. CyberFabric is database-agnostic; the concrete engine is selected by platform configuration.
+No alternative storage backends (e.g., object stores, in-memory caches) are permitted for primary persistence without a
+new ADR.
 
 #### Horizontal Scalability & Operability
 
@@ -198,18 +207,22 @@ resolution must traverse the tenant tree from child to parent.
 
 **Core Entities**:
 
-| Entity               | Description                                                                                                  |
-|----------------------|--------------------------------------------------------------------------------------------------------------|
-| Schema               | Defines the JSON structure of credential values. Bound to an application.                                    |
-| CredentialDefinition | Template binding a schema to an application with default values and access control list.                     |
-| Credential           | An encrypted tenant-specific credential value for a given definition, with propagation metadata.             |
-| TenantKey            | A per-tenant AES-256-GCM encryption key used for credential encryption and decryption. Managed by the `KeyProvider` port — may reside in local DB or an external key management service. |
+| Entity     | Description                                                                                                                                                                           |
+|------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Credential | An encrypted tenant-specific credential value owned by an application, identified by name within that application, with propagation metadata and an opaque GTS type URI.              |
+| TenantKey  | A per-tenant AES-256-GCM encryption key used for credential encryption and decryption. Managed by the `KeyProvider` port — may reside in local DB or an external key management service. |
 
 **Relationships**:
 
-- Schema 1→N CredentialDefinition: each definition references one schema for validation
-- CredentialDefinition 1→N Credential: each credential belongs to one definition
 - TenantKey 1→N Credential: each tenant key encrypts all credentials for that tenant (key resolution via `KeyProvider`)
+
+**Notes on scope**:
+
+Schema and credential-definition concerns (type/shape declaration, default values, application access control lists)
+are out of scope for stage 1. Credential type information is represented as an opaque GTS type URI stored alongside each
+credential; resolving, validating, or propagating that type is delegated to the Global Type System (see
+`https://github.com/GlobalTypeSystem/gts-spec`) and is not performed by this module. Stage 2 will introduce GTS-backed
+validation and default-value resolution.
 
 ### 3.2 Component Model
 
@@ -219,19 +232,20 @@ resolution must traverse the tenant tree from child to parent.
 
 ##### Why this component exists
 
-Encapsulates all business logic including credential CRUD orchestration, encryption/decryption, schema
-validation, and credential merge/propagation resolution.
+Encapsulates all business logic including credential CRUD orchestration, encryption/decryption, credential
+merge/propagation resolution.
 
 ##### Responsibility scope
 
-Orchestrate credential lifecycle: validate input against schema, encrypt values, persist via repository. Resolve
-credential merge from three sources (own → inherited → default). Obtain tenant encryption keys via `KeyProvider`
-(auto-generate on first use). Perform cryptographic operations (AES-256-GCM encrypt/decrypt).
+Orchestrate credential lifecycle: encrypt values, persist via repository. Resolve credential merge from two sources
+(own → inherited) by walking the tenant hierarchy. Obtain tenant encryption keys via `KeyProvider` (auto-generate on
+first use). Perform cryptographic operations (AES-256-GCM encrypt/decrypt).
 
 ##### Responsibility boundaries
 
-Does NOT handle HTTP concerns (routing, status codes). Does NOT construct SQL queries — delegates to repositories. Does
-NOT manage database connections.
+Does NOT validate credential values against their GTS type — the type URI is stored opaquely and validation is
+deferred to stage 2 (delegated to GTS). Does NOT handle HTTP concerns (routing, status codes). Does NOT construct SQL
+queries — delegates to repositories. Does NOT manage database connections.
 
 ##### Related components (by ID)
 
@@ -286,13 +300,14 @@ or database-specific concerns.
 
 ##### Responsibility scope
 
-CRUD operations for schemas, credential definitions, and credentials. Construct type-safe SQL queries via
-Sea-Query. Map database rows to domain entities. Manage transactions where required.
+CRUD operations for credentials. Construct type-safe SQL queries via Sea-Query. Map database rows to domain entities.
+Manage transactions where required.
 
 ##### Responsibility boundaries
 
-Does NOT contain business logic. Does NOT perform encryption — receives already-encrypted data. Does NOT validate
-against JSON schemas. Does NOT manage tenant keys (delegated to `KeyProvider`).
+Does NOT contain business logic. Does NOT perform encryption — receives already-encrypted data. Does NOT resolve or
+validate GTS types — the `gts_type_uri` column is stored and returned opaquely. Does NOT manage tenant keys (delegated
+to `KeyProvider`).
 
 ##### Related components (by ID)
 
@@ -310,8 +325,8 @@ testable and portable.
 
 ##### Responsibility scope
 
-Define Schema, CredentialDefinition, Credential, and TenantKey entities. Define CredentialOrigin enum (Credential,
-Inherited, Definition). Define CredentialView for merged credential representations.
+Define Credential and TenantKey entities. Define CredentialOrigin enum (Credential, Inherited). Define CredentialView
+for merged credential representations.
 
 ##### Responsibility boundaries
 
@@ -353,7 +368,7 @@ shared infrastructure.
 
 | Aspect                | Details                                                                          |
 |-----------------------|----------------------------------------------------------------------------------|
-| Purpose               | Persistent storage for schemas, definitions, and credentials. Tenant keys stored here only when `DatabaseKeyProvider` is active. |
+| Purpose               | Persistent storage for credentials. Tenant keys stored here only when `DatabaseKeyProvider` is active.                           |
 | Protocol              | TCP/SQL via SQLx async driver                                                    |
 | Authentication        | Username/password from environment configuration                                 |
 | Connection Management | Connection pool via `db-utils`; configurable pool size                           |
@@ -410,14 +425,10 @@ sequenceDiagram
 
     Admin->>API: POST /credentials (Bearer + body)
     API->>AuthN: authenticate(bearer_token)
-    AuthN-->>API: SecurityContext (subject_tenant_id, ...)
+    AuthN-->>API: SecurityContext (subject_tenant_id, application_id, ...)
     API->>AuthZ: access evaluation (Credential.Manage)
     AuthZ-->>API: decision = permit
-    API->>Svc: create_credential(tenant_id, definition_name, value)
-    Svc->>Repo: get_definition(definition_name)
-    Repo->>DB: SELECT credential_definition
-    DB-->>Repo: definition + schema
-    Svc->>Svc: Validate value against JSON Schema
+    API->>Svc: create_credential(tenant_id, application_id, name, gts_type_uri, value, propagate)
     Svc->>KP: get_or_create_key(tenant_id)
     alt DatabaseKeyProvider (local mode)
         KP->>DB: SELECT/INSERT tenant_key
@@ -429,7 +440,7 @@ sequenceDiagram
     KP-->>Svc: tenant_key
     Svc->>Crypto: encrypt(value, tenant_key)
     Crypto-->>Svc: encrypted_value
-    Svc->>Repo: insert_credential(encrypted, tenant_id)
+    Svc->>Repo: insert_credential(tenant_id, application_id, name, gts_type_uri, encrypted, propagate)
     Repo->>DB: INSERT credential
     DB-->>Repo: OK
     Svc-->>API: Credential created
@@ -437,9 +448,10 @@ sequenceDiagram
 ```
 
 **Description**: Administrator creates a credential. The AuthN Resolver validates the bearer token and produces a
-`SecurityContext`; the AuthZ Resolver (PDP) returns the access decision for `Credential.Manage`; the service then
-validates the value against the schema, obtains the tenant's encryption key via the `KeyProvider` port (either from
-local DB or an external key management service), encrypts it, and persists the encrypted value.
+`SecurityContext`; the AuthZ Resolver (PDP) returns the access decision for `Credential.Manage`; the service obtains
+the tenant's encryption key via the `KeyProvider` port (either from local DB or an external key management service),
+encrypts the value, and persists it together with its opaque `gts_type_uri`. Type validation against the GTS type is
+deferred to stage 2.
 
 #### Retrieve Credential with Merge Resolution
 
@@ -463,96 +475,61 @@ sequenceDiagram
     App->>API: GET /credentials/{name} (Bearer)
     API->>AuthN: authenticate(bearer_token)
     AuthN-->>API: SecurityContext (application_id, subject_tenant_id)
-    API->>Svc: get_credential(tenant_id, definition_name, app_id)
-    Svc->>Repo: get_credential(tenant_id, definition_name)
-    Repo->>DB: SELECT credential WHERE tenant_id AND definition
+    API->>Svc: get_credential(tenant_id, application_id, name)
+    Svc->>Repo: get_credential(tenant_id, application_id, name)
+    Repo->>DB: SELECT credential WHERE tenant_id AND application_id AND name
     DB-->>Repo: credential or NULL
 
     alt Credential found for tenant
         Svc->>Svc: origin = "Credential"
-    else No credential — check parent
-        Svc->>Repo: get_propagated_credential(parent_tenant_id, definition)
-        Repo->>DB: SELECT credential WHERE parent AND propagate=true
+    else No credential — walk up tenant ancestry
+        Svc->>Repo: get_propagated_credential(ancestor_tenant_ids, application_id, name)
+        Repo->>DB: SELECT credential WHERE tenant_id IN ancestors AND application_id AND name AND propagate=true
         DB-->>Repo: inherited credential or NULL
         alt Inherited credential found
             Svc->>Svc: origin = "Inherited"
-        else No inherited — use default
-            Svc->>Svc: Use definition.default_value, origin = "Definition"
+        else No inherited
+            Svc-->>API: 404 Not Found
         end
     end
 
-    Svc->>Svc: Verify app_id authorized (owner or in allowed_app_ids)
-
-    alt origin ≠ "Definition"
-        Svc->>KP: get_key(credential.tenant_id)
-        KP-->>Svc: tenant_key
-        Svc->>Crypto: decrypt(encrypted_value, tenant_key)
-        Crypto-->>Svc: decrypted_value
-        Svc-->>API: CredentialView(decrypted, origin)
-    else origin = "Definition"
-        Svc-->>API: CredentialView(default_value, origin)
-    end
-    API-->>App: 200 OK (value + origin metadata)
+    Svc->>KP: get_key(credential.tenant_id)
+    KP-->>Svc: tenant_key
+    Svc->>Crypto: decrypt(encrypted_value, tenant_key)
+    Crypto-->>Svc: decrypted_value
+    Svc-->>API: CredentialView(decrypted, origin, gts_type_uri)
+    API-->>App: 200 OK (value + origin + gts_type_uri)
 ```
 
-**Description**: Application retrieves a credential. The service resolves the value through the merge chain (own →
-inherited → default), verifies application authorization, decrypts the value, and returns it with origin metadata.
+**Description**: Application retrieves a credential. Credential lookup is scoped by `application_id` from the
+`SecurityContext`, so callers only see credentials owned by their application. The service resolves the value through
+the two-source merge chain (own → inherited by walking the tenant ancestry for credentials with `propagate=true`),
+decrypts with the owning tenant's key, and returns the value together with its origin and opaque `gts_type_uri`. If no
+value is found at either level the response is 404 — default-value fallback is deferred to stage 2 (delegated to GTS).
 
 ### 3.5 Database schemas & tables
 
 - [ ] `p3` - **ID**: `cpt-pc-cs-db-main`
 
-#### Table: schemas
-
-**ID**: `cpt-pc-cs-dbtable-schemas`
-
-| Column         | Type         | Description                                            |
-|----------------|--------------|--------------------------------------------------------|
-| id             | UUID         | Primary key                                            |
-| name           | VARCHAR(255) | Unique schema name (case-insensitive)                  |
-| created        | TIMESTAMPTZ  | Creation timestamp                                     |
-| schema         | JSONB        | JSON Schema definition for credential value validation |
-| application_id | UUID         | Owning application ID (from `SecurityContext.application_id`) |
-
-**PK**: `id`
-**Constraints**: UNIQUE(name), NOT NULL(name, schema, application_id)
-
-#### Table: credential_definitions
-
-**ID**: `cpt-pc-cs-dbtable-definitions`
-
-| Column          | Type         | Description                                                 |
-|-----------------|--------------|-------------------------------------------------------------|
-| id              | UUID         | Primary key                                                 |
-| name            | VARCHAR(255) | Definition name (unique per application, case-insensitive)  |
-| description     | TEXT         | Human-readable description                                  |
-| schema_id       | UUID         | Foreign key to schemas table                                |
-| created         | TIMESTAMPTZ  | Creation timestamp                                          |
-| default_value   | JSONB        | Default credential value (validated against schema)         |
-| application_id  | UUID         | Owning application ID                                       |
-| allowed_app_ids | UUID[]       | Array of application IDs authorized to retrieve credentials |
-
-**PK**: `id`
-**Constraints**: UNIQUE(name, application_id), FK(schema_id → schemas.id), NOT NULL(name, schema_id, default_value,
-application_id)
-
 #### Table: credentials
 
 **ID**: `cpt-pc-cs-dbtable-credentials`
 
-| Column          | Type        | Description                                              |
-|-----------------|-------------|----------------------------------------------------------|
-| id              | UUID        | Primary key                                              |
-| definition_id   | UUID        | Foreign key to credential_definitions table              |
-| encrypted_value | BYTEA       | AES-256-GCM encrypted credential value (nonce prepended) |
-| propagate       | BOOLEAN     | Whether this credential propagates to child tenants      |
-| tenant_id       | UUID        | Tenant that owns this credential                         |
-| key_id          | UUID        | Foreign key to tenant_keys table (encryption key used)   |
-| created         | TIMESTAMPTZ | Creation timestamp                                       |
+| Column          | Type         | Description                                                                                              |
+|-----------------|--------------|----------------------------------------------------------------------------------------------------------|
+| id              | UUID         | Primary key                                                                                              |
+| tenant_id       | UUID         | Tenant that owns this credential                                                                         |
+| application_id  | UUID         | Owning application ID (from `SecurityContext.application_id` at creation time)                           |
+| name            | VARCHAR(255) | Credential name (unique per tenant + application, case-insensitive)                                      |
+| gts_type_uri    | TEXT         | Opaque GTS type URI describing the credential value's type (not interpreted or validated by this module) |
+| encrypted_value | BYTEA        | AES-256-GCM encrypted credential value (nonce prepended)                                                 |
+| propagate       | BOOLEAN      | Whether this credential propagates to child tenants                                                      |
+| key_id          | UUID         | Foreign key to tenant_keys table (encryption key used)                                                   |
+| created         | TIMESTAMPTZ  | Creation timestamp                                                                                       |
 
 **PK**: `id`
-**Constraints**: UNIQUE(tenant_id, definition_id), FK(definition_id → credential_definitions.id), FK(key_id →
-tenant_keys.id), NOT NULL(definition_id, encrypted_value, tenant_id, key_id)
+**Constraints**: UNIQUE(tenant_id, application_id, name), FK(key_id → tenant_keys.id), NOT NULL(tenant_id,
+application_id, name, gts_type_uri, encrypted_value, key_id)
 
 #### Table: tenant_keys
 
@@ -578,6 +555,14 @@ and keys. See `cpt-pc-cs-principle-key-data-separation`.
 
 ## 4. Additional context
 
+- Stage 1 scope excludes schema and credential-definition management. Credential type information is stored as an
+  opaque GTS type URI (`gts_type_uri` column); this module does not resolve, validate, or interpret it. Stage 2 will
+  introduce GTS-backed validation and default-value resolution by reusing the Global Type System
+  (`https://github.com/GlobalTypeSystem/gts-spec`), which is already the platform's type system for plugin registration
+  (see `modules/credstore/docs/DESIGN.md`).
+- Application-level access control lists (`allowed_app_ids`) are out of scope for stage 1. Read access is scoped by
+  the caller's `SecurityContext.application_id` — a credential is only visible to its owning application. Cross-app
+  sharing will be revisited in a later stage once GTS-backed credential definitions are introduced.
 - User secrets (personal secrets per user, similar to Google Colab secrets) are a planned capability not yet
   implemented. The current data model may need extensions to support user-scoped credentials.
 - Encryption key storage in the application database (`DatabaseKeyProvider`) is suitable for development and

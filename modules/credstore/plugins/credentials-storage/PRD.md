@@ -71,19 +71,18 @@ REQUIREMENT LANGUAGE:
 
 ### 1.1 Purpose
 
-The Credentials Storage Plugin is a backend plugin for the CredStore gateway module that provides encrypted credential storage with schema-driven validation, credential merge/propagation resolution, and pluggable tenant key management. It replaces reliance on external credential backends with a self-contained service that manages the full credential lifecycle internally.
+The Credentials Storage Plugin is a backend plugin for the CredStore gateway module that provides encrypted credential storage, credential merge/propagation resolution, and pluggable tenant key management. It replaces reliance on external credential backends with a self-contained service that manages the encrypted credential lifecycle internally.
 
 ### 1.2 Background / Problem Statement
 
-The CredStore gateway supports multiple backend plugins for secret persistence. Existing plugins (VendorA Credstore, OS keychain) delegate encryption and storage to external systems, which limits control over encryption strategy, schema validation, and credential propagation logic.
+The CredStore gateway supports multiple backend plugins for secret persistence. Existing plugins (VendorA Credstore, OS keychain) delegate encryption and storage to external systems, which limits control over encryption strategy and credential propagation logic.
 
-Production multi-tenant deployments require per-tenant cryptographic isolation, defense-in-depth key management, and the ability to separate encryption keys from encrypted data. Existing backends do not natively support schema-driven credential validation or application-level access control lists. The Credentials Storage Plugin addresses these gaps by providing a self-contained credential management service with built-in encryption, schema validation, and tenant-aware credential resolution.
+Production multi-tenant deployments require per-tenant cryptographic isolation, defense-in-depth key management, and the ability to separate encryption keys from encrypted data. The Credentials Storage Plugin addresses these gaps by providing a self-contained credential management service with built-in encryption and tenant-aware credential resolution. Credential type declarations (schemas, default values, cross-application sharing) are intentionally out of scope for stage 1 and will be delegated to the Global Type System (GTS, `https://github.com/GlobalTypeSystem/gts-spec`) in stage 2.
 
 
 ### 1.3 Goals (Business Outcomes)
 
 - Encrypt all credentials before storing them in the database so that no secret is ever persisted in plaintext; each tenant's data is cryptographically isolated from other tenants
-- Enable schema-driven credential validation so credential structure is enforced at creation time, reducing runtime errors from malformed credentials by 100%
 - Support credential propagation across tenant hierarchies so child tenants inherit parent credentials without manual duplication
 - Store encryption keys in the same database by default; support external key services via pluggable KeyProvider for production deployments requiring key–data separation
 
@@ -91,12 +90,11 @@ Production multi-tenant deployments require per-tenant cryptographic isolation, 
 
 | Term | Definition |
 |------|------------|
-| Schema | A JSON Schema definition that describes the structure of credential values |
-| Credential Definition | A named configuration that links a schema to a specific application, provides default credential values, and specifies which applications are allowed to access credentials of this type |
-| Credential | A tenant-specific encrypted credential value associated with a credential definition |
+| Credential | A tenant-specific encrypted credential value owned by an application, identified by name within that application, carrying an opaque GTS type URI |
+| GTS Type URI | An identifier from the Global Type System (`https://github.com/GlobalTypeSystem/gts-spec`) that names the shape/type of a credential's value; stored opaquely by this plugin in stage 1 |
 | Tenant Key | A per-tenant encryption key used for credential encryption and decryption |
 | KeyProvider | An abstraction for tenant key management — implementations may store keys locally or delegate to an external service |
-| Credential Propagation | The process of resolving a credential value through the tenant hierarchy (own → inherited → default) |
+| Credential Propagation | The process of resolving a credential value through the tenant hierarchy (own → inherited) |
 
 ## 2. Actors
 
@@ -106,8 +104,8 @@ Production multi-tenant deployments require per-tenant cryptographic isolation, 
 
 **ID**: `cpt-pc-cs-actor-tenant-admin`
 
-**Role**: Authenticated administrator managing credentials, credential definitions, and schemas for their tenant. Creates, updates, and deletes credentials. Configures credential definitions with default values and application access control.
-**Needs**: CRUD operations on schemas, credential definitions, and credentials within their tenant namespace. Ability to control which applications can access specific credentials.
+**Role**: Authenticated administrator managing credentials for their tenant. Creates, updates, and deletes credentials.
+**Needs**: CRUD operations on credentials within their tenant namespace, with the ability to mark a credential for propagation to child tenants.
 
 ### 2.2 System Actors
 
@@ -115,14 +113,14 @@ Production multi-tenant deployments require per-tenant cryptographic isolation, 
 
 **ID**: `cpt-pc-cs-actor-vendor-app`
 
-**Role**: Platform application that retrieves decrypted credential values at runtime. Identified by `application_id` carried in the `SecurityContext` produced by the CyberFabric AuthN Resolver. Access is restricted to credential definitions that include the application in their `allowed_app_ids` list.
-**Needs**: Retrieve decrypted credential values for authorized credential definitions. Credential resolution must traverse the tenant hierarchy transparently.
+**Role**: Platform application that retrieves decrypted credential values at runtime. Identified by `application_id` carried in the `SecurityContext` produced by the CyberFabric AuthN Resolver. Access is scoped to credentials owned by the same `application_id` (no cross-application sharing in stage 1).
+**Needs**: Retrieve decrypted credential values for credentials owned by this application. Credential resolution must traverse the tenant hierarchy transparently.
 
 ## 3. Operational Concept & Environment
 
 ### 3.1 Module-Specific Environment Constraints
 
-- The plugin requires a database for persistent storage of schemas, credential definitions, credentials, and tenant keys (when local key storage is active)
+- The plugin requires a database for persistent storage of credentials and tenant keys (when local key storage is active)
 - The plugin requires access to the CyberFabric AuthN Resolver for authentication (token validation and `SecurityContext` production)
 - The plugin requires access to the CyberFabric AuthZ Resolver for write-operation authorization
 - When external key management is active, the plugin requires network access to the external key service
@@ -131,18 +129,21 @@ Production multi-tenant deployments require per-tenant cryptographic isolation, 
 
 ### 4.1 In Scope
 
-- Schema CRUD — create, list, get, update, delete (App)
-- Credential definition CRUD with schema binding, default values, and application access control (App)
-- Credential read (App, Admin)
+- Credential read scoped by owning application (App, Admin)
 - Credential write — create, update, delete with encryption at rest (Admin)
-- Credential merge/propagation resolution — own → inherited → default (App, Admin)
+- Credential merge/propagation resolution — own → inherited (App, Admin)
+- Opaque storage of a GTS type URI alongside each credential (no validation, no resolution)
 - Per-tenant encryption key management via pluggable KeyProvider
 - Authentication for all API endpoints via the CyberFabric AuthN Resolver (App, Admin)
 - Permission-based authorization for credential write operations (Admin)
-- Application-level access control — allowed_app_ids on credential definitions (App)
 
 ### 4.2 Out of Scope
 
+- Schema management (type/shape declaration of credential values) — delegated to GTS; stage 2
+- Credential definition management (named templates binding a schema to an application with defaults) — delegated to GTS; stage 2
+- Validation of credential values against their GTS type at write time — stage 2
+- Default-value fallback when no tenant or inherited credential exists — stage 2 (sourced from GTS type defaults)
+- Application-level access control (`allowed_app_ids`) for cross-application credential sharing — stage 2
 - Pluggable external key providers for key–data separation (planned; KeyProvider abstraction accommodates it)
 - Encryption key rotation (planned future capability; KeyProvider abstraction accommodates it)
 - User-scoped credentials (personal secrets per user, similar to Google Colab secrets)
@@ -182,7 +183,7 @@ All API endpoints **MUST** require an authenticated request. Token validation **
 - [ ] `p1` - **ID**: `cpt-pc-cs-fr-auth-permission`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** obtain an access decision from the CyberFabric AuthZ Resolver (PDP) for the `Credential.Manage` permission before allowing write operations (create, update, delete) on schemas, credential definitions, and credentials. The module acts as the PEP: it sends the AuthZ request with the authenticated subject, action, resource, and tenant context, and it **MUST** enforce the returned decision (and apply any returned constraints to the target query).
+The system **MUST** obtain an access decision from the CyberFabric AuthZ Resolver (PDP) for the `Credential.Manage` permission before allowing write operations (create, update, delete) on credentials. The module acts as the PEP: it sends the AuthZ request with the authenticated subject, action, resource, and tenant context, and it **MUST** enforce the returned decision (and apply any returned constraints to the target query).
 
 **Rationale**: Enforces least-privilege access control for mutating operations.
 **Actors**: `cpt-pc-cs-actor-tenant-admin`
@@ -195,7 +196,7 @@ The system **MUST** obtain an access decision from the CyberFabric AuthZ Resolve
 - [ ] `p1` - **ID**: `cpt-pc-cs-fr-credential-propagate`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** resolve credential values through the tenant hierarchy using a three-source merge chain: (1) the tenant's own credential, (2) an inherited credential from a parent tenant (where propagation is enabled), (3) the credential definition's default value. The first available source in this order **MUST** be returned. The response **MUST** indicate the origin of the resolved value.
+The system **MUST** resolve credential values through the tenant hierarchy using a two-source merge chain: (1) the tenant's own credential, (2) an inherited credential from an ancestor tenant (where propagation is enabled on that ancestor's credential). The first available source in this order **MUST** be returned. The response **MUST** indicate the origin of the resolved value. If neither source exists, the system **MUST** return a not-found response.
 
 **Rationale**: Enables parent tenants to share credentials with child tenants without manual duplication, while allowing child tenants to override with their own values.
 **Actors**: `cpt-pc-cs-actor-vendor-app`
@@ -206,20 +207,9 @@ The system **MUST** resolve credential values through the tenant hierarchy using
 - [ ] `p1` - **ID**: `cpt-pc-cs-fr-credential-decrypt-app`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** return decrypted credential values to authorized applications. Application identity **MUST** be determined from the `application_id` field of the `SecurityContext` produced by the AuthN Resolver.
+The system **MUST** return decrypted credential values to the owning application. Application identity **MUST** be determined from the `application_id` field of the `SecurityContext` produced by the AuthN Resolver, and credential lookup **MUST** be filtered by that `application_id` so callers can only retrieve credentials owned by their own application. Requests for credentials owned by a different application **MUST** receive a not-found response (to prevent enumeration).
 
-**Rationale**: Applications need the actual credential values to authenticate with external services.
-**Actors**: `cpt-pc-cs-actor-vendor-app`
-<!-- cpt-cf-id-content -->
-
-#### Application Access Control
-
-- [ ] `p1` - **ID**: `cpt-pc-cs-fr-definition-allowed-apps`
-
-<!-- cpt-cf-id-content -->
-The system **MUST** enforce application-level access control on credential retrieval. Each credential definition **MUST** specify an `allowed_app_ids` list. Only the owning application and applications in this list **MUST** be permitted to retrieve decrypted credential values. Unauthorized applications **MUST** receive a not-found response.
-
-**Rationale**: Prevents unauthorized applications from accessing credentials outside their scope.
+**Rationale**: Applications need the actual credential values to authenticate with external services; scoping reads by owning application provides the stage-1 access boundary without requiring cross-application ACLs.
 **Actors**: `cpt-pc-cs-actor-vendor-app`
 <!-- cpt-cf-id-content -->
 
@@ -273,7 +263,7 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 
 - **Type**: REST API
 - **Stability**: stable
-- **Description**: REST/JSON API for schema CRUD, credential definition CRUD, and credential CRUD with encryption at rest. All endpoints require an authenticated `SecurityContext` produced by the CyberFabric AuthN Resolver.
+- **Description**: REST/JSON API for credential CRUD with encryption at rest. All endpoints require an authenticated `SecurityContext` produced by the CyberFabric AuthN Resolver.
 - **Breaking Change Policy**: Versioned URL path (`/api/credentials-storage/v1/`); backward-compatible within major version
 
 ### 7.2 External Integration Contracts
@@ -311,20 +301,17 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 **Actor**: `cpt-pc-cs-actor-tenant-admin`
 
 **Preconditions**:
-- Admin's request carries a valid `SecurityContext` (produced by the AuthN Resolver) with `subject_tenant_id` set
+- Admin's request carries a valid `SecurityContext` (produced by the AuthN Resolver) with `subject_tenant_id` and `application_id` set
 - Admin has `Credential.Manage` permission (verified via the AuthZ Resolver)
 
 **Main Flow**:
-1. Admin creates a schema defining the credential structure
-2. Admin creates a credential definition binding the schema to an application, with default values and allowed_app_ids
-3. Admin creates a credential providing a value that validates against the schema
-4. System encrypts the value and persists it
+1. Admin submits a credential with a name, value, opaque GTS type URI, and propagation flag
+2. System encrypts the value and persists it scoped to `(tenant_id, application_id, name)`
 
 **Postconditions**:
 - Credential is stored encrypted.
 
 **Alternative Flows**:
-- **Schema validation fails**: System rejects the credential with a validation error
 - **Credential already exists**: System updates the existing credential value
 
 #### UC-002: Application Retrieves Credential
@@ -335,22 +322,19 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 
 **Preconditions**:
 - Application's request carries a valid `SecurityContext` (produced by the AuthN Resolver) with `application_id` and `subject_tenant_id`
-- Application is in the credential definition's allowed_app_ids list (or is the owning application)
 
 **Main Flow**:
-1. Application requests a credential by definition name
-2. System verifies application authorization against allowed_app_ids
-3. System retrieves the tenant's credential (own → inherited → default)
-4. System decrypts the value using the tenant's encryption key
-5. System returns the decrypted value with origin metadata
+1. Application requests a credential by name
+2. System looks up the credential scoped to `(tenant_id, application_id, name)` (own → inherited)
+3. System decrypts the value using the owning tenant's encryption key
+4. System returns the decrypted value with origin metadata and the opaque `gts_type_uri`
 
 **Postconditions**:
 - Application has the decrypted credential value for use with external services.
 
 **Alternative Flows**:
-- **Application not authorized**: System returns not-found (prevents enumeration)
-- **No credential exists**: System falls back to inherited or default value
-- **No value at any level**: System returns not-found
+- **Credential owned by another application**: System returns not-found (prevents enumeration)
+- **No credential exists at any level**: System returns not-found
 
 #### UC-003: Credential Inheritance Through Hierarchy
 
@@ -359,34 +343,33 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 **Actor**: `cpt-pc-cs-actor-vendor-app`
 
 **Preconditions**:
-- Parent tenant has a credential with propagation enabled
-- Child tenant has no own credential for the same definition
-- Application is authorized for the credential definition
+- An ancestor tenant has a credential with propagation enabled for the same `(application_id, name)`
+- Child tenant has no own credential for the same `(application_id, name)`
 
 **Main Flow**:
 1. Application requests a credential for the child tenant
 2. System finds no own credential for the child tenant
-3. System resolves the inherited credential from the parent tenant (propagation enabled)
-4. System decrypts using the parent tenant's encryption key
+3. System resolves the inherited credential from the nearest ancestor tenant with propagation enabled
+4. System decrypts using the ancestor tenant's encryption key
 5. System returns the value with origin indicating "Inherited"
 
 **Postconditions**:
-- Child tenant uses the parent's credential without manual duplication.
+- Child tenant uses the ancestor's credential without manual duplication.
 
 **Alternative Flows**:
-- **Propagation disabled on parent's credential**: System falls back to the credential definition's default value
+- **Propagation disabled on all ancestor credentials**: System returns not-found
 - **Child tenant creates own credential**: Own credential takes precedence over inherited on next retrieval
 
 ## 9. Acceptance Criteria
 
 - [ ] All credential values are encrypted before persistence — zero plaintext in the database
 - [ ] Each tenant has a unique encryption key — cross-tenant decryption fails
-- [ ] Schema validation rejects credentials that do not match the defined JSON Schema
-- [ ] Applications receive decrypted values for authorized credential definitions
-- [ ] Application access control enforces allowed_app_ids — unauthorized apps receive not-found
-- [ ] Credential propagation resolves through the three-source merge chain (own → inherited → default)
+- [ ] Applications receive decrypted values only for credentials owned by their own `application_id`
+- [ ] Credential lookups by another application's `application_id` return not-found (no enumeration)
+- [ ] Credential propagation resolves through the two-source merge chain (own → inherited); no value at either level returns not-found
 - [ ] All API endpoints require an authenticated `SecurityContext` produced by the CyberFabric AuthN Resolver
 - [ ] Write operations require a permit decision from the CyberFabric AuthZ Resolver for the `Credential.Manage` permission
+- [ ] Each credential stores an opaque `gts_type_uri`; the plugin does not validate or resolve it in stage 1
 
 ## 10. Dependencies
 
@@ -396,7 +379,7 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 | CyberFabric AuthN Resolver | Authentication — validates bearer tokens and produces `SecurityContext` (token format owned by the resolver plugin) | `p1` |
 | CyberFabric AuthZ Resolver | Authorization (PDP) — returns the access decision and any query-level constraints for the `Credential.Manage` permission on write operations | `p1` |
 | CyberFabric Tenant Resolver | Tenant hierarchy queries for credential propagation resolution (delegates to vendor Tenant Service via plugin) | `p1` |
-| Database | Persistent storage for schemas, definitions, credentials, and tenant keys (concrete engine selected by platform configuration) | `p1` |
+| Database | Persistent storage for credentials and tenant keys (concrete engine selected by platform configuration) | `p1` |
 | External Key Service | External key management service (Vault, KMS) for tenant key storage when external KeyProvider is active | `p2` |
 
 ## 11. Assumptions
@@ -414,7 +397,6 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 |------|--------|------------|
 | External key service unavailability | All encrypt/decrypt operations blocked when external KeyProvider is active | High-availability key service deployment; readiness signal reflects KMS connectivity; key caching with short TTL |
 | Keys co-located with encrypted data (local KeyProvider) | Single breach exposes both ciphertext and keys | Use external KeyProvider in production multi-tenant deployments; restrict local KeyProvider to development/test |
-| Schema evolution breaks existing credentials | Existing credentials fail validation against updated schema | Schema versioning strategy; backward-compatible schema changes only |
 | AuthZ Resolver unavailability | Write operations blocked | Circuit breaker pattern; readiness signal reflects AuthZ Resolver connectivity |
 | Credential propagation depth at deep nesting | Increased latency for credential resolution | Early termination on first resolved value; cache tenant hierarchy queries |
 
@@ -422,7 +404,8 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 
 - **Key rotation strategy**: When and how are tenant encryption keys rotated? The KeyProvider abstraction accommodates rotation, but the rotation workflow (re-encryption of existing credentials, key versioning) is not yet defined.
 - **User-scoped credentials**: Should the system support personal secrets per user (similar to Google Colab secrets)? The current data model may need extensions.
-- **Credential definition versioning**: Should credential definitions support versioning to track changes over time?
+- **GTS integration shape for stage 2**: Will the plugin call a GTS service/library to resolve types at write time (validation, default-value lookup), or will validation remain the caller's responsibility with the plugin only storing the type URI opaquely? This decides whether GTS becomes a hard runtime dependency of the plugin.
+- **Cross-application sharing in stage 2**: Once GTS-backed credential definitions exist, does cross-application access return as an `allowed_app_ids`-style ACL on the credential (or its type), or is it expressed via AuthZ Resolver policy instead?
 
 ## 14. Traceability
 
