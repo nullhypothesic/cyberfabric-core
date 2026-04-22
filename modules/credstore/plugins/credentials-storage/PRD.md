@@ -167,14 +167,14 @@ The system **MUST** encrypt all credential values before persistence. No plainte
 **Actors**: `cpt-pc-cs-actor-tenant-admin`, `cpt-pc-cs-actor-vendor-app`
 <!-- cpt-cf-id-content -->
 
-#### AuthN Resolver Authentication
+#### Authenticated Caller Required
 
 - [ ] `p1` - **ID**: `cpt-pc-cs-fr-auth-authn`
 
 <!-- cpt-cf-id-content -->
-All API endpoints **MUST** require an authenticated request. Token validation **MUST** be delegated to the CyberFabric AuthN Resolver. The token format (JWT, opaque, or other) is not prescribed by this module — it is determined by the AuthN Resolver plugin. The module **MUST** consume the resulting `SecurityContext` (`subject_id`, `subject_tenant_id`, `token_scopes`, and `application_id` when present) and propagate it to the service layer.
+All plugin operations **MUST** require an authenticated caller. The plugin **MUST NOT** terminate HTTP or validate bearer tokens itself; token validation is performed at the Module Gateway, which delegates to the CyberFabric AuthN Resolver and produces a `SecurityContext`. The plugin **MUST** consume the `SecurityContext` (`subject_id`, `subject_tenant_id`, `token_scopes`, and `application_id` when present) supplied by the Module Gateway and propagate it through its service layer. Token format (JWT, opaque, or other) is owned by the AuthN Resolver plugin and is not observable inside this plugin.
 
-**Rationale**: Aligns the module with the CyberFabric AuthN model, keeps token-format concerns inside the resolver, and makes tenant/application identity available for authorization and scoping decisions.
+**Rationale**: Keeps HTTP termination and token validation in one place (the Module Gateway), aligns the plugin with the CyberFabric AuthN model without making the plugin a second HTTP boundary, and still makes tenant/application identity available for authorization and scoping decisions inside the plugin.
 **Actors**: `cpt-pc-cs-actor-tenant-admin`, `cpt-pc-cs-actor-vendor-app`
 <!-- cpt-cf-id-content -->
 
@@ -272,9 +272,9 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 
 - [ ] `p1` - **ID**: `cpt-pc-cs-contract-authn`
 
-- **Direction**: required from client (inbound bearer token from caller; outbound validation call to the CyberFabric AuthN Resolver)
-- **Protocol/Format**: HTTP `Authorization: Bearer <token>` on all API requests; validation delegated to the AuthN Resolver module/plugin (in-process or out-of-process per resolver deployment). Response to the module is a `SecurityContext`.
-- **Compatibility**: Token format (JWT, opaque, other) is owned by the AuthN Resolver plugin; the module depends on the stable `SecurityContext` shape, not on any specific token format.
+- **Direction**: upstream (indirect). The plugin receives a `SecurityContext` from the Module Gateway, which owns HTTP termination and calls the CyberFabric AuthN Resolver to validate bearer tokens. The plugin itself does not make outbound calls to AuthN Resolver.
+- **Protocol/Format**: `SecurityContext` struct produced by the CyberFabric AuthN Resolver and supplied to the plugin by the Module Gateway. HTTP `Authorization: Bearer <token>` handling, transport, and resolver deployment model (in-process or out-of-process) are owned by the Module Gateway and are not part of this plugin's contract surface.
+- **Compatibility**: The plugin depends on the stable `SecurityContext` shape, not on any specific token format or transport. Token format (JWT, opaque, other) is owned by the AuthN Resolver plugin.
 
 #### AuthZ Resolver Contract
 

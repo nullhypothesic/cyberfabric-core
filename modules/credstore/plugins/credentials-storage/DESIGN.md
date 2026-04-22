@@ -73,10 +73,9 @@ Requirements that significantly influence architecture decisions.
 
 ```mermaid
 graph TB
-    Client["Client (App / Admin)"]
+    GW["Module Gateway<br/>(HTTP termination)"]
 
-    subgraph "Credentials Storage Module"
-        HTTP["HTTP Layer<br/>Axum Endpoints + Middleware"]
+    subgraph "Credentials Storage Plugin"
         SVC["Service Layer<br/>Business Logic + Crypto"]
         REPO["Repository Layer<br/>SQLx + Sea-Query"]
         DOM["Domain Layer<br/>Entities + Value Objects"]
@@ -88,21 +87,19 @@ graph TB
     AUTHZ["AuthZ Resolver"]
     EXT_KMS["External Key Service<br/>(Vault / KMS)"]
 
-    Client -->|"REST/JSON"| HTTP
-    HTTP -->|"SecurityContext"| SVC
+    GW -->|"SecurityContext + request"| SVC
     SVC -->|"Queries"| REPO
     SVC -->|"get/create key"| KP
     SVC -.->|"Uses"| DOM
     REPO -->|"SQL"| DB
     KP -->|"Local mode"| DB
     KP -->|"External mode"| EXT_KMS
-    HTTP -->|"authenticate"| AUTHN
-    HTTP -->|"access evaluation"| AUTHZ
+    SVC -->|"authenticate"| AUTHN
+    SVC -->|"access evaluation"| AUTHZ
 ```
 
 | Layer          | Responsibility                                                                      | Technology                     |
 |----------------|-------------------------------------------------------------------------------------|--------------------------------|
-| HTTP           | Request routing, AuthN middleware (AuthN Resolver call), AuthZ enforcement (AuthZ Resolver call), error mapping, OpenAPI docs | Axum 0.8, Tower-HTTP, Utoipa   |
 | Service        | Business logic, credential merge (own → inherited), encryption/decryption           | Core Rust, AES-GCM, Serde JSON |
 | Repository     | Data access, query construction, connection management                              | SQLx 0.8, Sea-Query 0.32       |
 | KeyProvider    | Tenant key retrieval and creation; abstracts local DB vs external key service       | Trait-based port (see §3.2)    |
@@ -183,14 +180,15 @@ state that prevents scale-out. Instances must expose readiness and liveness sign
 in-flight requests before exit), and tolerate rolling updates without dropped requests. The concrete runtime environment
 (Kubernetes, bare VMs, managed container platforms) is not prescribed; CyberFabric is environment-agnostic.
 
-#### AuthN Resolver Authentication
+#### Authenticated Caller Required
 
 - [ ] `p2` - **ID**: `cpt-pc-cs-constraint-authn`
 
-All API endpoints require an authenticated request. The module MUST NOT validate bearer tokens itself; validation is
-delegated to the CyberFabric AuthN Resolver, which produces a `SecurityContext`. Token format (JWT, opaque, or other)
-is determined by the AuthN Resolver plugin. The module propagates `SecurityContext` (`subject_id`, `subject_tenant_id`,
-`token_scopes`, and `application_id` when present) through the request context.
+All plugin operations require an authenticated caller. The plugin MUST NOT terminate HTTP or validate bearer tokens;
+token validation is performed at the Module Gateway, which delegates to the CyberFabric AuthN Resolver and produces a
+`SecurityContext`. The plugin consumes that `SecurityContext` (`subject_id`, `subject_tenant_id`, `token_scopes`, and
+`application_id` when present) supplied by the Module Gateway and propagates it through its internal service layer.
+Token format (JWT, opaque, or other) is owned by the AuthN Resolver plugin and is not observable inside this plugin.
 
 #### Multi-Tenant Hierarchy Support
 
@@ -382,15 +380,6 @@ shared infrastructure.
 | Authentication | Service-specific: Vault token, cloud IAM role, runtime service identity        |
 | Error Handling | Key Service unavailable blocks all encrypt/decrypt operations; readiness signal reflects KMS connectivity |
 
-#### CyberFabric AuthN Resolver
-
-| Aspect         | Details                                                                                               |
-|----------------|-------------------------------------------------------------------------------------------------------|
-| Purpose        | Authentication — validates the inbound bearer token and returns a `SecurityContext`                   |
-| Protocol       | In-process plugin call or out-of-process gRPC (per resolver deployment mode)                          |
-| Authentication | Same-process trust in-process; mTLS for out-of-process deployments                                    |
-| Token format   | Owned by the AuthN Resolver plugin (JWT, opaque, or other); this module depends on `SecurityContext`  |
-
 #### CyberFabric AuthZ Resolver
 
 | Aspect         | Details                                                                                      |
@@ -398,7 +387,9 @@ shared infrastructure.
 | Purpose        | Authorization (PDP) — returns the decision and optional query-level constraints for `Credential.Manage` on write operations |
 | Protocol       | In-process plugin call or out-of-process gRPC (AuthZEN-style request/response)               |
 | Authentication | Same-process trust in-process; mTLS for out-of-process deployments                           |
-| Error Handling | Deny decision maps to 403; resolver unavailable blocks write operations                      |
+| Error Handling | Deny decision is returned to the caller as a permission error; resolver unavailable blocks write operations |
+
+> **Note on authentication**: Bearer-token validation is not a dependency of this plugin. Token validation is owned by the Module Gateway, which calls the CyberFabric AuthN Resolver and supplies the resulting `SecurityContext` to the plugin. The `SecurityContext` shape contract is captured in PRD §7.2 (`cpt-pc-cs-contract-authn`).
 
 ### 3.4 Interactions & Sequences
 
@@ -413,22 +404,22 @@ shared infrastructure.
 ```mermaid
 sequenceDiagram
     actor Admin as Tenant Admin
-    participant API as HTTP Endpoints
+    participant GW as Module Gateway
     participant AuthN as AuthN Resolver
-    participant AuthZ as AuthZ Resolver (PDP)
     participant Svc as Credentials Service
+    participant AuthZ as AuthZ Resolver (PDP)
     participant KP as KeyProvider
     participant Crypto as Cryptography Service
     participant Repo as Credentials Repository
     participant DB as Database
     participant EXT as External KMS (optional)
 
-    Admin->>API: POST /credentials (Bearer + body)
-    API->>AuthN: authenticate(bearer_token)
-    AuthN-->>API: SecurityContext (subject_tenant_id, application_id, ...)
-    API->>AuthZ: access evaluation (Credential.Manage)
-    AuthZ-->>API: decision = permit
-    API->>Svc: create_credential(tenant_id, application_id, name, gts_type_uri, value, propagate)
+    Admin->>GW: POST /credentials (Bearer + body)
+    GW->>AuthN: authenticate(bearer_token)
+    AuthN-->>GW: SecurityContext (subject_tenant_id, application_id, ...)
+    GW->>Svc: create_credential(tenant_id, application_id, name, gts_type_uri, value, propagate, SecurityContext)
+    Svc->>AuthZ: access evaluation (Credential.Manage)
+    AuthZ-->>Svc: decision = permit
     Svc->>KP: get_or_create_key(tenant_id)
     alt DatabaseKeyProvider (local mode)
         KP->>DB: SELECT/INSERT tenant_key
@@ -443,15 +434,16 @@ sequenceDiagram
     Svc->>Repo: insert_credential(tenant_id, application_id, name, gts_type_uri, encrypted, propagate)
     Repo->>DB: INSERT credential
     DB-->>Repo: OK
-    Svc-->>API: Credential created
-    API-->>Admin: 201 Created
+    Svc-->>GW: Credential created
+    GW-->>Admin: 201 Created
 ```
 
-**Description**: Administrator creates a credential. The AuthN Resolver validates the bearer token and produces a
-`SecurityContext`; the AuthZ Resolver (PDP) returns the access decision for `Credential.Manage`; the service obtains
-the tenant's encryption key via the `KeyProvider` port (either from local DB or an external key management service),
-encrypts the value, and persists it together with its opaque `gts_type_uri`. Type validation against the GTS type is
-deferred to stage 2.
+**Description**: Administrator creates a credential. The Module Gateway terminates HTTP and delegates token validation
+to the AuthN Resolver, which produces a `SecurityContext`; the Gateway then invokes the plugin with that context. The
+plugin's Credentials Service obtains the access decision for `Credential.Manage` from the AuthZ Resolver (PDP), then
+retrieves the tenant's encryption key via the `KeyProvider` port (either from local DB or an external key management
+service), encrypts the value, and persists it together with its opaque `gts_type_uri`. Type validation against the GTS
+type is deferred to stage 2.
 
 #### Retrieve Credential with Merge Resolution
 
@@ -464,7 +456,7 @@ deferred to stage 2.
 ```mermaid
 sequenceDiagram
     actor App as Vendor App
-    participant API as HTTP Endpoints
+    participant GW as Module Gateway
     participant AuthN as AuthN Resolver
     participant Svc as Credentials Service
     participant KP as KeyProvider
@@ -472,10 +464,10 @@ sequenceDiagram
     participant Repo as Credentials Repository
     participant DB as Database
 
-    App->>API: GET /credentials/{name} (Bearer)
-    API->>AuthN: authenticate(bearer_token)
-    AuthN-->>API: SecurityContext (application_id, subject_tenant_id)
-    API->>Svc: get_credential(tenant_id, application_id, name)
+    App->>GW: GET /credentials/{name} (Bearer)
+    GW->>AuthN: authenticate(bearer_token)
+    AuthN-->>GW: SecurityContext (application_id, subject_tenant_id)
+    GW->>Svc: get_credential(tenant_id, application_id, name, SecurityContext)
     Svc->>Repo: get_credential(tenant_id, application_id, name)
     Repo->>DB: SELECT credential WHERE tenant_id AND application_id AND name
     DB-->>Repo: credential or NULL
@@ -489,7 +481,7 @@ sequenceDiagram
         alt Inherited credential found
             Svc->>Svc: origin = "Inherited"
         else No inherited
-            Svc-->>API: 404 Not Found
+            Svc-->>GW: 404 Not Found
         end
     end
 
@@ -497,15 +489,17 @@ sequenceDiagram
     KP-->>Svc: tenant_key
     Svc->>Crypto: decrypt(encrypted_value, tenant_key)
     Crypto-->>Svc: decrypted_value
-    Svc-->>API: CredentialView(decrypted, origin, gts_type_uri)
-    API-->>App: 200 OK (value + origin + gts_type_uri)
+    Svc-->>GW: CredentialView(decrypted, origin, gts_type_uri)
+    GW-->>App: 200 OK (value + origin + gts_type_uri)
 ```
 
-**Description**: Application retrieves a credential. Credential lookup is scoped by `application_id` from the
-`SecurityContext`, so callers only see credentials owned by their application. The service resolves the value through
-the two-source merge chain (own → inherited by walking the tenant ancestry for credentials with `propagate=true`),
-decrypts with the owning tenant's key, and returns the value together with its origin and opaque `gts_type_uri`. If no
-value is found at either level the response is 404 — default-value fallback is deferred to stage 2 (delegated to GTS).
+**Description**: Application retrieves a credential. The Module Gateway terminates HTTP and supplies the plugin with a
+`SecurityContext` produced by the AuthN Resolver. Inside the plugin, credential lookup is scoped by `application_id`
+from the `SecurityContext`, so callers only see credentials owned by their application. The service resolves the value
+through the two-source merge chain (own → inherited by walking the tenant ancestry for credentials with
+`propagate=true`), decrypts with the owning tenant's key, and returns the value together with its origin and opaque
+`gts_type_uri`. If no value is found at either level the response is 404 — default-value fallback is deferred to stage
+2 (delegated to GTS).
 
 ### 3.5 Database schemas & tables
 
