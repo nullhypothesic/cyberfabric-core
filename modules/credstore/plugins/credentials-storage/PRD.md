@@ -113,7 +113,7 @@ Production multi-tenant deployments require per-tenant cryptographic isolation, 
 
 **ID**: `cpt-pc-cs-actor-vendor-app`
 
-**Role**: Platform application that retrieves decrypted credential values at runtime. Identified by `application_id` carried in the `SecurityContext` produced by the CyberFabric AuthN Resolver. Access is scoped to credentials owned by the same `application_id` (no cross-application sharing in stage 1).
+**Role**: Platform application that retrieves decrypted credential values at runtime. Identified by the `SecurityContext` produced by the CyberFabric AuthN Resolver. Access is governed by the CyberFabric AuthZ Resolver (RBAC plus ABAC over each credential's `metadata`); the plugin itself performs no caller-scoping.
 **Needs**: Retrieve decrypted credential values for credentials owned by this application. Credential resolution must traverse the tenant hierarchy transparently.
 
 ## 3. Operational Concept & Environment
@@ -143,7 +143,7 @@ Production multi-tenant deployments require per-tenant cryptographic isolation, 
 - Credential definition management (named templates binding a schema to an application with defaults) — delegated to GTS; stage 2
 - Validation of credential values against their GTS type at write time — stage 2
 - Default-value fallback when no tenant or inherited credential exists — stage 2 (sourced from GTS type defaults)
-- Application-level access control (`allowed_app_ids`) for cross-application credential sharing — stage 2
+- Caller-level access control logic inside the plugin — delegated to the CyberFabric AuthZ Resolver (RBAC plus ABAC over `metadata`)
 - Pluggable external key providers for key–data separation (planned; KeyProvider abstraction accommodates it)
 - Encryption key rotation (planned future capability; KeyProvider abstraction accommodates it)
 - User-scoped credentials (personal secrets per user, similar to Google Colab secrets)
@@ -172,9 +172,9 @@ The system **MUST** encrypt all credential values before persistence. No plainte
 - [ ] `p1` - **ID**: `cpt-pc-cs-fr-auth-authn`
 
 <!-- cpt-cf-id-content -->
-All plugin operations **MUST** require an authenticated caller. The plugin **MUST NOT** terminate HTTP or validate bearer tokens itself; token validation is performed at the Module Gateway, which delegates to the CyberFabric AuthN Resolver and produces a `SecurityContext`. The plugin **MUST** consume the `SecurityContext` (`subject_id`, `subject_tenant_id`, `token_scopes`, and `application_id` when present) supplied by the Module Gateway and propagate it through its service layer. Token format (JWT, opaque, or other) is owned by the AuthN Resolver plugin and is not observable inside this plugin.
+All plugin operations **MUST** require an authenticated caller. The plugin **MUST NOT** terminate HTTP or validate bearer tokens itself; token validation is performed at the Module Gateway, which delegates to the CyberFabric AuthN Resolver and produces a `SecurityContext`. The plugin **MUST** consume the `SecurityContext` supplied by the Module Gateway and propagate it through its service layer. Token format (JWT, opaque, or other) is owned by the AuthN Resolver plugin and is not observable inside this plugin.
 
-**Rationale**: Keeps HTTP termination and token validation in one place (the Module Gateway), aligns the plugin with the CyberFabric AuthN model without making the plugin a second HTTP boundary, and still makes tenant/application identity available for authorization and scoping decisions inside the plugin.
+**Rationale**: Keeps HTTP termination and token validation in one place (the Module Gateway), aligns the plugin with the CyberFabric AuthN model without making the plugin a second HTTP boundary, and still makes the caller's identity available for authorization decisions inside the plugin.
 **Actors**: `cpt-pc-cs-actor-tenant-admin`, `cpt-pc-cs-actor-vendor-app`
 <!-- cpt-cf-id-content -->
 
@@ -207,9 +207,9 @@ The system **MUST** resolve credential values through the tenant hierarchy using
 - [ ] `p1` - **ID**: `cpt-pc-cs-fr-credential-decrypt-app`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** return decrypted credential values to the owning application. Application identity **MUST** be determined from the `application_id` field of the `SecurityContext` produced by the AuthN Resolver, and credential lookup **MUST** be filtered by that `application_id` so callers can only retrieve credentials owned by their own application. Requests for credentials owned by a different application **MUST** receive a not-found response (to prevent enumeration).
+The system **MUST** return decrypted credential values to authorized callers. The plugin **MUST** delegate the read access decision to the CyberFabric AuthZ Resolver, which combines RBAC permissions on credentials with an ABAC policy evaluated over the credential's `metadata` and the caller's `SecurityContext`. If AuthZ denies the read, the plugin **MUST** return a not-found response (to prevent enumeration); on permit, the value is decrypted and returned.
 
-**Rationale**: Applications need the actual credential values to authenticate with external services; scoping reads by owning application provides the stage-1 access boundary without requiring cross-application ACLs.
+**Rationale**: Applications need the actual credential values to authenticate with external services; routing access decisions through AuthZ keeps caller-scoping policy out of the plugin and lets sharing models evolve without schema changes here.
 **Actors**: `cpt-pc-cs-actor-vendor-app`
 <!-- cpt-cf-id-content -->
 
@@ -301,12 +301,12 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 **Actor**: `cpt-pc-cs-actor-tenant-admin`
 
 **Preconditions**:
-- Admin's request carries a valid `SecurityContext` (produced by the AuthN Resolver) with `subject_tenant_id` and `application_id` set
-- Admin has `Credential.Manage` permission (verified via the AuthZ Resolver)
+- Admin's request carries a valid `SecurityContext` (produced by the AuthN Resolver)
+- The AuthZ Resolver permits the write for this caller (RBAC permission on credentials, plus ABAC over the supplied `metadata`)
 
 **Main Flow**:
-1. Admin submits a credential with a name, value, opaque GTS type URI, and propagation flag
-2. System encrypts the value and persists it scoped to `(tenant_id, application_id, name)`
+1. Admin submits a credential with a name, value, opaque GTS type URI, propagation flag, and `metadata`
+2. System encrypts the value and persists it scoped to `(tenant_id, name)` together with its `metadata`
 
 **Postconditions**:
 - Credential is stored encrypted.
@@ -321,19 +321,20 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 **Actor**: `cpt-pc-cs-actor-vendor-app`
 
 **Preconditions**:
-- Application's request carries a valid `SecurityContext` (produced by the AuthN Resolver) with `application_id` and `subject_tenant_id`
+- Application's request carries a valid `SecurityContext` (produced by the AuthN Resolver)
 
 **Main Flow**:
 1. Application requests a credential by name
-2. System looks up the credential scoped to `(tenant_id, application_id, name)` (own → inherited)
-3. System decrypts the value using the owning tenant's encryption key
-4. System returns the decrypted value with origin metadata and the opaque `gts_type_uri`
+2. System looks up the credential scoped to `(tenant_id, name)` (own → inherited)
+3. System asks the AuthZ Resolver to evaluate the read decision against the credential's `metadata` and the caller's `SecurityContext`
+4. On permit, system decrypts the value using the owning tenant's encryption key
+5. System returns the decrypted value with origin metadata and the opaque `gts_type_uri`
 
 **Postconditions**:
 - Application has the decrypted credential value for use with external services.
 
 **Alternative Flows**:
-- **Credential owned by another application**: System returns not-found (prevents enumeration)
+- **AuthZ denies the read**: System returns not-found (prevents enumeration)
 - **No credential exists at any level**: System returns not-found
 
 #### UC-003: Credential Inheritance Through Hierarchy
@@ -343,8 +344,8 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 **Actor**: `cpt-pc-cs-actor-vendor-app`
 
 **Preconditions**:
-- An ancestor tenant has a credential with propagation enabled for the same `(application_id, name)`
-- Child tenant has no own credential for the same `(application_id, name)`
+- An ancestor tenant has a credential with propagation enabled for the same `name`
+- Child tenant has no own credential for the same `name`
 
 **Main Flow**:
 1. Application requests a credential for the child tenant
@@ -364,8 +365,8 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 
 - [ ] All credential values are encrypted before persistence — zero plaintext in the database
 - [ ] Each tenant has a unique encryption key — cross-tenant decryption fails
-- [ ] Applications receive decrypted values only for credentials owned by their own `application_id`
-- [ ] Credential lookups by another application's `application_id` return not-found (no enumeration)
+- [ ] Read access is decided by the AuthZ Resolver (RBAC plus ABAC over `metadata`); the plugin contains no caller-scoping logic of its own
+- [ ] AuthZ denials on reads surface as not-found (no enumeration)
 - [ ] Credential propagation resolves through the two-source merge chain (own → inherited); no value at either level returns not-found
 - [ ] All API endpoints require an authenticated `SecurityContext` produced by the CyberFabric AuthN Resolver
 - [ ] Write operations require a permit decision from the CyberFabric AuthZ Resolver for the `Credential.Manage` permission
@@ -385,7 +386,7 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 ## 11. Assumptions
 
 - The CredStore gateway selects this plugin at runtime via GTS configuration; only one storage plugin is active per deployment
-- The `SecurityContext` produced by the CyberFabric AuthN Resolver carries `subject_tenant_id` and, for vendor applications, `application_id`
+- The `SecurityContext` produced by the CyberFabric AuthN Resolver identifies the caller and carries the attributes required by the AuthZ Resolver to evaluate access
 - The CyberFabric AuthN Resolver and AuthZ Resolver are reachable from the module (in-process plugin or out-of-process service, per platform deployment)
 - Tenant hierarchy information is available via platform API
 - Tenant encryption keys are auto-generated on first credential creation for a tenant
@@ -405,7 +406,7 @@ See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
 - **Key rotation strategy**: When and how are tenant encryption keys rotated? The KeyProvider abstraction accommodates rotation, but the rotation workflow (re-encryption of existing credentials, key versioning) is not yet defined.
 - **User-scoped credentials**: Should the system support personal secrets per user (similar to Google Colab secrets)? The current data model may need extensions.
 - **GTS integration shape for stage 2**: Will the plugin call a GTS service/library to resolve types at write time (validation, default-value lookup), or will validation remain the caller's responsibility with the plugin only storing the type URI opaquely? This decides whether GTS becomes a hard runtime dependency of the plugin.
-- **Cross-application sharing in stage 2**: Once GTS-backed credential definitions exist, does cross-application access return as an `allowed_app_ids`-style ACL on the credential (or its type), or is it expressed via AuthZ Resolver policy instead?
+- **Cross-application sharing in stage 2**: Once GTS-backed credential definitions exist, what `metadata` shape and AuthZ policy patterns should the platform standardize for cross-caller credential sharing?
 
 ## 14. Traceability
 

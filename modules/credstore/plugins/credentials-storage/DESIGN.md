@@ -28,9 +28,10 @@
 Credentials Storage is designed as a self-contained module (deployable as part of the CredStore gateway or as a
 standalone microservice) with a layered hexagonal architecture that isolates domain logic from infrastructure concerns.
 The architecture prioritizes security-by-default: every credential value is encrypted before reaching the persistence
-layer, and access is enforced at multiple levels — AuthN-validated identity (via the CyberFabric AuthN Resolver),
-authorization decisions from the CyberFabric AuthZ Resolver for write operations, and `application_id`-scoped read
-access so callers can only see credentials owned by their own application.
+layer, and access is enforced at multiple levels — AuthN-validated identity (via the CyberFabric AuthN Resolver) and
+authorization decisions from the CyberFabric AuthZ Resolver, which combines RBAC permissions on credentials with an
+ABAC policy evaluated over each credential's opaque `metadata` and other request attributes. The plugin itself
+contains no caller-scoping logic; every access decision is delegated to AuthZ.
 
 Stage 1 focuses strictly on encrypted storage and tenant-hierarchy propagation for credentials. Credential type
 definitions (formerly modeled as `Schema` and `CredentialDefinition` entities) are delegated to the Global Type System
@@ -140,18 +141,17 @@ ciphertext and the keys needed to decrypt it.
 - [ ] `p2` - **ID**: `cpt-pc-cs-principle-least-privilege`
 
 Access control is enforced at multiple levels: the CyberFabric AuthN Resolver verifies identity and produces a
-`SecurityContext`; the CyberFabric AuthZ Resolver returns the access decision (and optional query-level constraints);
-and credential lookup is scoped by the caller's `application_id` so callers can only see credentials owned by their
-application.
+`SecurityContext`; the CyberFabric AuthZ Resolver returns the access decision based on RBAC permissions on credentials
+combined with ABAC over each credential's `metadata` and other request attributes. The plugin performs no caller-scoping
+itself — all visibility and write decisions are delegated to AuthZ.
 
 #### Defense in Depth
 
 - [ ] `p2` - **ID**: `cpt-pc-cs-principle-defense-in-depth`
 
 Security is layered: network-level (transport and network policy as provided by the runtime), transport-level (TLS),
-authentication (CyberFabric AuthN Resolver), authorization (CyberFabric AuthZ Resolver), application scoping (credential
-lookup filtered by `SecurityContext.application_id`), and data-level (AES-256-GCM encryption). No single layer's failure
-exposes credentials.
+authentication (CyberFabric AuthN Resolver), authorization (CyberFabric AuthZ Resolver — RBAC plus ABAC over per-credential
+`metadata`), and data-level (AES-256-GCM encryption). No single layer's failure exposes credentials.
 
 #### Clean Architecture
 
@@ -415,9 +415,9 @@ sequenceDiagram
 
     Admin->>GW: POST /credentials (Bearer + body)
     GW->>AuthN: authenticate(bearer_token)
-    AuthN-->>GW: SecurityContext (subject_tenant_id, application_id, ...)
-    GW->>Svc: create_credential(tenant_id, application_id, name, gts_type_uri, value, propagate, SecurityContext)
-    Svc->>AuthZ: access evaluation (Credential.Manage)
+    AuthN-->>GW: SecurityContext
+    GW->>Svc: create_credential(tenant_id, name, gts_type_uri, value, propagate, metadata, SecurityContext)
+    Svc->>AuthZ: access evaluation (write permission, metadata)
     AuthZ-->>Svc: decision = permit
     Svc->>KP: get_or_create_key(tenant_id)
     alt DatabaseKeyProvider (local mode)
@@ -430,7 +430,7 @@ sequenceDiagram
     KP-->>Svc: tenant_key
     Svc->>Crypto: encrypt(value, tenant_key)
     Crypto-->>Svc: encrypted_value
-    Svc->>Repo: insert_credential(tenant_id, application_id, name, gts_type_uri, encrypted, propagate)
+    Svc->>Repo: insert_credential(tenant_id, name, gts_type_uri, encrypted, propagate, metadata)
     Repo->>DB: INSERT credential
     DB-->>Repo: OK
     Svc-->>GW: Credential created
@@ -438,11 +438,12 @@ sequenceDiagram
 ```
 
 **Description**: Administrator creates a credential. The Module Gateway terminates HTTP and delegates token validation
-to the AuthN Resolver, which produces a `SecurityContext`; the Gateway then invokes the plugin with that context. The
-plugin's Credentials Service obtains the access decision for `Credential.Manage` from the AuthZ Resolver (PDP), then
-retrieves the tenant's encryption key via the `KeyProvider` port (either from local DB or an external key management
-service), encrypts the value, and persists it together with its opaque `gts_type_uri`. Type validation against the GTS
-type is deferred to stage 2.
+to the AuthN Resolver, which produces a `SecurityContext`; the Gateway then invokes the plugin with that context and the
+caller-supplied `metadata`. The plugin's Credentials Service obtains the access decision from the AuthZ Resolver (PDP) —
+RBAC for the credential write permission combined with ABAC over the supplied `metadata` — then retrieves the tenant's
+encryption key via the `KeyProvider` port (either from local DB or an external key management service), encrypts the
+value, and persists it together with its opaque `gts_type_uri` and `metadata`. Type validation against the GTS type is
+deferred to stage 2.
 
 #### Retrieve Credential with Merge Resolution
 
@@ -458,6 +459,7 @@ sequenceDiagram
     participant GW as Module Gateway
     participant AuthN as AuthN Resolver
     participant Svc as Credentials Service
+    participant AuthZ as AuthZ Resolver (PDP)
     participant KP as KeyProvider
     participant Crypto as Cryptography Service
     participant Repo as Credentials Repository
@@ -465,23 +467,29 @@ sequenceDiagram
 
     App->>GW: GET /credentials/{name} (Bearer)
     GW->>AuthN: authenticate(bearer_token)
-    AuthN-->>GW: SecurityContext (application_id, subject_tenant_id)
-    GW->>Svc: get_credential(tenant_id, application_id, name, SecurityContext)
-    Svc->>Repo: get_credential(tenant_id, application_id, name)
-    Repo->>DB: SELECT credential WHERE tenant_id AND application_id AND name
+    AuthN-->>GW: SecurityContext
+    GW->>Svc: get_credential(tenant_id, name, SecurityContext)
+    Svc->>Repo: get_credential(tenant_id, name)
+    Repo->>DB: SELECT credential WHERE tenant_id AND name
     DB-->>Repo: credential or NULL
 
     alt Credential found for tenant
         Svc->>Svc: origin = "Credential"
     else No credential — walk up tenant ancestry
-        Svc->>Repo: get_propagated_credential(ancestor_tenant_ids, application_id, name)
-        Repo->>DB: SELECT credential WHERE tenant_id IN ancestors AND application_id AND name AND propagate=true
+        Svc->>Repo: get_propagated_credential(ancestor_tenant_ids, name)
+        Repo->>DB: SELECT credential WHERE tenant_id IN ancestors AND name AND propagate=true
         DB-->>Repo: inherited credential or NULL
         alt Inherited credential found
             Svc->>Svc: origin = "Inherited"
         else No inherited
             Svc-->>GW: 404 Not Found
         end
+    end
+
+    Svc->>AuthZ: access evaluation (read permission, credential.metadata)
+    AuthZ-->>Svc: decision = permit | deny
+    alt deny
+        Svc-->>GW: 403 Forbidden
     end
 
     Svc->>KP: get_key(credential.tenant_id)
@@ -493,12 +501,12 @@ sequenceDiagram
 ```
 
 **Description**: Application retrieves a credential. The Module Gateway terminates HTTP and supplies the plugin with a
-`SecurityContext` produced by the AuthN Resolver. Inside the plugin, credential lookup is scoped by `application_id`
-from the `SecurityContext`, so callers only see credentials owned by their application. The service resolves the value
-through the two-source merge chain (own → inherited by walking the tenant ancestry for credentials with
-`propagate=true`), decrypts with the owning tenant's key, and returns the value together with its origin and opaque
-`gts_type_uri`. If no value is found at either level the response is 404 — default-value fallback is deferred to stage
-2 (delegated to GTS).
+`SecurityContext` produced by the AuthN Resolver. The service resolves the credential through the two-source merge chain
+(own → inherited by walking the tenant ancestry for credentials with `propagate=true`), then asks the AuthZ Resolver to
+evaluate the read decision against the caller and the credential's `metadata` (RBAC plus ABAC). If denied, the response
+is 403; if permitted, the value is decrypted with the owning tenant's key and returned together with its origin and
+opaque `gts_type_uri`. If no credential is found at either level the response is 404 — default-value fallback is
+deferred to stage 2 (delegated to GTS).
 
 ### 3.5 Database schemas & tables
 
@@ -512,17 +520,17 @@ through the two-source merge chain (own → inherited by walking the tenant ance
 |-----------------|--------------|----------------------------------------------------------------------------------------------------------|
 | id              | UUID         | Primary key                                                                                              |
 | tenant_id       | UUID         | Tenant that owns this credential                                                                         |
-| application_id  | UUID         | Owning application ID (from `SecurityContext.application_id` at creation time)                           |
-| name            | VARCHAR(255) | Credential name (unique per tenant + application, case-insensitive)                                      |
+| name            | VARCHAR(255) | Credential name (unique per tenant, case-insensitive)                                                    |
 | gts_type_uri    | TEXT         | Opaque GTS type URI describing the credential value's type (not interpreted or validated by this module) |
 | encrypted_value | BYTEA        | AES-256-GCM encrypted credential value (nonce prepended)                                                 |
 | propagate       | BOOLEAN      | Whether this credential propagates to child tenants                                                      |
+| metadata        | JSONB        | Opaque metadata supplied at write time and consumed by the AuthZ ABAC policy; not interpreted by this plugin |
 | key_id          | UUID         | Foreign key to tenant_keys table (encryption key used)                                                   |
 | created         | TIMESTAMPTZ  | Creation timestamp                                                                                       |
 
 **PK**: `id`
-**Constraints**: UNIQUE(tenant_id, application_id, name), FK(key_id → tenant_keys.id), NOT NULL(tenant_id,
-application_id, name, gts_type_uri, encrypted_value, key_id)
+**Constraints**: UNIQUE(tenant_id, name), FK(key_id → tenant_keys.id), NOT NULL(tenant_id, name, gts_type_uri,
+encrypted_value, key_id)
 
 #### Table: tenant_keys
 
@@ -553,9 +561,10 @@ and keys. See `cpt-pc-cs-principle-key-data-separation`.
   introduce GTS-backed validation and default-value resolution by reusing the Global Type System
   (`https://github.com/GlobalTypeSystem/gts-spec`), which is already the platform's type system for plugin registration
   (see `modules/credstore/docs/DESIGN.md`).
-- Application-level access control lists (`allowed_app_ids`) are out of scope for stage 1. Read access is scoped by
-  the caller's `SecurityContext.application_id` — a credential is only visible to its owning application. Cross-app
-  sharing will be revisited in a later stage once GTS-backed credential definitions are introduced.
+- Caller-level access scoping is delegated entirely to the CyberFabric AuthZ Resolver. The plugin defines RBAC
+  permissions on the credential resource and exposes each credential's `metadata` for evaluation by an ABAC policy;
+  the plugin itself contains no caller-scoping logic. Cross-tenant or cross-caller sharing models are realized as
+  AuthZ policies on `metadata` and require no schema changes here.
 - User secrets (personal secrets per user, similar to Google Colab secrets) are a planned capability not yet
   implemented. The current data model may need extensions to support user-scoped credentials.
 - Encryption key storage in the application database (`DatabaseKeyProvider`) is suitable for development and
