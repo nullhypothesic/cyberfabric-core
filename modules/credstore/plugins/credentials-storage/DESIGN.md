@@ -14,9 +14,10 @@
 - [3. Technical Architecture](#3-technical-architecture)
   - [3.1 Domain Model](#31-domain-model)
   - [3.2 Component Model](#32-component-model)
-  - [3.3 External Dependencies](#33-external-dependencies)
-  - [3.4 Interactions & Sequences](#34-interactions--sequences)
-  - [3.5 Database schemas & tables](#35-database-schemas--tables)
+  - [3.3 API Contracts](#33-api-contracts)
+  - [3.4 External Dependencies](#34-external-dependencies)
+  - [3.5 Interactions & Sequences](#35-interactions--sequences)
+  - [3.6 Database schemas & tables](#36-database-schemas--tables)
 - [4. Additional context](#4-additional-context)
 
 <!-- /toc -->
@@ -359,7 +360,11 @@ shared infrastructure.
 
 - `cpt-pc-cs-component-services` — infrastructure creates service instances in ApiState
 
-### 3.3 External Dependencies
+### 3.3 API Contracts
+
+This plugin exposes no external API of its own. It implements the `CredStorePluginClientV1` trait defined in `credstore-sdk` and is invoked in-process by the parent CredStore gateway, which owns HTTP termination and the public REST surface. See the parent module's [DESIGN.md §4.3](../../docs/DESIGN.md#43-api-contracts) for the trait signature and REST contract.
+
+### 3.4 External Dependencies
 
 #### Database
 
@@ -390,7 +395,7 @@ shared infrastructure.
 
 > **Note on authentication**: Bearer-token validation is not a dependency of this plugin. Token validation is owned by the Module Gateway, which calls the CyberFabric AuthN Resolver and supplies the resulting `SecurityContext` to the plugin. The `SecurityContext` shape contract is captured in PRD §7.2 (`cpt-pc-cs-contract-authn`).
 
-### 3.4 Interactions & Sequences
+### 3.5 Interactions & Sequences
 
 #### Create Credential with Encryption
 
@@ -508,7 +513,7 @@ is 403; if permitted, the value is decrypted with the owning tenant's key and re
 opaque `gts_type_uri`. If no credential is found at either level the response is 404 — default-value fallback is
 deferred to stage 2 (delegated to GTS).
 
-### 3.5 Database schemas & tables
+### 3.6 Database schemas & tables
 
 - [ ] `p3` - **ID**: `cpt-pc-cs-db-main`
 

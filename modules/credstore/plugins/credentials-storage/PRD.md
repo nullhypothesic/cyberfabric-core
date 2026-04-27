@@ -257,14 +257,7 @@ API responses **MUST** complete within 100ms at p95 under 100 concurrent request
 
 ### 7.1 Public API Surface
 
-#### REST API
-
-See `cpt-pc-cs-interface-rest-api` (defined in DESIGN.md).
-
-- **Type**: REST API
-- **Stability**: stable
-- **Description**: REST/JSON API for credential CRUD with encryption at rest. All endpoints require an authenticated `SecurityContext` produced by the CyberFabric AuthN Resolver.
-- **Breaking Change Policy**: Versioned URL path (`/api/credentials-storage/v1/`); backward-compatible within major version
+This plugin exposes no public API of its own. HTTP termination and the public REST surface for credential operations are owned by the parent CredStore gateway; the plugin is invoked in-process by the gateway through the `CredStorePluginClientV1` trait defined in `credstore-sdk`. See the parent module's PRD and DESIGN for the consumer-facing REST contract and stability policy.
 
 ### 7.2 External Integration Contracts
 
