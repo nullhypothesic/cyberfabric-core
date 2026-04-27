@@ -293,7 +293,7 @@ graph TB
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-component-credentials-storage`
 
-`credentials_storage` — Standalone Rust service providing encrypted credential storage and hierarchical credential propagation (merge resolution: own → inherited). Encryption is handled internally via AES-256-GCM with per-tenant keys managed by a pluggable `KeyProvider` port. Two `KeyProvider` implementations: `DatabaseKeyProvider` (keys in local PostgreSQL, for dev/test) and `ExternalKeyProvider` (keys in external KMS such as HashiCorp Vault or AWS KMS, for production key–data separation). Interfaces: plugin-facing API invoked by the CredStore Gateway (the Gateway terminates HTTP and supplies a `SecurityContext`); the plugin enforces access evaluation by calling the CyberFabric AuthZ Resolver. Detailed architecture is documented in `plugins/credentials-storage/DESIGN.md`.
+`credentials_storage` — CredStore plugin that declares hierarchical resolution capability, providing encrypted credential storage and hierarchical credential propagation (merge resolution: own → inherited) internally. Encryption is handled internally via AES-256-GCM with per-tenant keys managed by a pluggable `KeyProvider` port. Two `KeyProvider` implementations: `DatabaseKeyProvider` (keys in local PostgreSQL, for dev/test) and `ExternalKeyProvider` (keys in external KMS such as HashiCorp Vault or AWS KMS, for production key–data separation). Interfaces: implements `CredStorePluginClientV1` and is invoked by the CredStore Gateway through ClientHub (the Gateway supplies a `SecurityContext`); the plugin enforces access evaluation by calling the CyberFabric AuthZ Resolver. Detailed architecture is documented in `plugins/credentials-storage/DESIGN.md`.
 
 **Interactions**:
 - Consumer → Gateway: via `CredStoreClientV1` trait through ClientHub
@@ -623,14 +623,13 @@ graph LR
     GW --> OAuth["OAuth/OIDC<br/>Provider"]
 ```
 
-**Credentials Storage Plugin (standalone microservice):**
+**Credentials Storage Plugin:**
 
 ```mermaid
 graph LR
     Platform["Platform<br/>(OAGW, modules)"] --> GW["credstore +<br/>credentials_storage plugin"]
-    GW --> CSP["Credentials Storage<br/>(Rust svc)"]
-    CSP --> PG["PostgreSQL<br/>(credentials)"]
-    CSP -->|"mTLS"| KMS["External Key Service<br/>(Vault / KMS)"]
+    GW --> DB["DB<br/>(credentials)"]
+    GW -->|"mTLS"| KMS["External Key Service<br/>(Vault / KMS)"]
 ```
 
 **Desktop/VM Environment (P2):**
