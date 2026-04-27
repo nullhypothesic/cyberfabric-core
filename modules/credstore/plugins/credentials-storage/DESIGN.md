@@ -186,8 +186,7 @@ in-flight requests before exit), and tolerate rolling updates without dropped re
 
 All plugin operations require an authenticated caller. The plugin MUST NOT terminate HTTP or validate bearer tokens;
 token validation is performed at the Module Gateway, which delegates to the CyberFabric AuthN Resolver and produces a
-`SecurityContext`. The plugin consumes that `SecurityContext` (`subject_id`, `subject_tenant_id`, `token_scopes`, and
-`application_id` when present) supplied by the Module Gateway and propagates it through its internal service layer.
+`SecurityContext`. The plugin consumes that `SecurityContext` supplied by the Module Gateway and propagates it through its internal service layer.
 Token format (JWT, opaque, or other) is owned by the AuthN Resolver plugin and is not observable inside this plugin.
 
 #### Multi-Tenant Hierarchy Support
