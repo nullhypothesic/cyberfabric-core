@@ -35,10 +35,9 @@ ABAC policy evaluated over each credential's opaque `metadata` and other request
 contains no caller-scoping logic; every access decision is delegated to AuthZ.
 
 Stage 1 focuses strictly on encrypted storage and tenant-hierarchy propagation for credentials. Credential type
-definitions (formerly modeled as `Schema` and `CredentialDefinition` entities) are delegated to the Global Type System
-(GTS, `https://github.com/GlobalTypeSystem/gts-spec`), which is already the platform's type system for plugin
-registration. Each credential carries an opaque GTS type URI; GTS-backed validation and default-value resolution are
-deferred to stage 2.
+semantics (value shape, default values, cross-application sharing) are out of scope — each credential carries an opaque
+GTS type URI that this plugin stores and returns without interpretation. Stage 2 will integrate with the Global Type
+System (GTS, `https://github.com/GlobalTypeSystem/gts-spec`) for value validation and default-value resolution.
 
 
 Tenant encryption key management is abstracted behind a `KeyProvider` port, allowing keys to be stored either locally
