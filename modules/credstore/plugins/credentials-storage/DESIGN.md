@@ -569,8 +569,6 @@ and keys. See `cpt-pc-cs-principle-key-data-separation`.
   permissions on the credential resource and exposes each credential's `metadata` for evaluation by an ABAC policy;
   the plugin itself contains no caller-scoping logic. Cross-tenant or cross-caller sharing models are realized as
   AuthZ policies on `metadata` and require no schema changes here.
-- User secrets (personal secrets per user, similar to Google Colab secrets) are a planned capability not yet
-  implemented. The current data model may need extensions to support user-scoped credentials.
 - Encryption key storage in the application database (`DatabaseKeyProvider`) is suitable for development and
   single-tenant deployments. For production multi-tenant environments, the `ExternalKeyProvider` delegates key
   management to a separate service (HashiCorp Vault, AWS KMS, etc.) to achieve key–data separation.
