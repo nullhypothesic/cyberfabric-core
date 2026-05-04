@@ -610,7 +610,7 @@ This allows User B to access the parent's shared credential. Meanwhile, User A i
 
 The gateway module has no local database. Secrets are persisted in the external backend (VendorA Credstore or OS keychain). The gateway and the VendorA/OS plugins are stateless.
 
-The `credentials_storage` plugin maintains its own database with tables for schemas, credential definitions, credentials (encrypted), and tenant keys (when `DatabaseKeyProvider` is active). The initial implementation uses PostgreSQL; the storage layer is designed to become database-agnostic in future iterations. The full database schema is specified in the plugin design document (`plugins/credentials-storage/DESIGN.md`, planned).
+The `credentials_storage` plugin maintains its own database with tables for credentials (encrypted) and tenant keys (when `DatabaseKeyProvider` is active). Credential schemas and definitions are out of scope here — they are owned by GTS and addressed in Stage 2. The initial implementation uses PostgreSQL; the storage layer is designed to become database-agnostic in future iterations. The full database schema is specified in the plugin design document (`plugins/credentials-storage/DESIGN.md`, planned).
 
 ### 4.8 Deployment Topology
 
