@@ -87,6 +87,7 @@ graph TB
     AUTHZ["AuthZ Resolver"]
     EXT_KMS["External Key Service<br/>(Vault / KMS)"]
 
+    GW -->|"authenticate"| AUTHN
     GW -->|"SecurityContext + request"| SVC
     SVC -->|"Queries"| REPO
     SVC -->|"get/create key"| KP
@@ -94,7 +95,6 @@ graph TB
     REPO -->|"SQL"| DB
     KP -->|"Local mode"| DB
     KP -->|"External mode"| EXT_KMS
-    SVC -->|"authenticate"| AUTHN
     SVC -->|"access evaluation"| AUTHZ
 ```
 
