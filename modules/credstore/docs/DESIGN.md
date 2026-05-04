@@ -188,7 +188,7 @@ The following capabilities are explicitly out of scope for v1:
 
 Authorization (permission checks for `Secrets:Read` and `Secrets:Write`) is enforced exclusively in the gateway layer. Simple plugins (VendorA, OS keychain) are "storage adapters" that delegate to backends and MUST NOT implement authorization or policy decisions. This prevents inconsistent behavior across backends.
 
-**Note**: For simple plugins, the Gateway also implements sharing mode enforcement and hierarchical resolution. The `credentials_storage` plugin is a full microservice that handles its own merge resolution, authorization (AuthN Resolver + AuthZ Resolver), and sharing logic internally — in this case the Gateway delegates these responsibilities to the plugin.
+**Note**: For simple plugins, the Gateway also implements sharing mode enforcement and hierarchical resolution. The `credentials_storage` plugin declares hierarchical resolution capability and handles its own merge resolution, authorization (via the CyberFabric AuthZ Resolver), and sharing logic internally — in this case the Gateway delegates these responsibilities to the plugin.
 
 #### Stateless Key Mapping
 
