@@ -26,8 +26,7 @@
 
 ### 1.1 Architectural Vision
 
-Credentials Storage is designed as a self-contained module (deployable as part of the CredStore gateway or as a
-standalone microservice) with a layered hexagonal architecture that isolates domain logic from infrastructure concerns.
+Credentials Storage is designed as a self-contained module (deployable as part of the CredStore gateway) with a layered hexagonal architecture that isolates domain logic from infrastructure concerns.
 The architecture prioritizes security-by-default: every credential value is encrypted before reaching the persistence
 layer, and access is enforced at multiple levels — AuthN-validated identity (via the CyberFabric AuthN Resolver) and
 authorization decisions from the CyberFabric AuthZ Resolver, which combines RBAC permissions on credentials with an
