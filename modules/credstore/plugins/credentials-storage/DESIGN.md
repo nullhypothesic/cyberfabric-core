@@ -104,7 +104,7 @@ graph TB
 | Repository     | Data access, query construction, connection management                              | SQLx 0.8, Sea-Query 0.32       |
 | KeyProvider    | Tenant key retrieval and creation; abstracts local DB vs external key service       | Trait-based port (see §3.2)    |
 | Domain         | Core entities (Credential, TenantKey), value objects, enums                         | Pure Rust structs              |
-| Infrastructure | Configuration, telemetry, server lifecycle, connection pooling                      | Tokio, OpenTelemetry, Clap     |
+| Infrastructure | Configuration, telemetry, server lifecycle, connection pooling                      | Tokio, OpenTelemetry           |
 
 ## 2. Principles & Constraints
 
