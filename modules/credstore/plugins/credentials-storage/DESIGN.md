@@ -307,6 +307,30 @@ Provide a `KeyProvider` trait (async port) with two operations: `get_or_create_k
 The active implementation is selected by configuration (`key_provider` field). The `ExternalKeyProvider` communicates
 with the external service over mTLS and authenticates via service-specific credentials (Vault token, IAM role, etc.).
 
+##### Idempotent key creation (concurrency contract)
+
+`get_or_create_key(tenant_id)` MUST be safe under concurrent first-write for the same tenant. Two `create_credential`
+calls arriving simultaneously for a tenant that has no `tenant_keys` row must converge on a single key — never produce
+duplicate keys, fail with a constraint violation visible to the caller, or leave one credential encrypted under an
+orphaned key. This is enforced at the `KeyProvider` trait contract; both implementations must satisfy it.
+
+- **`DatabaseKeyProvider`** — implement get-or-create as a single statement using `INSERT ... ON CONFLICT (tenant_id)
+  DO NOTHING RETURNING *`, followed (when `RETURNING` returns no row) by a `SELECT` to read the row created by the
+  winning concurrent call. The `UNIQUE(tenant_id)` constraint on `tenant_keys` is the source of truth that resolves
+  the race; the `ON CONFLICT` clause turns the loser's collision into a benign no-op rather than a propagated error.
+  An advisory lock (`pg_advisory_xact_lock(hashtext('tenant_key:' || tenant_id))`) is an acceptable alternative when
+  the underlying engine does not support `ON CONFLICT` semantics, but `ON CONFLICT` is preferred where available
+  because it avoids serializing unrelated tenants' first-writes through a single lock.
+- **`ExternalKeyProvider`** — the chosen KMS API call MUST be idempotent on `tenant_id` (e.g., Vault Transit's
+  create-key is naturally idempotent — re-creating an existing named key is a no-op; AWS KMS requires the
+  alias-then-create-then-bind pattern with conflict handling on the alias). If the underlying API is not idempotent,
+  the implementation MUST serialize first-writes per tenant (e.g., via the same in-process single-flight used by the
+  cache, scoped to the create path) and treat the "already exists" error from the KMS as success — fetching the
+  existing key.
+- **Cache interaction** — the in-process cache (below) MUST NOT be populated until the underlying provider has
+  confirmed a single canonical row/key; otherwise a losing concurrent create could cache the wrong key id. Single-
+  flight on `get_or_create_key` collapses concurrent misses into one provider call and resolves this naturally.
+
 ##### In-process key cache
 
 Both implementations sit behind a thin in-process cache to keep the response-time NFR
@@ -477,12 +501,18 @@ sequenceDiagram
     Svc->>AuthZ: access evaluation (write permission, metadata)
     AuthZ-->>Svc: decision = permit
     Svc->>KP: get_or_create_key(tenant_id)
+    Note over KP: single-flight per tenant_id<br/>collapses concurrent misses
     alt DatabaseKeyProvider (local mode)
-        KP->>DB: SELECT/INSERT tenant_key
-        DB-->>KP: tenant_key
+        KP->>DB: INSERT ... ON CONFLICT (tenant_id) DO NOTHING RETURNING *
+        alt row returned (winner)
+            DB-->>KP: newly created tenant_key
+        else no row (loser — concurrent create won)
+            KP->>DB: SELECT tenant_key WHERE tenant_id = ?
+            DB-->>KP: existing tenant_key
+        end
     else ExternalKeyProvider (external mode)
-        KP->>EXT: GET/CREATE key for tenant_id
-        EXT-->>KP: tenant_key
+        KP->>EXT: idempotent get-or-create key for tenant_id
+        EXT-->>KP: tenant_key (existing or freshly created)
     end
     KP-->>Svc: tenant_key
     Svc->>Crypto: encrypt(value, tenant_key)
