@@ -576,7 +576,7 @@ sequenceDiagram
     Svc->>AuthZ: access evaluation (read permission, credential.metadata)
     AuthZ-->>Svc: decision = permit | deny
     alt deny
-        Svc-->>GW: 403 Forbidden
+        Svc-->>GW: 404 Not Found
     end
 
     Svc->>KP: get_key(credential.tenant_id)
@@ -591,7 +591,9 @@ sequenceDiagram
 `SecurityContext` produced by the AuthN Resolver. The service resolves the credential through the two-source merge chain
 (own → inherited by walking the tenant ancestry for credentials with `propagate=true`), then asks the AuthZ Resolver to
 evaluate the read decision against the caller and the credential's `metadata` (RBAC plus ABAC). If denied, the response
-is 403; if permitted, the value is decrypted with the owning tenant's key and returned together with its origin and
+is **404 Not Found** — identical to the "no credential resolved" path — to prevent the caller from distinguishing
+"exists but you cannot see it" from "does not exist", which would otherwise enable enumeration of credential names
+(per PRD FR-002, UC-002 alt-flow, and Acceptance #4). If permitted, the value is decrypted with the owning tenant's key and returned together with its origin and
 opaque `gts_type_uri`. If no credential is found at either level the response is 404 — default-value fallback is
 deferred to stage 2 (delegated to GTS).
 
