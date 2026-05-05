@@ -203,14 +203,32 @@ resolution must traverse the tenant tree from child to parent.
 
 **Core Entities**:
 
-| Entity     | Description                                                                                                                                                                           |
-|------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Credential | An encrypted tenant-specific credential value owned by an application, identified by name within that application, with propagation metadata and an opaque GTS type URI.              |
-| TenantKey  | A per-tenant AES-256-GCM encryption key used for credential encryption and decryption. Managed by the `KeyProvider` port — may reside in local DB or an external key management service. |
+| Entity         | Description                                                                                                                                                                              |
+|----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Credential     | An encrypted tenant-specific credential value owned by an application, identified by name within that application, with propagation metadata and an opaque GTS type URI.                 |
+| TenantKey      | A per-tenant AES-256-GCM encryption key used for credential encryption and decryption. Managed by the `KeyProvider` port — may reside in local DB or an external key management service.    |
+| CredentialView | Read-model returned to callers after merge resolution. Carries the decrypted value, the resolution `origin` (own vs. inherited), the source tenant, and the opaque GTS type URI.         |
+
+**Value objects & enums**:
+
+- `CredentialOrigin` — enum with variants `Credential` (resolved on the requesting tenant) and `Inherited` (resolved on an ancestor tenant via propagation).
+
+**`CredentialView` fields**:
+
+| Field             | Type               | Description                                                                                                          |
+|-------------------|--------------------|----------------------------------------------------------------------------------------------------------------------|
+| name              | String             | Credential name as requested by the caller.                                                                          |
+| value             | Plaintext bytes    | Decrypted credential value. Held in memory only for the duration of the response and never logged.                   |
+| origin            | `CredentialOrigin` | Indicates whether the value came from the requesting tenant or from an ancestor via propagation.                     |
+| owner_tenant_id   | UUID               | Tenant that owns the resolved credential. Equals the requesting tenant when `origin = Credential`; the ancestor tenant when `origin = Inherited`. |
+| gts_type_uri      | String             | Opaque GTS type URI copied from the resolved credential; not interpreted by this module.                             |
+| propagate         | bool               | Whether the resolved credential is configured to propagate to descendant tenants. Lets callers see the propagation chain is intact when `origin = Inherited`. |
+| created           | Timestamp (UTC)    | Creation timestamp of the resolved credential row, copied from the `credentials.created` column.                     |
 
 **Relationships**:
 
 - TenantKey 1→N Credential: each tenant key encrypts all credentials for that tenant (key resolution via `KeyProvider`)
+- CredentialView is derived from exactly one Credential at read time; it is not persisted.
 
 **Notes on scope**:
 
