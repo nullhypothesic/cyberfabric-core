@@ -609,17 +609,20 @@ deferred to stage 2 (delegated to GTS).
 |-----------------|--------------|----------------------------------------------------------------------------------------------------------|
 | id              | UUID         | Primary key                                                                                              |
 | tenant_id       | UUID         | Tenant that owns this credential                                                                         |
-| name            | VARCHAR(255) | Credential name (unique per tenant, case-insensitive)                                                    |
+| name            | VARCHAR(255) | Credential name. Stored lower-cased; the service layer normalizes to lowercase on every write and lookup, so `UNIQUE(tenant_id, name)` enforces case-insensitive uniqueness without any case-folding column type or functional index. |
 | gts_type_uri    | TEXT         | Opaque GTS type URI describing the credential value's type (not interpreted or validated by this module) |
 | encrypted_value | BYTEA        | AES-256-GCM encrypted credential value (nonce prepended)                                                 |
 | propagate       | BOOLEAN      | Whether this credential propagates to child tenants                                                      |
-| metadata        | JSONB        | Opaque metadata supplied at write time and consumed by the AuthZ ABAC policy; not interpreted by this plugin |
+| metadata        | JSON         | Opaque JSON document supplied at write time and consumed by the AuthZ ABAC policy; not interpreted by this plugin. |
 | key_id          | UUID         | Foreign key to tenant_keys table (encryption key used)                                                   |
 | created         | TIMESTAMPTZ  | Creation timestamp                                                                                       |
+| updated         | TIMESTAMPTZ  | Last-modification timestamp; set on every successful update of `encrypted_value`, `propagate`, `metadata`, or `gts_type_uri`. Equal to `created` for never-updated rows. |
 
 **PK**: `id`
 **Constraints**: UNIQUE(tenant_id, name), FK(key_id → tenant_keys.id), NOT NULL(tenant_id, name, gts_type_uri,
-encrypted_value, key_id)
+encrypted_value, key_id, created, updated)
+**Indexes**:
+- Partial index on `(tenant_id, name)` filtered by `propagate = TRUE` — supports the walk-up inheritance lookup (`SELECT … WHERE tenant_id IN ancestors AND name AND propagate = TRUE`). Restricting the index to propagating rows keeps it small and the lookup index-only.
 
 #### Table: tenant_keys
 
