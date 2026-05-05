@@ -464,7 +464,7 @@ This plugin exposes no external API of its own. It implements the `CredStorePlug
 
 | Aspect         | Details                                                                                      |
 |----------------|----------------------------------------------------------------------------------------------|
-| Purpose        | Authorization (PDP) — returns the decision and optional query-level constraints for `Credential.Manage` on write operations |
+| Purpose        | Authorization (PDP) — returns the decision and optional query-level constraints for `Secrets:Write` on write operations |
 | Protocol       | In-process plugin call or out-of-process gRPC (AuthZEN-style request/response)               |
 | Authentication | Same-process trust in-process; mTLS for out-of-process deployments                           |
 | Error Handling | Deny decision is returned to the caller as a permission error; resolver unavailable blocks write operations |

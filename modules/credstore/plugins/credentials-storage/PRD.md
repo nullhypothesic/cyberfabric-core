@@ -183,7 +183,7 @@ All plugin operations **MUST** require an authenticated caller. The plugin **MUS
 - [ ] `p1` - **ID**: `cpt-pc-cs-fr-auth-permission`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** obtain an access decision from the CyberFabric AuthZ Resolver (PDP) for the `Credential.Manage` permission before allowing write operations (create, update, delete) on credentials. The module acts as the PEP: it sends the AuthZ request with the authenticated subject, action, resource, and tenant context, and it **MUST** enforce the returned decision (and apply any returned constraints to the target query).
+The system **MUST** obtain an access decision from the CyberFabric AuthZ Resolver (PDP) for the `Secrets:Write` permission before allowing write operations (create, update, delete) on credentials. The module acts as the PEP: it sends the AuthZ request with the authenticated subject, action, resource, and tenant context, and it **MUST** enforce the returned decision (and apply any returned constraints to the target query). The permission name matches the parent CredStore module (`modules/credstore/docs/PRD.md`) so a single RBAC binding governs the entire CredStore capability surface.
 
 **Rationale**: Enforces least-privilege access control for mutating operations.
 **Actors**: `cpt-pc-cs-actor-tenant-admin`
@@ -362,7 +362,7 @@ This plugin exposes no public API of its own. HTTP termination and the public RE
 - [ ] AuthZ denials on reads surface as not-found (no enumeration)
 - [ ] Credential propagation resolves through the two-source merge chain (own → inherited); no value at either level returns not-found
 - [ ] All API endpoints require an authenticated `SecurityContext` produced by the CyberFabric AuthN Resolver
-- [ ] Write operations require a permit decision from the CyberFabric AuthZ Resolver for the `Credential.Manage` permission
+- [ ] Write operations require a permit decision from the CyberFabric AuthZ Resolver for the `Secrets:Write` permission
 - [ ] Each credential stores an opaque `gts_type_uri`; the plugin does not validate or resolve it in stage 1
 
 ## 10. Dependencies
@@ -371,7 +371,7 @@ This plugin exposes no public API of its own. HTTP termination and the public RE
 |------------|-------------|-------------|
 | CredStore Gateway | Parent module that routes requests to this plugin via `CredStorePluginClientV1` trait | `p1` |
 | CyberFabric AuthN Resolver | Authentication — validates bearer tokens and produces `SecurityContext` (token format owned by the resolver plugin) | `p1` |
-| CyberFabric AuthZ Resolver | Authorization (PDP) — returns the access decision and any query-level constraints for the `Credential.Manage` permission on write operations | `p1` |
+| CyberFabric AuthZ Resolver | Authorization (PDP) — returns the access decision and any query-level constraints for the `Secrets:Write` permission on write operations | `p1` |
 | CyberFabric Tenant Resolver | Tenant hierarchy queries for credential propagation resolution (delegates to vendor Tenant Service via plugin) | `p1` |
 | Database | Persistent storage for credentials and tenant keys (concrete engine selected by platform configuration) | `p1` |
 | External Key Service | External key management service (Vault, KMS) for tenant key storage when external KeyProvider is active | `p2` |
