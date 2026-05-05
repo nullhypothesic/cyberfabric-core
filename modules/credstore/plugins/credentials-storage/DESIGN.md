@@ -64,7 +64,7 @@ Requirements that significantly influence architecture decisions.
 |----------------------------------|------------------------------------|----------------------------------------------|--------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------|
 | `cpt-pc-cs-nfr-encryption`       | 100% encryption at rest            | Cryptography Service + KeyProvider           | All credential values pass through encrypt() before persistence; no direct DB writes bypass encryption | Integration tests verify no plaintext in DB                                              |
 | `cpt-pc-cs-nfr-tenant-isolation` | Per-tenant cryptographic isolation | KeyProvider + Cryptography Service           | Each tenant has a unique AES-256 key; keys never shared across tenants; keys can be isolated in external KMS | Unit tests verify key uniqueness; integration tests verify cross-tenant decryption fails |
-| `cpt-pc-cs-nfr-response-time`    | p95 ≤ 100ms at 100 concurrent      | All layers                                   | Async I/O via Tokio; connection pooling; AuthN/AuthZ Resolver calls reused across requests             | Load testing with k6 or similar                                                          |
+| `cpt-pc-cs-nfr-response-time`    | p95 ≤ 100ms at 100 concurrent      | All layers + KeyProvider cache               | Async I/O via Tokio; connection pooling; AuthN/AuthZ Resolver calls reused across requests; in-process per-tenant key cache (short TTL) absorbs hot paths so `ExternalKeyProvider` round-trips are not on every encrypt/decrypt | Load testing with k6 or similar; cache hit-rate surfaced in telemetry                    |
 
 
 ### 1.3 Architecture Layers
@@ -195,6 +195,20 @@ Token format (JWT, opaque, or other) is owned by the AuthN Resolver plugin and i
 The service must support a hierarchical tenant model for credential propagation. Credential
 resolution must traverse the tenant tree from child to parent.
 
+#### Cross-Tenant Key Access for Inheritance
+
+- [ ] `p2` - **ID**: `cpt-pc-cs-constraint-key-access-scope`
+
+Inherited credentials are encrypted with the **owning ancestor tenant's key**, not the requesting tenant's key. Walk-up
+resolution therefore requires the plugin to decrypt under any tenant key it may encounter while traversing the tenant
+tree. The plugin's identity at the KMS (`ExternalKeyProvider` mode) MUST be granted read access to **every tenant key in
+the deployment** — typically via a single namespace/path (e.g., a Vault mount or KMS key alias prefix) covering all
+tenant keys, not per-tenant least-privilege scoping. Restrictive per-tenant policies that deny access to ancestor keys
+will silently break credential inheritance for descendants. Encrypt-time access is naturally limited to the requesting
+tenant's key (because credentials are written under their owning tenant); the broad scope applies to read/decrypt.
+Cross-tenant exposure is bounded inside the plugin by the AuthZ Resolver decision and the merge logic — the KMS is not
+the authorization boundary here.
+
 ## 3. Technical Architecture
 
 ### 3.1 Domain Model
@@ -292,6 +306,26 @@ Provide a `KeyProvider` trait (async port) with two operations: `get_or_create_k
 
 The active implementation is selected by configuration (`key_provider` field). The `ExternalKeyProvider` communicates
 with the external service over mTLS and authenticates via service-specific credentials (Vault token, IAM role, etc.).
+
+##### In-process key cache
+
+Both implementations sit behind a thin in-process cache to keep the response-time NFR
+(`cpt-pc-cs-nfr-response-time`, p95 ≤ 100ms) achievable when `ExternalKeyProvider` is active — without it, every
+encrypt/decrypt would incur a network round-trip to the external KMS, which alone can exceed the budget under load.
+
+| Aspect            | Decision                                                                                                     |
+|-------------------|--------------------------------------------------------------------------------------------------------------|
+| Scope             | Keyed by `tenant_id`. One entry caches the resolved `TenantKey` (the AES-256 material plus its `key_id`).    |
+| Storage           | Per-process (each plugin instance has its own cache); never persisted to disk; zeroized on eviction/shutdown. |
+| TTL               | Short — default 60s, configurable. Bounds blast radius if a key is rotated or revoked at the KMS.            |
+| Negative caching  | Not cached — a missing key on read is a normal miss path that must always re-check the source of truth.      |
+| Invalidation      | TTL expiry plus explicit invalidation on key-rotation events (stage 2). On any decrypt failure attributable to a stale key, the entry is dropped and the lookup retried once against the provider. |
+| Concurrency       | Single-flight per `tenant_id`: concurrent misses for the same tenant collapse to one provider call.          |
+| Bound             | LRU cap (default 10 000 entries) so a tenant explosion cannot grow the cache without bound.                  |
+
+The cache is part of the `KeyProvider` port surface — both `DatabaseKeyProvider` and `ExternalKeyProvider` use the same
+wrapper, so cache semantics do not vary by deployment mode. Cached material is treated as sensitive: not logged, not
+included in telemetry, zeroized on drop.
 
 ##### Responsibility boundaries
 
@@ -398,7 +432,9 @@ This plugin exposes no external API of its own. It implements the `CredStorePlug
 | Purpose        | Tenant encryption key storage and lifecycle when `ExternalKeyProvider` is active. Provides key–data separation for production security posture. |
 | Protocol       | HTTPS/mTLS (Vault HTTP API, AWS KMS API, or custom REST/gRPC)                |
 | Authentication | Service-specific: Vault token, cloud IAM role, runtime service identity        |
-| Error Handling | Key Service unavailable blocks all encrypt/decrypt operations; readiness signal reflects KMS connectivity |
+| Access Scope   | The plugin's KMS identity MUST be authorized to read **every tenant key** in the deployment (typically a single mount/alias-prefix covering all tenants). Required because inheritance decrypts credentials under ancestor-tenant keys — see `cpt-pc-cs-constraint-key-access-scope`. Per-tenant least-privilege policies will break propagation. |
+| Caching        | The plugin maintains an in-process per-tenant key cache (short TTL, default 60s) — see `cpt-pc-cs-component-key-provider`. Required to meet the response-time NFR; without it, each encrypt/decrypt incurs a KMS round-trip. |
+| Error Handling | Key Service unavailable blocks all encrypt/decrypt operations once cache entries expire; readiness signal reflects KMS connectivity |
 
 #### CyberFabric AuthZ Resolver
 
