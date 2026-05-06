@@ -16,8 +16,9 @@
   - [3.2 Component Model](#32-component-model)
   - [3.3 API Contracts](#33-api-contracts)
   - [3.4 External Dependencies](#34-external-dependencies)
-  - [3.5 Interactions & Sequences](#35-interactions--sequences)
-  - [3.6 Database schemas & tables](#36-database-schemas--tables)
+  - [3.5 Hierarchical Resolution](#35-hierarchical-resolution)
+  - [3.6 Interactions & Sequences](#36-interactions--sequences)
+  - [3.7 Database schemas & tables](#37-database-schemas--tables)
 - [4. Additional context](#4-additional-context)
 
 <!-- /toc -->
@@ -471,7 +472,42 @@ This plugin exposes no external API of its own. It implements the `CredStorePlug
 
 > **Note on authentication**: Bearer-token validation is not a dependency of this plugin. Token validation is owned by the Module Gateway, which calls the CyberFabric AuthN Resolver and supplies the resulting `SecurityContext` to the plugin. The `SecurityContext` shape contract is captured in PRD §7.2 (`cpt-pc-cs-contract-authn`).
 
-### 3.5 Interactions & Sequences
+### 3.5 Hierarchical Resolution
+
+This plugin declares the **hierarchical resolution capability** on the parent CredStore Gateway (see [`../../docs/DESIGN.md` §4.6](../../docs/DESIGN.md#46-interactions--sequences)). When the capability is declared, the Gateway issues a single `get` call and the plugin returns the resolved credential together with its `origin`. This section specifies the resolution semantics the plugin guarantees in return.
+
+#### Resolution chain
+
+The plugin merges across an ordered list of **sources**. The first source that yields a credential wins; the result is tagged with the corresponding `CredentialOrigin` and returned with the owning tenant in `owner_tenant_id`. The chain is short-circuiting — once a source matches, lower-priority sources are not consulted.
+
+| Order | Source                                                                | Origin tag   |
+|-------|-----------------------------------------------------------------------|--------------|
+| 1     | Credential row on the requesting tenant                               | `Credential` |
+| 2     | Credential row on the nearest ancestor tenant with `propagate = TRUE` | `Inherited`  |
+
+If no source matches, the plugin returns `NotFound`.
+
+#### Algorithm
+
+```text
+fn resolve(tenant_id, name) -> Option<CredentialView>:
+    if row = repo.get_credential(tenant_id, name):
+        return view(row, origin = Credential, owner_tenant_id = tenant_id)
+
+    for ancestor in tenant_resolver.ancestors(tenant_id):  // nearest → root
+        if row = repo.get_propagated(ancestor, name):       // propagate = TRUE
+            return view(row, origin = Inherited, owner_tenant_id = ancestor)
+
+    return None
+```
+
+The propagation gate is enforced by a partial index on `(tenant_id, name) WHERE propagate = TRUE` (see [§3.7](#37-database-schemas--tables)) so the ancestor lookup is index-only and does not scan non-propagating rows.
+
+#### Visibility policy
+
+The resolved `value` is returned as plaintext for every origin. Per-origin redaction — for example, masking inherited values from human callers — is not in scope for this plugin and is tracked as a parent-module open question (see [`../../docs/DESIGN.md` §7.1 item 2](../../docs/DESIGN.md#71-from-prd-cross-reference)). `CredentialOrigin` is returned alongside the value so a future policy on the parent module or a downstream consumer can dispatch on origin without changes here.
+
+### 3.6 Interactions & Sequences
 
 #### Create Credential with Encryption
 
@@ -597,7 +633,7 @@ is **404 Not Found** — identical to the "no credential resolved" path — to p
 opaque `gts_type_uri`. If no credential is found at either level the response is 404 — default-value fallback is
 deferred to stage 2 (delegated to GTS).
 
-### 3.6 Database schemas & tables
+### 3.7 Database schemas & tables
 
 - [ ] `p3` - **ID**: `cpt-pc-cs-db-main`
 

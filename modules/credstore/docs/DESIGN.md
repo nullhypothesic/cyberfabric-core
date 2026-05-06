@@ -606,6 +606,14 @@ sequenceDiagram
 
 This allows User B to access the parent's shared credential. Meanwhile, User A in tenant X would get their own private `key1` (phase 1 hit).
 
+**Hierarchical Resolution Capability (Plugin-Owned)**: When the active plugin declares hierarchical resolution capability (see [§1.1](#11-architectural-vision)), the Gateway issues a single `get` call and treats the response as authoritative — it does **not** query `tenant_resolver`, walk ancestors, or perform the two-phase private/tenant lookup described above. Capability contract:
+
+- **Single-call semantics**: exactly one plugin `get` per consumer request.
+- **Response shape**: the plugin returns `origin`, `owner_tenant_id`, and `sharing` so the Gateway populates the standard response envelope (`is_inherited`, `metadata.owner_tenant_id`, `metadata.sharing`) uniformly with the simple-plugin path.
+- **Source set is plugin-defined**: the Gateway treats the source list as opaque. `credentials_storage` resolves over two sources — own credential, then inherited via `propagate=true` walk-up. See [`plugins/credentials-storage/DESIGN.md` §3.5](../plugins/credentials-storage/DESIGN.md#35-hierarchical-resolution).
+- **Visibility / redaction is a plugin concern**: any per-origin value-redaction policy lives in the plugin. v1 returns plaintext for all origins; restricting raw inherited values from human callers is tracked in [§7.1 item 2](#71-from-prd-cross-reference) and is out of scope for v1.
+- **No Gateway-side overlay**: the Gateway MUST NOT layer simple-plugin walk-up logic (sharing-mode access checks, two-phase lookup, ancestor iteration) on top of a capability-owning plugin's response — doing so would double-resolve and could mask plugin-internal policy.
+
 ### 4.7 Database schemas & tables
 
 The gateway module has no local database. Secrets are persisted in the external backend (VendorA Credstore or OS keychain). The gateway and the VendorA/OS plugins are stateless.
