@@ -439,6 +439,34 @@ shared infrastructure.
 
 This plugin exposes no external API of its own. It implements the `CredStorePluginClientV1` trait defined in `credstore-sdk` and is invoked in-process by the parent CredStore gateway, which owns HTTP termination and the public REST surface. See the parent module's [DESIGN.md §4.3](../../docs/DESIGN.md#43-api-contracts) for the trait signature and REST contract.
 
+#### Trait boundary mapping (parent SDK ↔ plugin domain)
+
+- [ ] `p1` - **ID**: `cpt-pc-cs-contract-trait-mapping`
+
+The parent SDK's `SecretMetadata { sharing: SharingMode, owner_id, ... }` is not isomorphic to this plugin's `propagate + metadata + AuthZ ABAC` model. This section pins the projection used at the `CredStorePluginClientV1` boundary.
+
+**Read (plugin → gateway, `get`)**
+
+| `SecretMetadata` field | Plugin source                                                       |
+|------------------------|---------------------------------------------------------------------|
+| `value`                | Decrypted credential value                                          |
+| `owner_tenant_id`      | `CredentialView.owner_tenant_id`                                    |
+| `sharing`              | `if propagate { Shared } else { Tenant }` — `Private` never emitted |
+| `owner_id`             | `OwnerId::nil()` — this plugin does not model per-subject ownership |
+
+Caller-scoping semantics that the parent encodes as `Private` (owner-match) are expressed here as ABAC predicates over `metadata`, evaluated by the AuthZ Resolver. Gateway code MUST NOT treat the returned `owner_id` as a security input when this plugin is active — the gateway's `Private`-mode owner-match check (`docs/DESIGN.md:242`) is not exercised, and the `credentials` table has no `owner_id` column (see [§3.7](#37-database-schemas--tables)).
+
+**Write (gateway → plugin, `put` — when added to the trait)**
+
+| Parent input        | Plugin behavior                                                                                |
+|---------------------|------------------------------------------------------------------------------------------------|
+| `sharing = Tenant`  | Stored with `propagate = false`                                                                |
+| `sharing = Shared`  | Stored with `propagate = true`                                                                 |
+| `sharing = Private` | Rejected (`CredStoreError`); per-owner scoping must be encoded in `metadata` for AuthZ to read |
+| `owner_id`          | Not persisted; passed to AuthZ for the write decision then discarded                           |
+
+**Deferred decision.** Generalizing the parent trait so AuthZ ABAC is the single caller-scoping mechanism across all plugins is the cleaner end state but out of scope here. It depends on whether `static-credstore-plugin` is intended to remain standalone-deployable without an AuthZ Resolver in the loop, and whether desktop / single-tenant deployments require a degenerate AuthZ path. Until resolved at the parent module level, the projection above is authoritative for this plugin.
+
 ### 3.4 External Dependencies
 
 #### Database
